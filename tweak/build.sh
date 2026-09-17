@@ -52,7 +52,7 @@ build_target() {
     KeepAlive)     extra=(-framework CoreLocation -weak_framework BackgroundTasks) ;;
     ControlPanel)  extra=() ;;
     # UniformTypeIdentifiers 是 iOS 14 才有的框架，用 weak 链接兼容更低的部署目标
-    FileBridge)    extra=(-weak_framework UniformTypeIdentifiers) ;;
+    FileBridge)    extra=(-weak_framework UniformTypeIdentifiers -lz) ;;
   esac
 
   echo "编译 $name: min-iOS=$MIN_IOS archs=$ARCHS"

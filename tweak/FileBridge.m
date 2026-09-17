@@ -26,6 +26,9 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <zlib.h>
 #import "IPATControlShared.h"
 
 #define IPATFbLog(fmt, ...) NSLog(@"[ipatool-files] " fmt, ##__VA_ARGS__)
@@ -744,12 +747,11 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
     UIDocumentPickerViewController *picker = nil;
     if (@available(iOS 14.0, *)) {
         NSArray<UTType *> *types = foldersOnly ? @[UTTypeFolder] : @[UTTypeItem];
-        // asCopy:YES 选文件夹有坑：点「打开」后系统要整拷到临时目录，
-        // iCloud / 第三方提供方会一直转圈、永不回调。文件夹改 asCopy:NO
-        // （回调立即返回安全作用域 URL，拷贝由 importURLs 自己完成）；
-        // 文件保持 asCopy:YES，省掉安全作用域访问。
+        // 全部用 asCopy:NO：asCopy:YES 有两个坑——选文件夹时系统整拷会卡到
+        // 永不回调；选大文件时会先把整个文件白拷到 tmp 才开始回调
+        // （4G 的 zip 直接双倍占空间）。安全作用域访问由 importURLs 处理。
         picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:types
-                                                                            asCopy:!foldersOnly];
+                                                                            asCopy:NO];
     } else {
         NSArray<NSString *> *types = foldersOnly ? @[@"public.folder"] : @[@"public.item"];
         picker = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:types
@@ -806,6 +808,419 @@ static BOOL IPATFbCopyDirectory(NSURL *source, NSString *destination, NSError **
     return ok;
 }
 
+#pragma mark - ZIP 解压
+
+/// 大 zip（热更资源 4G 级别）直接走解压，别让用户在 PC 上先解开再导。
+/// 支持 store / deflate（zlib 流式，条目再大也不进整块内存）、ZIP64、
+/// Windows 压缩的 GBK 中文文件名；解压到临时目录成功后才挪进落地目录。
+
+static uint16_t IPATFbZipU16(const uint8_t *p) {
+    return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
+}
+
+static uint32_t IPATFbZipU32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static uint64_t IPATFbZipU64(const uint8_t *p) {
+    return (uint64_t)IPATFbZipU32(p) | ((uint64_t)IPATFbZipU32(p + 4) << 32);
+}
+
+/// 文件名解码：打包工具一般会标 UTF-8；Windows 资源管理器压缩的中文包
+/// 不带 UTF-8 标志，按 GB18030 解
+static NSString *IPATFbZipDecodeName(const uint8_t *bytes, uint16_t length, uint16_t flags) {
+    if (length == 0) return @"";
+    NSData *data = [NSData dataWithBytes:bytes length:length];
+    if (!(flags & 0x800)) {
+        NSStringEncoding gbk = CFStringConvertEncodingToNSStringEncoding(kCFStringEncodingGB_18030_1998);
+        NSString *decoded = [[NSString alloc] initWithData:data encoding:gbk];
+        if (decoded) return decoded;
+    }
+    return [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]
+        ?: [[NSString alloc] initWithData:data encoding:NSISOLatin1StringEncoding]
+        ?: @"";
+}
+
+/// 拒绝 zip 里的路径穿越（../、盘符、绝对路径）
+static BOOL IPATFbZipSafePath(NSString *root, NSString *name, NSString **outPath) {
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    for (NSString *part in [name pathComponents]) {
+        if (part.length == 0 || [part isEqualToString:@"."]) continue;
+        if ([part isEqualToString:@".."]) return NO;
+        if ([part containsString:@":"]) return NO;
+        [parts addObject:part];
+    }
+    if (parts.count == 0) return NO;
+    NSString *path = root;
+    for (NSString *part in parts) path = [path stringByAppendingPathComponent:part];
+    *outPath = path;
+    return YES;
+}
+
+/// 单个条目的解压：method 0 直拷，method 8 zlib 流式 inflate
+static BOOL IPATFbZipInflateEntry(FILE *fp, off_t dataOffset, uint16_t method,
+                                  uint64_t compSize,
+                                  NSString *outPath,
+                                  void (^progress)(uint64_t added),
+                                  NSError **error) {
+    if (fseeko(fp, dataOffset, SEEK_SET) != 0) {
+        if (error) *error = [NSError errorWithDomain:@"IPAToolFiles" code:1
+                                         userInfo:@{NSLocalizedDescriptionKey: @"zip 内定位数据失败"}];
+        return NO;
+    }
+    FILE *out = fopen(outPath.fileSystemRepresentation, "wb");
+    if (!out) {
+        if (error) *error = [NSError errorWithDomain:@"IPAToolFiles" code:2
+                                         userInfo:@{NSLocalizedDescriptionKey:
+                                                    [NSString stringWithFormat:@"写文件失败：%@",
+                                                               outPath.lastPathComponent]}];
+        return NO;
+    }
+
+    static const size_t kChunk = 256 * 1024;
+    BOOL ok = NO;
+    BOOL badWrite = NO;
+
+    if (method == 0) {
+        // store：直接落盘
+        uint8_t *buf = malloc(kChunk);
+        uint64_t remaining = compSize;
+        while (remaining > 0) {
+            size_t n = fread(buf, 1, remaining < kChunk ? (size_t)remaining : kChunk, fp);
+            if (n == 0) break;
+            if (fwrite(buf, 1, n, out) != n) { badWrite = YES; break; }
+            progress(n);
+            remaining -= n;
+        }
+        free(buf);
+        ok = !badWrite && remaining == 0;
+    } else {
+        // deflate：raw inflate 流式解
+        uint8_t *inBuf = malloc(kChunk);
+        uint8_t *outBuf = malloc(kChunk);
+        z_stream zs = {0};
+        BOOL haveEnd = NO;
+        if (inflateInit2(&zs, -MAX_WBITS) == Z_OK) {
+            uint64_t remaining = compSize;
+            for (;;) {
+                if (zs.avail_in == 0 && remaining > 0) {
+                    size_t n = fread(inBuf, 1, remaining < kChunk ? (size_t)remaining : kChunk, fp);
+                    if (n == 0) break;
+                    zs.next_in = inBuf;
+                    zs.avail_in = (uInt)n;
+                    remaining -= n;
+                }
+                zs.next_out = outBuf;
+                zs.avail_out = (uInt)kChunk;
+                int ret = inflate(&zs, Z_NO_FLUSH);
+                uInt produced = kChunk - zs.avail_out;
+                if (produced > 0) {
+                    if (fwrite(outBuf, 1, produced, out) != produced) { badWrite = YES; break; }
+                    progress(produced);
+                }
+                if (ret == Z_STREAM_END) { haveEnd = YES; break; }
+                if (ret != Z_OK) break;                          // 数据损坏 / 不支持
+                if (remaining == 0 && zs.avail_in == 0) break;   // 输入耗尽但流没结束
+            }
+            inflateEnd(&zs);
+        }
+        free(inBuf);
+        free(outBuf);
+        ok = !badWrite && haveEnd;
+    }
+
+    fclose(out);
+    if (!ok) {
+        [[NSFileManager defaultManager] removeItemAtPath:outPath error:NULL];
+        if (error) {
+            NSString *msg = badWrite ? @"写文件失败（沙盒空间不足？）"
+                                     : @"zip 数据不完整或已损坏";
+            *error = [NSError errorWithDomain:@"IPAToolFiles" code:3
+                                  userInfo:@{NSLocalizedDescriptionKey:
+                                             [NSString stringWithFormat:@"%@（%@）", msg,
+                                                        outPath.lastPathComponent]}];
+        }
+    }
+    return ok;
+}
+
+/// 解析中央目录的一个条目，pos 前移到下一个条目；ZIP64 的超限字段从 extra 里补
+static BOOL IPATFbZipParseEntry(const uint8_t *cd, uint64_t cdSize, uint64_t *pos,
+                                NSString **name, uint16_t *method, uint16_t *flags,
+                                uint64_t *compSize, uint64_t *uncompSize,
+                                uint64_t *localOffset, BOOL *isDirectory) {
+    if (*pos + 46 > cdSize || IPATFbZipU32(cd + *pos) != 0x02014b50) return NO;
+    const uint8_t *e = cd + *pos;
+    *flags = IPATFbZipU16(e + 8);
+    *method = IPATFbZipU16(e + 10);
+    *compSize = IPATFbZipU32(e + 20);
+    *uncompSize = IPATFbZipU32(e + 24);
+    uint16_t nameLen = IPATFbZipU16(e + 28);
+    uint16_t extraLen = IPATFbZipU16(e + 30);
+    uint16_t commentLen = IPATFbZipU16(e + 32);
+    uint32_t extAttr = IPATFbZipU32(e + 38);
+    *localOffset = IPATFbZipU32(e + 42);
+    if (*pos + 46 + (uint64_t)nameLen + extraLen + commentLen > cdSize) return NO;
+
+    const uint8_t *extra = e + 46 + nameLen;
+    uint16_t off = 0;
+    while (off + 4 <= extraLen) {
+        uint16_t id = IPATFbZipU16(extra + off);
+        uint16_t size = IPATFbZipU16(extra + off + 2);
+        if (off + 4 + (uint64_t)size > extraLen) break;
+        if (id == 0x0001) {   // ZIP64
+            const uint8_t *p = extra + off + 4;
+            const uint8_t *end = extra + off + 4 + size;
+            if (*uncompSize == 0xFFFFFFFFFFFFFFFFULL && p + 8 <= end) { *uncompSize = IPATFbZipU64(p); p += 8; }
+            if (*compSize == 0xFFFFFFFFFFFFFFFFULL && p + 8 <= end) { *compSize = IPATFbZipU64(p); p += 8; }
+            if (*localOffset == 0xFFFFFFFFFFFFFFFFULL && p + 8 <= end) { *localOffset = IPATFbZipU64(p); p += 8; }
+        }
+        off = (uint16_t)(off + 4 + size);
+    }
+
+    *name = IPATFbZipDecodeName(e + 46, nameLen, *flags);
+    *isDirectory = (*name).hasSuffix:@"/" || (extAttr & 0x10) != 0;
+    *pos += 46 + (uint64_t)nameLen + extraLen + commentLen;
+    return YES;
+}
+
+/// 解开整个 zip 到 stagingDir；先扫一遍中央目录做空间预检，再逐条解
+static BOOL IPATFbZipExtract(NSURL *zipURL, NSString *stagingDir,
+                             NSInteger *outFiles, NSInteger *outDirs, uint64_t *outTotalBytes,
+                             void (^progress)(uint64_t added), NSError **error) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    FILE *fp = fopen(zipURL.path.fileSystemRepresentation, "rb");
+    if (!fp) {
+        if (error) *error = [NSError errorWithDomain:@"IPAToolFiles" code:4
+                                         userInfo:@{NSLocalizedDescriptionKey: @"打不开 zip 文件"}];
+        return NO;
+    }
+
+    BOOL ok = NO;
+    uint8_t *tail = NULL;
+    uint8_t *cd = NULL;
+
+    fseeko(fp, 0, SEEK_END);
+    off_t fileSize = ftello(fp);
+
+    // 1) 从尾部找 EOCD（0x06054b50）
+    uint64_t tailLen = MIN((uint64_t)fileSize, 22 + 65535);
+    tail = malloc(tailLen);
+    fseeko(fp, (off_t)(fileSize - (off_t)tailLen), SEEK_SET);
+    if (fread(tail, 1, tailLen, fp) != tailLen || tailLen < 22) {
+        if (error) *error = [NSError errorWithDomain:@"IPAToolFiles" code:4
+                                         userInfo:@{NSLocalizedDescriptionKey: @"读取 zip 结尾失败"}];
+        goto done;
+    }
+    uint64_t eocdInTail = UINT64_MAX;
+    for (uint64_t i = tailLen - 21; i-- > 0;) {
+        if (IPATFbZipU32(tail + i) == 0x06054b50 &&
+            i + 22 + (uint64_t)IPATFbZipU16(tail + i + 20) == tailLen) {
+            eocdInTail = i;
+            break;
+        }
+    }
+    if (eocdInTail == UINT64_MAX) {
+        if (error) *error = [NSError errorWithDomain:@"IPAToolFiles" code:5
+                                         userInfo:@{NSLocalizedDescriptionKey: @"不是有效的 zip 文件"}];
+        goto done;
+    }
+    uint64_t eocdOffset = (uint64_t)fileSize - tailLen + eocdInTail;
+    uint64_t cdOffset = IPATFbZipU32(tail + eocdInTail + 16);
+    uint64_t cdSize = IPATFbZipU32(tail + eocdInTail + 12);
+    uint64_t entryCount = IPATFbZipU16(tail + eocdInTail + 10);
+
+    // 2) ZIP64：EOCD 里的字段装不下时走 ZIP64 EOCD
+    if (eocdOffset >= 20) {
+        uint8_t locator[20];
+        fseeko(fp, (off_t)(eocdOffset - 20), SEEK_SET);
+        if (fread(locator, 1, 20, fp) == 20 && IPATFbZipU32(locator) == 0x07064b50) {
+            uint8_t z64[56];
+            fseeko(fp, (off_t)IPATFbZipU64(locator + 8), SEEK_SET);
+            if (fread(z64, 1, 56, fp) == 56 && IPATFbZipU32(z64) == 0x06064b50) {
+                entryCount = IPATFbZipU64(z64 + 32);
+                cdSize = IPATFbZipU64(z64 + 40);
+                cdOffset = IPATFbZipU64(z64 + 48);
+            } else {
+                if (error) *error = [NSError errorWithDomain:@"IPAToolFiles" code:5
+                                                 userInfo:@{NSLocalizedDescriptionKey: @"ZIP64 目录损坏"}];
+                goto done;
+            }
+        }
+    }
+
+    // 3) 读入中央目录
+    if (cdSize == 0 || cdSize > (uint64_t)fileSize) {
+        if (error) *error = [NSError errorWithDomain:@"IPAToolFiles" code:5
+                                         userInfo:@{NSLocalizedDescriptionKey: @"zip 中央目录损坏"}];
+        goto done;
+    }
+    cd = malloc((size_t)cdSize);
+    fseeko(fp, (off_t)cdOffset, SEEK_SET);
+    if (fread(cd, 1, (size_t)cdSize, fp) != cdSize) {
+        if (error) *error = [NSError errorWithDomain:@"IPAToolFiles" code:4
+                                         userInfo:@{NSLocalizedDescriptionKey: @"读取 zip 中央目录失败"}];
+        goto done;
+    }
+    free(tail);
+    tail = NULL;
+
+    // 4) 第一遍：统计解压后的总体积，做空间预检
+    uint64_t totalBytes = 0;
+    for (uint64_t pos = 0, i = 0; i < entryCount && pos < cdSize; i++) {
+        NSString *name = nil;
+        uint16_t method = 0, flags = 0;
+        BOOL isDir = NO;
+        uint64_t compSize = 0, uncompSize = 0, localOffset = 0;
+        if (!IPATFbZipParseEntry(cd, cdSize, &pos, &name, &method, &flags,
+                                 &compSize, &uncompSize, &localOffset, &isDir)) break;
+        totalBytes += uncompSize;
+    }
+    if (outTotalBytes) *outTotalBytes = totalBytes;
+    NSDictionary *fsAttr = [fm attributesOfFileSystemForPath:stagingDir error:NULL];
+    uint64_t freeBytes = [fsAttr[NSFileSystemFreeSize] unsignedLongLongValue];
+    if (freeBytes > 0 && totalBytes > freeBytes) {
+        if (error) *error = [NSError errorWithDomain:@"IPAToolFiles" code:6
+                                         userInfo:@{NSLocalizedDescriptionKey:
+                                                    [NSString stringWithFormat:
+                                                     @"沙盒空间不足：解压需要约 %.1f GB，剩余 %.1f GB",
+                                                     totalBytes / 1073741824.0,
+                                                     freeBytes / 1073741824.0]}];
+        goto done;
+    }
+
+    // 5) 第二遍：逐条解压
+    NSInteger files = 0, dirs = 0;
+    for (uint64_t pos = 0, i = 0; i < entryCount && pos < cdSize; i++) {
+        NSString *name = nil;
+        uint16_t method = 0, flags = 0;
+        BOOL isDir = NO;
+        uint64_t compSize = 0, uncompSize = 0, localOffset = 0;
+        if (!IPATFbZipParseEntry(cd, cdSize, &pos, &name, &method, &flags,
+                                 &compSize, &uncompSize, &localOffset, &isDir)) break;
+        if (name.length == 0) continue;
+
+        if (flags & 0x1) {
+            if (error && !*error)
+                *error = [NSError errorWithDomain:@"IPAToolFiles" code:7
+                                       userInfo:@{NSLocalizedDescriptionKey:
+                                                  [NSString stringWithFormat:@"不支持加密 zip（%@）", name]}];
+            goto done;
+        }
+        if (method != 0 && method != 8) {
+            if (error && !*error)
+                *error = [NSError errorWithDomain:@"IPAToolFiles" code:7
+                                       userInfo:@{NSLocalizedDescriptionKey:
+                                                  [NSString stringWithFormat:@"不支持的压缩方式（%@）", name]}];
+            goto done;
+        }
+
+        NSString *path = nil;
+        if (!IPATFbZipSafePath(stagingDir, name, &path)) continue;   // 可疑路径直接跳过
+
+        if (isDir) {
+            if (![fm fileExistsAtPath:path]) {
+                if (![fm createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:error])
+                    goto done;
+            }
+            dirs++;
+            continue;
+        }
+
+        NSError *parentError = nil;
+        if (![fm createDirectoryAtPath:[path stringByDeletingLastPathComponent]
+           withIntermediateDirectories:YES attributes:nil error:&parentError]) {
+            if (error && !*error) *error = parentError;
+            goto done;
+        }
+
+        // 从 local header 拿真实的名字/extra 长度，跳到数据区
+        uint8_t lh[30];
+        fseeko(fp, (off_t)localOffset, SEEK_SET);
+        if (fread(lh, 1, 30, fp) != 30 || IPATFbZipU32(lh) != 0x04034b50) {
+            if (error && !*error)
+                *error = [NSError errorWithDomain:@"IPAToolFiles" code:5
+                                       userInfo:@{NSLocalizedDescriptionKey: @"zip 局部文件头损坏"}];
+            goto done;
+        }
+        off_t dataOffset = (off_t)localOffset + 30 + IPATFbZipU16(lh + 26) + IPATFbZipU16(lh + 28);
+
+        if (!IPATFbZipInflateEntry(fp, dataOffset, method, compSize, path, progress, error))
+            goto done;
+        files++;
+    }
+
+    if (outFiles) *outFiles = files;
+    if (outDirs) *outDirs = dirs;
+    ok = YES;
+
+done:
+    free(tail);
+    free(cd);
+    fclose(fp);
+    return ok;
+}
+
+/// 导入 .zip：解压到同名 .ipatool-zip 临时目录，全部成功后再把顶层条目
+/// 原子挪进落地目录（中途失败不留半成品）。extractedFiles 返回解出的文件数
+- (BOOL)importZip:(NSURL *)url toDirectory:(NSString *)destination
+            files:(NSInteger *)extractedFiles error:(NSError **)error {
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    NSString *base = [url.lastPathComponent stringByDeletingPathExtension];
+    NSString *staging = [destination stringByAppendingPathComponent:
+                         [NSString stringWithFormat:@"%@.ipatool-zip", base]];
+    for (NSInteger i = 2; [fm fileExistsAtPath:staging]; i++) {
+        staging = [destination stringByAppendingPathComponent:
+                   [NSString stringWithFormat:@"%@-%ld.ipatool-zip", base, (long)i]];
+    }
+    if (![fm createDirectoryAtPath:staging withIntermediateDirectories:YES attributes:nil error:error]) {
+        return NO;
+    }
+
+    NSString *zipName = url.lastPathComponent;
+    __block uint64_t totalBytes = 0, doneBytes = 0, lastReport = 0;
+    void (^progress)(uint64_t) = ^(uint64_t added) {
+        doneBytes += added;
+        if (doneBytes - lastReport >= 256ULL * 1024 * 1024) {   // 每 256MB 报一次进度
+            lastReport = doneBytes;
+            long percent = totalBytes > 0 ? (long)((double)doneBytes / (double)totalBytes * 100.0) : 0;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self postStatus:[NSString stringWithFormat:@"解压 %@：%ld%%", zipName, percent]];
+            });
+        }
+    };
+
+    NSInteger files = 0, dirs = 0;
+    if (!IPATFbZipExtract(url, staging, &files, &dirs, &totalBytes, progress, error)) {
+        [fm removeItemAtPath:staging error:NULL];
+        return NO;
+    }
+
+    // 顶层条目挪进落地目录（move 同卷是原子操作，重名自动避让）
+    NSArray<NSURL *> *topLevel =
+        [fm contentsOfDirectoryAtURL:[NSURL fileURLWithPath:staging]
+          includingPropertiesForKeys:@[NSURLIsDirectoryKey]
+                             options:0
+                               error:error];
+    if (!topLevel) {
+        [fm removeItemAtPath:staging error:NULL];
+        return NO;
+    }
+    for (NSURL *item in topLevel) {
+        NSString *final = IPATFbUniquePath(destination, item.lastPathComponent);
+        if (![fm moveItemAtURL:item toURL:[NSURL fileURLWithPath:final] error:error]) {
+            [fm removeItemAtPath:staging error:NULL];
+            return NO;
+        }
+    }
+    [fm removeItemAtPath:staging error:NULL];   // 挪完应该只剩空壳，顺手清掉
+    IPATFbLog(@"解压 %@：%ld 个文件、%ld 个目录（%.2f GB）",
+              zipName, (long)files, (long)dirs, totalBytes / 1073741824.0);
+    if (extractedFiles) *extractedFiles = files;
+    return YES;
+}
+
 - (void)importURLs:(NSArray<NSURL *> *)urls {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *destination = self.importDirectory.length ? self.importDirectory : IPATFbImportDirectory();
@@ -822,34 +1237,51 @@ static BOOL IPATFbCopyDirectory(NSURL *source, NSString *destination, NSError **
 
     NSInteger copied = 0;
     NSInteger folders = 0;
+    NSInteger zips = 0;
+    NSInteger extractedFiles = 0;
     NSError *lastError = nil;
     for (NSURL *url in urls) {
         BOOL scoped = [url startAccessingSecurityScopedResource];
-        NSString *target = IPATFbUniquePath(destination, url.lastPathComponent);
 
         NSNumber *isDirectory = nil;
         [url getResourceValue:&isDirectory forKey:NSURLIsDirectoryKey error:NULL];
+        BOOL isDir = [isDirectory boolValue];
 
         NSError *copyError = nil;
-        // 临时目录 + 原子 rename：热更运行中导入也不给游戏暴露半成品
-        BOOL ok = IPATFbCopyThenRename(url, target, [isDirectory boolValue], &copyError);
+        BOOL ok = NO;
+        // .zip 走解压（热更资源动辄几个 G，整包拷一份没意义）；其余临时目录 + 原子 rename
+        BOOL isZip = !isDir && [url.pathExtension.lowercaseString isEqualToString:@"zip"];
+        if (isZip) {
+            NSInteger extracted = 0;
+            ok = [self importZip:url toDirectory:destination files:&extracted error:&copyError];
+            if (ok) {
+                zips++;
+                extractedFiles += extracted;
+            }
+        } else {
+            NSString *target = IPATFbUniquePath(destination, url.lastPathComponent);
+            ok = IPATFbCopyThenRename(url, target, isDir, &copyError);
+            if (ok && isDir) folders++;
+        }
 
         if (ok) {
             copied++;
-            if ([isDirectory boolValue]) folders++;
         } else {
             lastError = copyError;
         }
         if (scoped) [url stopAccessingSecurityScopedResource];
     }
     dispatch_async(dispatch_get_main_queue(), ^{
-        [self finishImport:copied total:(NSInteger)urls.count folders:folders error:lastError];
+        [self finishImport:copied total:(NSInteger)urls.count folders:folders
+                      zips:zips extracted:extractedFiles error:lastError];
     });
 }
 
 - (void)finishImport:(NSInteger)copied
                total:(NSInteger)total
              folders:(NSInteger)folders
+                zips:(NSInteger)zips
+           extracted:(NSInteger)extractedFiles
                error:(NSError *)error {
     IPATFbSetOverlayVisible(YES);
     NSString *where = IPATFbDisplayPath(self.importDirectory.length
@@ -860,14 +1292,17 @@ static BOOL IPATFbCopyDirectory(NSURL *source, NSString *destination, NSError **
     } else if (copied < total) {
         [self postStatus:[NSString stringWithFormat:@"已导入 %ld/%ld 项到 %@",
                                                     (long)copied, (long)total, where]];
+    } else if (zips > 0) {
+        [self postStatus:[NSString stringWithFormat:@"已导入 %ld 项（解压 %ld 个文件）到 %@",
+                                                    (long)copied, (long)extractedFiles, where]];
     } else if (folders > 0) {
         [self postStatus:[NSString stringWithFormat:@"已导入 %ld 项（含 %ld 个文件夹）到 %@",
                                                     (long)copied, (long)folders, where]];
     } else {
         [self postStatus:[NSString stringWithFormat:@"已导入 %ld 项到 %@", (long)copied, where]];
     }
-    IPATFbLog(@"导入完成：%ld/%ld（文件夹 %ld）-> %@",
-              (long)copied, (long)total, (long)folders, where);
+    IPATFbLog(@"导入完成：%ld/%ld（文件夹 %ld，压缩包 %ld）-> %@",
+              (long)copied, (long)total, (long)folders, (long)zips, where);
 }
 
 #pragma mark UIDocumentPickerDelegate
