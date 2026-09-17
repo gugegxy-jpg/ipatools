@@ -5,11 +5,13 @@
 //  设计要点：
 //    1. 平时不占资源：只有用户在悬浮面板上点「动作行」时才干活，没有常驻循环。
 //    2. 浏览界面用自带的 UITableViewController：
-//         点目录 = 进入；点文件 = 勾选；右上角「导出」= 导出勾选的文件，
-//         什么都没勾选就导出当前文件夹本身。
+//         点目录 = 进入；点文件 = 勾选；文件夹行右侧的圆圈 = 勾选整个文件夹；
+//         右上角「导出」= 导出勾选的内容（文件和文件夹可以混着选）。
+//         顶部还有「全选本目录文件」和「导出整个文件夹」两个快捷入口。
 //       这样「手动选择导出哪个文件夹或文件」用同一个界面就能满足，
 //       也避免连续弹 UIAlertController 带来的 present 时序问题。
-//    3. 导入走系统的 UIDocumentPickerViewController（「文件」App），支持多选文件 / 文件夹。
+//    3. 导入走系统的 UIDocumentPickerViewController（「文件」App），支持多选文件 / 文件夹；
+//       落地目录除了面板上的三个预设，还能用「导入到指定文件夹」在沙盒里任意挑一个目录。
 //    4. 弹系统界面之前先发 IPATControlVisibility 让悬浮窗躲开：
 //       悬浮窗的 windowLevel 比 Alert 还高，不躲开会盖在文档选择器上面。
 //    5. 导入落地目录可以在面板上改（写进 NSUserDefaults），优先级高于 Info.plist。
@@ -30,6 +32,13 @@
 /// 动作行的标识（只是本 dylib 内部的字符串，不写 NSUserDefaults）
 static NSString *const IPATFbActionBrowse = @"files.browse";
 static NSString *const IPATFbActionImport = @"files.import";
+static NSString *const IPATFbActionImportTo = @"files.importTo";
+
+/// 浏览器的用途：导出时勾选内容，或给导入挑一个落地文件夹
+typedef NS_ENUM(NSInteger, IPATFbBrowserMode) {
+    IPATFbBrowserModeExport = 0,     // 勾选文件 / 文件夹后导出
+    IPATFbBrowserModeImportTarget,   // 选一个文件夹作为导入落地目录
+};
 
 static NSString *const IPATFbDefaultImportRelative = @"Documents";
 static NSString *const IPATFbDefaultStatus = @"可导出 / 导入沙盒文件";
@@ -150,12 +159,22 @@ static NSString *IPATFbUniquePath(NSString *directory, NSString *name) {
     return [directory stringByAppendingPathComponent:[NSUUID UUID].UUIDString];
 }
 
+/// 绝对路径 -> 相对沙盒的显示文本，给面板状态用
+static NSString *IPATFbDisplayPath(NSString *path) {
+    NSString *home = NSHomeDirectory();
+    NSString *relative = [path hasPrefix:home] ? [path substringFromIndex:home.length] : path;
+    relative = [relative stringByTrimmingCharactersInSet:
+        [NSCharacterSet characterSetWithCharactersInString:@"/"]];
+    return relative.length ? relative : @"沙盒";
+}
+
 #pragma mark - 文件浏览器
 
 @interface IPATFbBrowserController : UITableViewController
 
 @property (nonatomic, copy) NSString *directory;
 @property (nonatomic, copy) NSString *rootDirectory;
+@property (nonatomic, assign) IPATFbBrowserMode mode;
 @property (nonatomic, strong) NSArray<NSDictionary *> *entries;
 @property (nonatomic, strong) NSMutableSet<NSString *> *selectedPaths;
 
@@ -163,15 +182,18 @@ static NSString *IPATFbUniquePath(NSString *directory, NSString *name) {
 @property (nonatomic, copy) void (^onDismiss)(void);
 /// 用户点了「导出」，参数是要导出的绝对路径（文件或文件夹）
 @property (nonatomic, copy) void (^onExport)(NSArray<NSString *> *paths);
+/// 选目录模式下用户确认了某个目录
+@property (nonatomic, copy) void (^onPickDirectory)(NSString *path);
 
 @end
 
 @implementation IPATFbBrowserController
 
-- (instancetype)initWithDirectory:(NSString *)directory root:(NSString *)root {
+- (instancetype)initWithDirectory:(NSString *)directory root:(NSString *)root mode:(IPATFbBrowserMode)mode {
     if ((self = [super initWithStyle:UITableViewStylePlain])) {
         _directory = [directory copy];
         _rootDirectory = [root copy];
+        _mode = mode;
         _selectedPaths = [NSMutableSet set];
         _entries = @[];
     }
@@ -180,13 +202,25 @@ static NSString *IPATFbUniquePath(NSString *directory, NSString *name) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.tableView.rowHeight = 50.0;
-    self.navigationItem.prompt = @"点目录进入 · 点文件勾选 · 右上角导出";
-    self.navigationItem.rightBarButtonItem =
-        [[UIBarButtonItem alloc] initWithTitle:@"导出"
-                                        style:UIBarButtonItemStyleDone
-                                       target:self
-                                       action:@selector(handleExport)];
+    self.tableView.rowHeight = 52.0;
+
+    if (self.mode == IPATFbBrowserModeImportTarget) {
+        self.navigationItem.prompt = @"进入文件夹后点右上角「导入到这里」";
+        self.navigationItem.rightBarButtonItem =
+            [[UIBarButtonItem alloc] initWithTitle:@"导入到这里"
+                                            style:UIBarButtonItemStyleDone
+                                           target:self
+                                           action:@selector(handlePickHere)];
+    } else {
+        self.navigationItem.prompt = @"点文件夹右侧圆圈可勾选 · 点文件夹名进入";
+        self.navigationItem.rightBarButtonItem =
+            [[UIBarButtonItem alloc] initWithTitle:@"导出"
+                                            style:UIBarButtonItemStyleDone
+                                           target:self
+                                           action:@selector(handleExport)];
+        [self setupHeaderActions];
+    }
+
     // 根目录没有返回按钮，自己给一个关闭入口（子目录由导航栏自动提供返回）
     if ([self.directory isEqualToString:self.rootDirectory]) {
         self.navigationItem.leftBarButtonItem =
@@ -195,6 +229,52 @@ static NSString *IPATFbUniquePath(NSString *directory, NSString *name) {
                                                           action:@selector(handleClose)];
     }
     [self reloadEntries];
+}
+
+/// 导出模式顶部加两个快捷操作，省得一个个勾
+- (void)setupHeaderActions {
+    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 320.0, 44.0)];
+
+    UIButton *selectAll = [UIButton buttonWithType:UIButtonTypeSystem];
+    [selectAll setTitle:@"全选本目录文件" forState:UIControlStateNormal];
+    selectAll.titleLabel.font = [UIFont systemFontOfSize:14.0];
+    [selectAll addTarget:self action:@selector(handleSelectAll) forControlEvents:UIControlEventTouchUpInside];
+
+    UIButton *exportDir = [UIButton buttonWithType:UIButtonTypeSystem];
+    [exportDir setTitle:@"导出整个文件夹" forState:UIControlStateNormal];
+    exportDir.titleLabel.font = [UIFont systemFontOfSize:14.0];
+    [exportDir addTarget:self action:@selector(handleExportDirectory) forControlEvents:UIControlEventTouchUpInside];
+
+    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[selectAll, exportDir]];
+    stack.axis = UILayoutConstraintAxisHorizontal;
+    stack.distribution = UIStackViewDistributionFillEqually;
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
+    [header addSubview:stack];
+    [NSLayoutConstraint activateConstraints:@[
+        [stack.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:12.0],
+        [stack.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-12.0],
+        [stack.topAnchor constraintEqualToAnchor:header.topAnchor constant:4.0],
+        [stack.bottomAnchor constraintEqualToAnchor:header.bottomAnchor constant:-4.0],
+    ]];
+    self.tableView.tableHeaderView = header;
+}
+
+- (void)handleSelectAll {
+    for (NSDictionary *entry in self.entries) {
+        if ([entry[@"dir"] boolValue]) continue;
+        [self.selectedPaths addObject:entry[@"path"]];
+    }
+    [self.tableView reloadData];
+    [self updateExportButton];
+}
+
+/// 不勾任何东西，直接把当前所在的整个文件夹导出去
+- (void)handleExportDirectory {
+    if (self.onExport) self.onExport(@[self.directory]);
+}
+
+- (void)handlePickHere {
+    if (self.onPickDirectory) self.onPickDirectory(self.directory);
 }
 
 - (void)handleClose {
@@ -247,6 +327,7 @@ static NSString *IPATFbUniquePath(NSString *directory, NSString *name) {
 }
 
 - (void)updateExportButton {
+    if (self.mode != IPATFbBrowserModeExport) return;   // 选目录模式右上角是「导入到这里」，别动它
     NSString *title = self.selectedPaths.count > 0
         ? [NSString stringWithFormat:@"导出(%lu)", (unsigned long)self.selectedPaths.count]
         : @"导出";
@@ -281,14 +362,67 @@ static NSString *IPATFbUniquePath(NSString *directory, NSString *name) {
     cell.textLabel.text = entry[@"name"];
     cell.textLabel.font = [UIFont systemFontOfSize:15.0];
     cell.detailTextLabel.text = isDir ? @"文件夹" : [self sizeDescriptionForPath:path];
-    if (isDir) {
+    cell.accessoryView = nil;
+    cell.accessoryType = UITableViewCellAccessoryNone;
+
+    if (isDir && self.mode == IPATFbBrowserModeExport) {
+        // 右侧圆圈 = 勾选整个文件夹；点行本身还是进入
+        cell.accessoryView = [self folderAccessorySelected:[self.selectedPaths containsObject:path]
+                                                       row:(NSInteger)indexPath.row];
+    } else if (isDir) {
         cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-    } else {
+    } else if (self.mode == IPATFbBrowserModeExport) {
         cell.accessoryType = [self.selectedPaths containsObject:path]
             ? UITableViewCellAccessoryCheckmark
             : UITableViewCellAccessoryNone;
     }
     return cell;
+}
+
+/// 文件夹行右侧：圆圈勾选（整文件夹导出）+ 箭头（提示点行可进入）
+- (UIView *)folderAccessorySelected:(BOOL)selected row:(NSInteger)row {
+    UIView *container = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 58.0, 30.0)];
+
+    UIButton *check = [UIButton buttonWithType:UIButtonTypeCustom];
+    check.frame = CGRectMake(0, 2, 26, 26);
+    check.layer.cornerRadius = 13.0;
+    check.layer.borderWidth = 1.5;
+    check.selected = selected;
+    check.titleLabel.font = [UIFont systemFontOfSize:15.0];
+    [check setTitle:@"✓" forState:UIControlStateSelected];
+    [check setTitleColor:[UIColor whiteColor] forState:UIControlStateSelected];
+    UIColor *tint = selected ? [UIColor blueColor] : [UIColor lightGrayColor];
+    check.layer.borderColor = tint.CGColor;
+    check.backgroundColor = selected ? [UIColor blueColor] : [UIColor clearColor];
+    check.tag = row;
+    [check addTarget:self action:@selector(toggleFolder:) forControlEvents:UIControlEventTouchUpInside];
+    [container addSubview:check];
+
+    UILabel *arrow = [[UILabel alloc] initWithFrame:CGRectMake(30, 0, 24, 30)];
+    arrow.text = @"›";
+    arrow.textAlignment = NSTextAlignmentRight;
+    arrow.font = [UIFont systemFontOfSize:24.0];
+    arrow.textColor = [UIColor lightGrayColor];
+    [container addSubview:arrow];
+
+    return container;
+}
+
+- (void)toggleFolder:(UIButton *)sender {
+    NSInteger row = sender.tag;
+    if (row < 0 || (NSUInteger)row >= self.entries.count) return;
+    NSDictionary *entry = self.entries[(NSUInteger)row];
+    if (![entry[@"dir"] boolValue]) return;
+
+    NSString *path = entry[@"path"];
+    if ([self.selectedPaths containsObject:path]) {
+        [self.selectedPaths removeObject:path];
+    } else {
+        [self.selectedPaths addObject:path];
+    }
+    [self.tableView reloadRowsAtIndexPaths:@[[NSIndexPath indexPathForRow:row inSection:0]]
+                          withRowAnimation:UITableViewRowAnimationNone];
+    [self updateExportButton];
 }
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -298,10 +432,15 @@ static NSString *IPATFbUniquePath(NSString *directory, NSString *name) {
 
     if ([entry[@"dir"] boolValue]) {
         IPATFbBrowserController *child =
-            [[IPATFbBrowserController alloc] initWithDirectory:path root:self.rootDirectory];
+            [[IPATFbBrowserController alloc] initWithDirectory:path root:self.rootDirectory mode:self.mode];
+        child.onDismiss = self.onDismiss;
+        child.onExport = self.onExport;
+        child.onPickDirectory = self.onPickDirectory;
         [self.navigationController pushViewController:child animated:YES];
         return;
     }
+
+    if (self.mode != IPATFbBrowserModeExport) return;   // 选目录模式下文件不可选
 
     if ([self.selectedPaths containsObject:path]) {
         [self.selectedPaths removeObject:path];
@@ -338,6 +477,8 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
 
 @property (nonatomic, assign) IPATFbPickerPurpose purpose;
 @property (nonatomic, copy) NSString *lastStatus;
+/// 本次导入的落地目录（用「导入到指定文件夹」挑过之后才有值）
+@property (nonatomic, copy) NSString *importDirectory;
 
 @end
 
@@ -403,6 +544,10 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
               IPATRowTitle: @"从「文件」App 导入",
               IPATRowKind: IPATRowKindAction,
               IPATRowNote: @"支持多选文件 / 文件夹，落到上面的目录"},
+            @{IPATRowKey: IPATFbActionImportTo,
+              IPATRowTitle: @"导入到指定文件夹",
+              IPATRowKind: IPATRowKindAction,
+              IPATRowNote: @"先挑沙盒里的文件夹，再选要导入的内容"},
         ],
     };
     [[NSNotificationCenter defaultCenter] postNotificationName:IPATControlRegisterNotification
@@ -442,15 +587,17 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
     if (![userInfo[IPATChgId] isEqual:IPATFeatureFiles]) return;
     NSString *key = userInfo[IPATActKey];
     if ([key isEqualToString:IPATFbActionBrowse]) {
-        [self openBrowser];
+        [self openBrowserWithMode:IPATFbBrowserModeExport];
     } else if ([key isEqualToString:IPATFbActionImport]) {
-        [self openImporter];
+        [self openImporterToDirectory:nil];
+    } else if ([key isEqualToString:IPATFbActionImportTo]) {
+        [self openBrowserWithMode:IPATFbBrowserModeImportTarget];
     }
 }
 
 #pragma mark 浏览器
 
-- (void)openBrowser {
+- (void)openBrowserWithMode:(IPATFbBrowserMode)mode {
     if (!IPATFbEnabled()) {
         [self postStatus:@"功能已关闭"];
         return;
@@ -463,7 +610,7 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
     }
 
     IPATFbBrowserController *browser =
-        [[IPATFbBrowserController alloc] initWithDirectory:root root:root];
+        [[IPATFbBrowserController alloc] initWithDirectory:root root:root mode:mode];
     __weak typeof(self) weakSelf = self;
     __weak IPATFbBrowserController *weakBrowser = browser;
     browser.onDismiss = ^{
@@ -472,6 +619,15 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
     };
     browser.onExport = ^(NSArray<NSString *> *paths) {
         [weakSelf exportPaths:paths from:weakBrowser];
+    };
+    browser.onPickDirectory = ^(NSString *path) {
+        // 先收起浏览器，下一帧再弹系统选择器，避免两个 present 撞车
+        IPATFbBrowserController *strongBrowser = weakBrowser;
+        [strongBrowser dismissViewControllerAnimated:YES completion:^{
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [weakSelf openImporterToDirectory:path];
+            });
+        }];
     };
 
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:browser];
@@ -515,21 +671,26 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
 
 #pragma mark 导入
 
-- (void)openImporter {
+/// directory 传 nil 表示用面板上选的预设目录
+- (void)openImporterToDirectory:(NSString *)directory {
     if (!IPATFbEnabled()) {
         [self postStatus:@"功能已关闭"];
         return;
     }
 
     self.purpose = IPATFbPickerImport;
+    self.importDirectory = directory.length ? [directory copy] : [IPATFbImportDirectory() copy];
     UIDocumentPickerViewController *picker = nil;
     if (@available(iOS 14.0, *)) {
         // asCopy:YES —— 系统先复制到临时目录，省掉安全作用域访问的坑
-        picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeItem, UTTypeFolder]
-                                                                           asCopy:YES];
+        // UTTypeFolder 让「文件」App 里能直接选文件夹（连里面的内容一起带进来）
+        picker = [[UIDocumentPickerViewController alloc]
+            initForOpeningContentTypes:@[UTTypeItem, UTTypeFolder]
+                               asCopy:YES];
     } else {
-        picker = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[@"public.item", @"public.folder"]
-                                                                      inMode:UIDocumentPickerModeImport];
+        picker = [[UIDocumentPickerViewController alloc]
+            initWithDocumentTypes:@[@"public.item", @"public.folder"]
+                           inMode:UIDocumentPickerModeImport];
     }
     picker.allowsMultipleSelection = YES;
     picker.delegate = self;
@@ -537,46 +698,105 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
     [self presentFromTop:picker];
 }
 
+/// 目录复制的兜底：某些来源（比如 iCloud 上还没下载完的文件夹）copyItemAtURL 会失败，
+/// 这时自己递归建目录再逐个拷
+static BOOL IPATFbCopyDirectory(NSURL *source, NSString *destination, NSError **error) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm createDirectoryAtPath:destination withIntermediateDirectories:YES attributes:nil error:error]) {
+        return NO;
+    }
+    NSArray<NSURL *> *items = [fm contentsOfDirectoryAtURL:source
+                                includingPropertiesForKeys:@[NSURLIsDirectoryKey]
+                                                   options:0
+                                                     error:error];
+    if (!items) return NO;
+
+    BOOL ok = YES;
+    for (NSURL *item in items) {
+        NSNumber *isDirectory = nil;
+        [item getResourceValue:&isDirectory forKey:NSURLIsDirectoryKey error:NULL];
+        NSString *target = [destination stringByAppendingPathComponent:item.lastPathComponent];
+        NSError *itemError = nil;
+        if ([isDirectory boolValue]) {
+            if (!IPATFbCopyDirectory(item, target, &itemError)) {
+                ok = NO;
+                if (error && !*error) *error = itemError;
+            }
+        } else if (![fm copyItemAtURL:item toURL:[NSURL fileURLWithPath:target] error:&itemError]) {
+            ok = NO;
+            if (error && !*error) *error = itemError;
+        }
+    }
+    return ok;
+}
+
 - (void)importURLs:(NSArray<NSURL *> *)urls {
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *destination = IPATFbImportDirectory();
+    NSString *destination = self.importDirectory.length ? self.importDirectory : IPATFbImportDirectory();
     NSError *error = nil;
     if (![fm createDirectoryAtPath:destination
        withIntermediateDirectories:YES
                         attributes:nil
                              error:&error]) {
-        [self finishImport:0 total:(NSInteger)urls.count error:error];
+        [self finishImport:0 total:(NSInteger)urls.count folders:0 error:error];
         return;
     }
 
     NSInteger copied = 0;
+    NSInteger folders = 0;
     NSError *lastError = nil;
     for (NSURL *url in urls) {
         BOOL scoped = [url startAccessingSecurityScopedResource];
         NSString *target = IPATFbUniquePath(destination, url.lastPathComponent);
+
+        NSNumber *isDirectory = nil;
+        [url getResourceValue:&isDirectory forKey:NSURLIsDirectoryKey error:NULL];
+
         NSError *copyError = nil;
-        if ([fm copyItemAtURL:url toURL:[NSURL fileURLWithPath:target] error:&copyError]) {
+        BOOL ok = NO;
+        if ([isDirectory boolValue]) {
+            // 文件夹：先让系统整拷，不行再自己递归
+            ok = [fm copyItemAtURL:url toURL:[NSURL fileURLWithPath:target] error:&copyError];
+            if (!ok) {
+                copyError = nil;
+                ok = IPATFbCopyDirectory(url, target, &copyError);
+            }
+            if (ok) folders++;
+        } else {
+            ok = [fm copyItemAtURL:url toURL:[NSURL fileURLWithPath:target] error:&copyError];
+        }
+
+        if (ok) {
             copied++;
         } else {
             lastError = copyError;
         }
         if (scoped) [url stopAccessingSecurityScopedResource];
     }
-    [self finishImport:copied total:(NSInteger)urls.count error:lastError];
+    [self finishImport:copied total:(NSInteger)urls.count folders:folders error:lastError];
 }
 
-- (void)finishImport:(NSInteger)copied total:(NSInteger)total error:(NSError *)error {
+- (void)finishImport:(NSInteger)copied
+               total:(NSInteger)total
+             folders:(NSInteger)folders
+               error:(NSError *)error {
     IPATFbSetOverlayVisible(YES);
+    NSString *where = IPATFbDisplayPath(self.importDirectory.length
+                                        ? self.importDirectory
+                                        : IPATFbImportDirectory());
     if (copied == 0 && error) {
         [self postStatus:[NSString stringWithFormat:@"导入失败：%@", error.localizedDescription]];
     } else if (copied < total) {
-        [self postStatus:[NSString stringWithFormat:@"已导入 %ld/%ld 项",
-                                                    (long)copied, (long)total]];
+        [self postStatus:[NSString stringWithFormat:@"已导入 %ld/%ld 项到 %@",
+                                                    (long)copied, (long)total, where]];
+    } else if (folders > 0) {
+        [self postStatus:[NSString stringWithFormat:@"已导入 %ld 项（含 %ld 个文件夹）到 %@",
+                                                    (long)copied, (long)folders, where]];
     } else {
-        [self postStatus:[NSString stringWithFormat:@"已导入 %ld 项到 %@",
-                                                    (long)copied, IPATFbImportRelative()]];
+        [self postStatus:[NSString stringWithFormat:@"已导入 %ld 项到 %@", (long)copied, where]];
     }
-    IPATFbLog(@"导入完成：%ld/%ld -> %@", (long)copied, (long)total, IPATFbImportRelative());
+    IPATFbLog(@"导入完成：%ld/%ld（文件夹 %ld）-> %@",
+              (long)copied, (long)total, (long)folders, where);
 }
 
 #pragma mark UIDocumentPickerDelegate

@@ -69,8 +69,15 @@ static NSString *ListDocs(void) {
     NSMutableString *s = [NSMutableString string];
     for (NSString *name in [items sortedArrayUsingSelector:@selector(compare:)]) {
         NSString *p = [DocsDir() stringByAppendingPathComponent:name];
-        unsigned long long size = [[fm attributesOfItemAtPath:p error:nil] fileSize];
-        [s appendFormat:@"  %@  (%llu B)\n", name, size];
+        BOOL isDir = NO;
+        [fm fileExistsAtPath:p isDirectory:&isDir];
+        if (isDir) {
+            NSUInteger count = [[fm contentsOfDirectoryAtPath:p error:nil] count];
+            [s appendFormat:@"  %@/  [文件夹, %lu 项]\n", name, (unsigned long)count];
+        } else {
+            unsigned long long size = [[fm attributesOfItemAtPath:p error:nil] fileSize];
+            [s appendFormat:@"  %@  (%llu B)\n", name, size];
+        }
     }
     return s;
 }
