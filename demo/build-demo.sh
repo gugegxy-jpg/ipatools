@@ -19,8 +19,10 @@ APP="IPATDemo.app"
 EXE="IPATDemo"
 OUT="build"
 
+BUNDLE="$OUT/Payload/$APP"   # IPA 必须是 Payload/xxx.app 结构
+
 rm -rf "$OUT"
-mkdir -p "$OUT/$APP"
+mkdir -p "$BUNDLE"
 
 echo "编译 ${EXE} (arm64 / min iOS 14.0)"
 "$CC" -arch arm64 \
@@ -32,14 +34,14 @@ echo "编译 ${EXE} (arm64 / min iOS 14.0)"
   -framework UIKit \
   -framework AVFoundation \
   -framework AVKit \
-  -o "$OUT/$APP/$EXE" \
+  -o "$BUNDLE/$EXE" \
   Demo.m
 
-cp Info.plist "$OUT/$APP/Info.plist"
+cp Info.plist "$BUNDLE/Info.plist"
 
 # ad-hoc 签名只为让包结构完整；真机安装必须由重签工具换成开发者证书
-codesign -f -s - "$OUT/$APP" >/dev/null 2>&1 || echo "  提示: ad-hoc 签名失败（不影响后续注入）"
+codesign -f -s - "$BUNDLE" >/dev/null 2>&1 || echo "  提示: ad-hoc 签名失败（不影响后续注入）"
 
-(cd "$OUT" && zip -qry "IPATDemo.ipa" "$APP")
+(cd "$OUT" && zip -qry "IPATDemo.ipa" Payload)
 
 echo "已生成: demo/${OUT}/IPATDemo.ipa"
