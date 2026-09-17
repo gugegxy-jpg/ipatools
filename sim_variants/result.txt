@@ -1,0 +1,4 @@
+windows_gbk_deflate bad=╚╚╕ⁿ/ [('╚╚╕ⁿ/', 0, 35), ('╚╚╕ⁿ/config.bin', 1200, 105), ('╚╚╕ⁿ/sub/data.bin', 1200, 177)]
+deflate_ascii bad=update/ [('update/', 0, 37), ('update/a.bin', 1200, 104)]
+data_descriptor bad=update/ [('update/', 0, 37), ('update/a.bin', 1200, 116)]
+store_no_utf8 bad=╚╚╕ⁿ/ [('╚╚╕ⁿ/', 0, 35), ('╚╚╕ⁿ/a.bin', 1200, 1275)]

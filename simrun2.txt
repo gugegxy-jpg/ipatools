@@ -1,0 +1,4 @@
+﻿windows_gbk_deflate    files=2 dirs=1 OK ['热更/config.bin', '热更/sub/data.bin']
+deflate_ascii          files=1 dirs=1 OK ['update/a.bin']
+data_descriptor        files=1 dirs=1 OK ['update/a.bin']
+store_no_utf8          files=1 dirs=1 OK ['热更/a.bin']

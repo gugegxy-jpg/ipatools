@@ -818,6 +818,7 @@ static BOOL IPATFbZipWrite(NSArray<NSDictionary *> *entries, uint64_t totalBytes
             IPATFbZipAppend16(h, (uint16_t)name.length);
             IPATFbZipAppend16(h, 0);              // extra len
             [h appendData:name];
+            uint64_t headerOffset = offset;       // 注意先记位置再写：CD 记的是 LFH 起始
             if (fwrite(h.bytes, 1, h.length, out) != h.length) goto fail;
             offset += h.length;
 
@@ -837,7 +838,7 @@ static BOOL IPATFbZipWrite(NSArray<NSDictionary *> *entries, uint64_t totalBytes
             IPATFbZipAppend16(cd, 0);             // disk start
             IPATFbZipAppend16(cd, 0);             // internal attr
             IPATFbZipAppend32(cd, 0x10);          // external attr：目录位
-            IPATFbZipAppend32(cd, (uint32_t)offset);
+            IPATFbZipAppend32(cd, (uint32_t)headerOffset);
             [cd appendData:name];
             continue;
         }
@@ -1070,7 +1071,15 @@ fail:
                 [[UIDocumentPickerViewController alloc] initForExportingURLs:
                     @[[NSURL fileURLWithPath:zipPath]] asCopy:YES];
             picker.delegate = self;
-            IPATFbLog(@"导出 zip 就绪：%ld 项 -> %@", (long)valid.count, zipPath);
+            NSInteger fileCount = 0, dirCount = 0;
+            uint64_t zipBytes = 0;
+            for (NSDictionary *e in entries) {
+                if ([e[@"dir"] boolValue]) dirCount++;
+                else { fileCount++; zipBytes += [e[@"size"] unsignedLongLongValue]; }
+            }
+            IPATFbLog(@"导出 zip 就绪：%ld 项（文件 %ld、目录 %ld，共 %.2f GB）-> %@",
+                      (long)valid.count, (long)fileCount, (long)dirCount,
+                      zipBytes / 1073741824.0, zipPath);
             [presenter presentViewController:picker animated:YES completion:nil];
         });
     });
@@ -1446,7 +1455,17 @@ static BOOL IPATFbZipExtract(NSURL *zipURL, NSString *stagingDir,
         BOOL isDir = NO;
         uint64_t compSize = 0, uncompSize = 0, localOffset = 0;
         if (!IPATFbZipParseEntry(cd, cdSize, &pos, &name, &method, &flags,
-                                 &compSize, &uncompSize, &localOffset, &isDir)) break;
+                                 &compSize, &uncompSize, &localOffset, &isDir)) {
+            // 之前这里是静默 break，目录解出来了、文件全丢，表面看就是"导入成功
+            // 但只有一个空文件夹"。改成显式报错，把进度说清楚
+            if (error && !*error)
+                *error = [NSError errorWithDomain:@"IPAToolFiles" code:5
+                                       userInfo:@{NSLocalizedDescriptionKey:
+                                                  [NSString stringWithFormat:
+                                                   @"zip 中央目录第 %ld 条解析失败（共 %ld 条），文件可能不完整",
+                                                   (long)(i + 1), (long)entryCount]}];
+            goto done;
+        }
         if (name.length == 0) continue;
 
         if (flags & 0x1) {
@@ -1465,7 +1484,10 @@ static BOOL IPATFbZipExtract(NSURL *zipURL, NSString *stagingDir,
         }
 
         NSString *path = nil;
-        if (!IPATFbZipSafePath(stagingDir, name, &path)) continue;   // 可疑路径直接跳过
+        if (!IPATFbZipSafePath(stagingDir, name, &path)) {
+            IPATFbLog(@"跳过可疑路径：%@", name);
+            continue;
+        }
 
         if (isDir) {
             if (![fm fileExistsAtPath:path]) {
