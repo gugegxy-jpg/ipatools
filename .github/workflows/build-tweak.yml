@@ -67,11 +67,15 @@ jobs:
           done
 
       - name: Build demo app (for on-device testing)
+        id: build_demo
+        continue-on-error: true
         run: |
           chmod +x demo/build-demo.sh
-          ./demo/build-demo.sh
+          ./demo/build-demo.sh 2>&1 | tee demo-build.log
+          exit ${PIPESTATUS[0]}
 
       - name: Inject tweaks into demo app
+        if: steps.build_demo.outcome == 'success'
         run: |
           python3 -m ipatool inject demo/build/IPATDemo.ipa \
             --pip --keep-alive --files --in-place --sign none
@@ -81,6 +85,7 @@ jobs:
           ls -la demo/build
 
       - uses: actions/upload-artifact@v4
+        if: steps.build_demo.outcome == 'success'
         with:
           name: ipatool-demo-ipa
           path: demo/build/IPATDemo.ipa
@@ -102,12 +107,18 @@ jobs:
           retention-days: 90
 
       # Release asset 可以匿名下载，Artifact 必须登录，所以额外发一份到 Release
+      # if: always() —— 即使 Demo 编译失败也要把 dylib 和编译日志发出来，方便定位
       - name: Publish dylibs as release assets
+        if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: build-${{ github.run_number }}
         run: |
-          gh release create "$TAG" tweak/build/*.dylib build-artifacts.zip demo/build/IPATDemo.ipa \
+          assets=(build-artifacts.zip)
+          for f in tweak/build/*.dylib; do [ -f "$f" ] && assets+=("$f"); done
+          if [ -f demo/build/IPATDemo.ipa ]; then assets+=(demo/build/IPATDemo.ipa); fi
+          if [ -f demo-build.log ]; then assets+=(demo-build.log); fi
+          gh release create "$TAG" "${assets[@]}" \
             --title "$TAG" \
             --notes "Actions 自动编译：run ${{ github.run_number }} / commit ${{ github.sha }}" \
             --latest=false
