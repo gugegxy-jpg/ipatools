@@ -22,7 +22,7 @@ OUT="build"
 rm -rf "$OUT"
 mkdir -p "$OUT/$APP"
 
-echo "编译 $EXE（arm64 / min iOS 14.0）"
+echo "编译 ${EXE} (arm64 / min iOS 14.0)"
 "$CC" -arch arm64 \
   -isysroot "$SDK" \
   -miphoneos-version-min=14.0 \
@@ -41,4 +41,4 @@ codesign -f -s - "$OUT/$APP" >/dev/null 2>&1 || echo "  提示: ad-hoc 签名失
 
 (cd "$OUT" && zip -qry "IPATDemo.ipa" "$APP")
 
-echo "已生成: demo/$OUT/IPATDemo.ipa"
+echo "已生成: demo/${OUT}/IPATDemo.ipa"
