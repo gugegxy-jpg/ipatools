@@ -73,7 +73,7 @@ build_target() {
     ${extra[@]+"${extra[@]}"} \
     -install_name "@executable_path/Frameworks/$name.dylib" \
     -o "$out" "$src"; then
-    echo "编译失败: $name（详见上方 clang 输出）" >&2
+    echo "编译失败: $name - 详见上方 clang 输出" >&2
     return 1
   fi
 

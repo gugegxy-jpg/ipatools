@@ -1185,7 +1185,7 @@ static NSString *IPATFbZipDecodeName(const uint8_t *bytes, uint16_t length, uint
     if (length == 0) return @"";
     NSData *data = [NSData dataWithBytes:bytes length:length];
     if (!(flags & 0x800)) {
-        NSStringEncoding gbk = CFStringConvertEncodingToNSStringEncoding(kCFStringEncodingGB_18030_1998);
+        NSStringEncoding gbk = CFStringConvertEncodingToNSStringEncoding(kCFStringEncodingGB_18030_2000);
         NSString *decoded = [[NSString alloc] initWithData:data encoding:gbk];
         if (decoded) return decoded;
     }
@@ -1332,7 +1332,7 @@ static BOOL IPATFbZipParseEntry(const uint8_t *cd, uint64_t cdSize, uint64_t *po
     }
 
     *name = IPATFbZipDecodeName(e + 46, nameLen, *flags);
-    *isDirectory = (*name).hasSuffix:@"/" || (extAttr & 0x10) != 0;
+    *isDirectory = [name hasSuffix:@"/"] || (extAttr & 0x10) != 0;
     *pos += 46 + (uint64_t)nameLen + extraLen + commentLen;
     return YES;
 }
@@ -1352,6 +1352,9 @@ static BOOL IPATFbZipExtract(NSURL *zipURL, NSString *stagingDir,
     BOOL ok = NO;
     uint8_t *tail = NULL;
     uint8_t *cd = NULL;
+    // 注意：ARC 下 goto 不能跨过 __strong 变量的初始化，所以 ObjC 指针
+    // 一律先声明在这里，后面只赋值
+    NSDictionary *fsAttr = nil;
 
     fseeko(fp, 0, SEEK_END);
     off_t fileSize = ftello(fp);
@@ -1430,7 +1433,7 @@ static BOOL IPATFbZipExtract(NSURL *zipURL, NSString *stagingDir,
         totalBytes += uncompSize;
     }
     if (outTotalBytes) *outTotalBytes = totalBytes;
-    NSDictionary *fsAttr = [fm attributesOfFileSystemForPath:stagingDir error:NULL];
+    fsAttr = [fm attributesOfFileSystemForPath:stagingDir error:NULL];
     uint64_t freeBytes = [fsAttr[NSFileSystemFreeSize] unsignedLongLongValue];
     if (freeBytes > 0 && totalBytes > freeBytes) {
         if (error) *error = [NSError errorWithDomain:@"IPAToolFiles" code:6
@@ -1583,7 +1586,7 @@ done:
                         attributes:nil
                              error:&error]) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            [self finishImport:0 total:(NSInteger)urls.count folders:0 error:error];
+            [self finishImport:0 total:(NSInteger)urls.count folders:0 zips:0 extracted:0 error:error];
         });
         return;
     }
