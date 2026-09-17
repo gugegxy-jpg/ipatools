@@ -31,7 +31,7 @@
 //    Log(bool)                  默认 YES，打印 [ipatool-keepalive] 日志
 //
 //  运行时开关：
-//    注入 ControlPanel.dylib 后 App 里会出现悬浮窗，点开即可实时开关保活及其子选项，
+//    注入 ControlPanel.dylib 后 App 里会出现悬浮窗，点开即可实时开关保活（面板就一个总开关），
 //    面板写入的值存在 NSUserDefaults 里，优先级高于上面的 Info.plist 初始值。
 //    注意：定时唤醒的 launch handler 只能在启动阶段注册，所以「定时唤醒」开关
 //    打开后要下次启动才真正生效（关闭是立刻生效的），面板上会显示当前状态。
@@ -66,10 +66,10 @@ static NSString *IPATKAPanelKey(NSString *plistKey) {
     static NSDictionary *map;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
+        // 只有「后台保活」这一个开关在面板上，子项（静音音频 / 任务续期）只认 Info.plist：
+        // 免得以前在面板上改过一次留下旧值，开关拿掉之后反而改不回来
         map = @{
             @"Enabled": IPATKeyKAEnabled,
-            @"SilentAudio": IPATKeyKASilentAudio,
-            @"RenewBackgroundTask": IPATKeyKARenew,
             @"Fetch": IPATKeyKAFetch,
             @"Location": IPATKeyKALocation,
         };
@@ -300,16 +300,9 @@ static NSData *IPATKASilentWAV(double seconds, uint32_t sampleRate) {
         IPATRegDetail: @"切后台后进程不被挂起",
         IPATRegMasterKey: IPATKeyKAEnabled,
         IPATRegEnabled: @(IPATKABool(@"Enabled", YES)),
-        // 面板只放常用的两项：定位要授权还费电、定时唤醒改了要重启 App，
-        // 这两项留给 Info.plist（--keep-alive-location / --keep-alive-fetch）
-        IPATRegRows: @[
-            @{IPATRowKey: IPATKeyKASilentAudio,
-              IPATRowTitle: @"静音音频",
-              IPATRowValue: @(IPATKABool(@"SilentAudio", YES))},
-            @{IPATRowKey: IPATKeyKARenew,
-              IPATRowTitle: @"后台任务续期",
-              IPATRowValue: @(IPATKABool(@"RenewBackgroundTask", YES))},
-        ],
+        // 面板只留一个总开关：子项（静音音频 / 后台任务续期）默认全开，
+        // 定位要授权还费电、定时唤醒改了要重启 App，这两项留给 Info.plist
+        //（--keep-alive-no-audio / --keep-alive-no-task-renew / --keep-alive-location / --keep-alive-fetch）
     };
     [[NSNotificationCenter defaultCenter] postNotificationName:IPATControlRegisterNotification
                                                         object:nil

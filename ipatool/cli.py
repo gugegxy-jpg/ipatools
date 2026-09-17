@@ -71,7 +71,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     pj = sub.add_parser(
         "inject",
-        help="注入 dylib（内置 --pip 画中画、--keep-alive 后台保活、--files 文件导入导出）",
+        help="注入 dylib（内置 --keep-alive 后台保活、--files 文件导入导出）",
         description="把 dylib 放进 App 的 Frameworks/ 并写入 LC_LOAD_DYLIB；注入后必须重新签名才能安装",
     )
     pj.add_argument("input", help="IPA 文件路径，或已解包且含 Payload 的目录")
@@ -83,16 +83,6 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="写 NSAllowsArbitraryLoads=YES 关掉 ATS 限制（热更服务器用明文 HTTP 时需要）",
     )
-
-    pip = pj.add_argument_group("画中画", "切到后台自动进入画中画，从而在后台继续运行")
-    pip.add_argument("--pip", action="store_true", help="注入内置画中画 tweak")
-    pip.add_argument("--pip-dylib", metavar="PATH", help="画中画 tweak 的 dylib 路径，默认自动查找（macOS 上会自动编译）")
-    pip.add_argument("--pip-video", metavar="PATH", help="画中画窗口里循环播放的 mp4（不给则显示黑画面/镜像）")
-    pip.add_argument("--pip-mode", choices=["black", "mirror"], help="black 纯黑画面（默认）；mirror 镜像当前界面（实验性）")
-    pip.add_argument("--pip-start-on", choices=["background", "resignActive", "launch"], help="何时启动画中画，默认 background")
-    pip.add_argument("--pip-frame-rate", type=int, metavar="N", help="喂帧/镜像帧率，默认 10")
-    pip.add_argument("--pip-keep-foreground", action="store_true", help="回到前台也保持画中画（默认回前台自动退出）")
-    pip.add_argument("--pip-no-keep-alive", action="store_true", help="不播放静音音频保活（默认播放）")
 
     ka = pj.add_argument_group(
         "后台保活",
@@ -121,8 +111,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     panel = pj.add_argument_group(
         "悬浮窗",
-        "在 App 里显示一个可拖动的悬浮按钮，点开后实时开关画中画 / 后台保活 / 文件导入导出"
-        "（默认跟着 --pip/--keep-alive/--files 一起注入）",
+        "在 App 里显示一个可拖动的悬浮按钮，点开后实时开关后台保活 / 文件导入导出"
+        "（默认跟着 --keep-alive/--files 一起注入）",
     )
     panel.add_argument("--panel", action="store_true", help="强制注入悬浮窗")
     panel.add_argument("--no-panel", action="store_true", help="不注入悬浮窗（只改配置、不加界面）")
@@ -430,7 +420,6 @@ def cmd_inject(args) -> int:
                 print(f"  - {d}")
             return 0
 
-        pip_enabled = bool(args.pip or args.pip_video or args.pip_dylib)
         ka_tuning = any((
             args.keep_alive_dylib,
             args.keep_alive_start_on,
@@ -454,11 +443,10 @@ def cmd_inject(args) -> int:
         # 悬浮窗默认跟着内置功能一起注入；--no-panel 关掉它
         panel_tuning = bool(args.panel or args.panel_dylib or args.panel_title)
         panel_enabled = bool(
-            pip_enabled or keep_alive_enabled or files_enabled or panel_tuning
+            keep_alive_enabled or files_enabled or panel_tuning
         ) and not args.no_panel
         plist_touched = bool(
-            pip_enabled
-            or keep_alive_enabled
+            keep_alive_enabled
             or files_enabled
             or panel_enabled
             or args.background_mode
@@ -466,7 +454,7 @@ def cmd_inject(args) -> int:
         )
         if not args.dylib and not plist_touched:
             print(
-                "错误：请用 --dylib 指定要注入的库，或用 --pip（画中画）/ --keep-alive（后台保活）"
+                "错误：请用 --dylib 指定要注入的库，或用 --keep-alive（后台保活）"
                 "/ --files（文件导入导出）注入内置 tweak，或用 --panel 只注入悬浮窗",
                 file=sys.stderr,
             )
@@ -481,13 +469,6 @@ def cmd_inject(args) -> int:
         print(f"Bundle ID   : {app.identifier}")
 
         planned: list[tuple[str, str]] = []  # (dylib 路径, 注入名)
-        if pip_enabled:
-            pip_dylib = inject_mod.locate_pip_dylib(
-                explicit=args.pip_dylib,
-                log=lambda m: print(f"  {m}"),
-            )
-            planned.append((pip_dylib, inject_mod.PIP_DYLIB_NAME))
-            print(f"画中画 tweak: {pip_dylib}")
         if keep_alive_enabled:
             ka_dylib = inject_mod.locate_keep_alive_dylib(
                 explicit=args.keep_alive_dylib,
@@ -521,24 +502,6 @@ def cmd_inject(args) -> int:
         warnings: list[str] = []
         settings: list[tuple[str, dict, str]] = []
         modes: list[str] = list(args.background_mode or [])
-
-        if pip_enabled:
-            pip_options = inject_mod.build_pip_options(
-                mode=args.pip_mode,
-                start_on=args.pip_start_on,
-                stop_on_foreground=False if args.pip_keep_foreground else None,
-                keep_alive_audio=False if args.pip_no_keep_alive else None,
-                frame_rate=args.pip_frame_rate,
-                video_file=inject_mod.PIP_DEFAULT_VIDEO if args.pip_video else None,
-            )
-            if args.pip_video:
-                video_changes, video_warnings = inject_mod.place_pip_video(
-                    app, args.pip_video, dry_run=args.dry_run,
-                )
-                changes += video_changes
-                warnings += video_warnings
-            settings.append((inject_mod.PIP_INFO_KEY, pip_options, "画中画配置"))
-            modes.append(inject_mod.PIP_REQUIRED_BACKGROUND_MODE)
 
         if keep_alive_enabled:
             silent_audio = not args.keep_alive_no_audio

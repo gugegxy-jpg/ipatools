@@ -16,7 +16,6 @@
 - 递归替换 plist 中所有引用旧 Bundle ID 的字符串
 - 同步修改 `*.lproj/InfoPlist.strings` 中的本地化显示名（可用 `--no-localized` 关闭）
 - **注入 dylib**（`inject`）：放进 `Frameworks/` 并给主可执行文件追加 `LC_LOAD_DYLIB`，支持 fat 二进制、幂等
-- **切后台自动画中画**：`inject --pip` 注入内置 tweak，让 App 退到后台时自动进入画中画（从而在后台继续运行）
 - **切后台继续运行**：`inject --keep-alive` 注入保活 tweak（静音音频 + 后台任务续期，可选后台定位/系统定时唤醒），适合游戏切后台继续热更、下载
 - **文件导入导出**：`inject --files` 注入文件桥，在悬浮面板里浏览 App 沙盒，把热更资源（补丁/配置/存档）导出到系统「文件」App，或从「文件」App 导入回沙盒
 - **应用内悬浮控制面板**：上面这些功能会顺带注入一个悬浮窗，点开即可在 App 里实时开关 / 操作它们（`--no-panel` 可关掉）
@@ -80,7 +79,7 @@ python -m ipatool.gui
 | --- | --- | --- |
 | 信息 | `info --json` | Bundle ID / 名称 / 版本 / 后台模式 / 内嵌 bundle / 已注入 dylib |
 | 改 ID / 名称 | `modify` | Bundle Identifier、显示名称、CFBundleName、本地化开关 |
-| 注入功能 | `inject` | 画中画、后台保活、文件导入导出、悬浮窗、自定义 dylib、后台模式、ATS |
+| 注入功能 | `inject` | 后台保活、文件导入导出、悬浮窗、自定义 dylib、后台模式、ATS |
 | 签名 | `modify` / `inject` 公共参数 | 签名后端、`--identity`、p12 与密码、描述文件、entitlements、dry-run |
 
 用法要点：
@@ -141,46 +140,6 @@ python -m ipatool inject app.ipa --dylib MyTweak.dylib --dry-run
 - **幂等**：同一路径已存在时跳过，重复注入不会叠加。
 - **必须重签**：改了主可执行文件后原签名必然失效，`--sign none` 出来的包只能越狱设备用，工具会明确警告。
 
-### 切后台自动画中画（`--pip`）
-
-```bash
-# 用内置画中画 tweak（macOS 上会先自动编译 tweak/PiPBackground.m）
-python -m ipatool inject app.ipa --pip \
-  --p12 cert.p12 --p12-password 123456 \
-  --provision app.mobileprovision -o out.ipa
-
-# 画中画里循环播放自己的视频（放到 App 包内的 ipatool_pip.mp4）
-python -m ipatool inject app.ipa --pip --pip-video logo.mp4 -o out.ipa
-
-# 实验性：把 App 当前界面镜像进画中画窗口（默认是纯黑画面）
-python -m ipatool inject app.ipa --pip --pip-mode mirror -o out.ipa
-```
-
-| 参数 | 说明 |
-| --- | --- |
-| `--pip` | 注入内置画中画 tweak，并自动补 `UIBackgroundModes: audio` |
-| `--pip-dylib` | 自己指定画中画 dylib 路径（默认找 `tweak/build/`，macOS 上找不到会自动编译） |
-| `--pip-video` | 画中画窗口里循环播放的 mp4（不给则显示黑画面/镜像）；编码建议 H.264 |
-| `--pip-mode` | `black` 纯黑（默认）／`mirror` 镜像当前界面（实验性，Metal 内容可能拍不到） |
-| `--pip-start-on` | `background`（默认，切后台时）／`resignActive`（失活时就启动）／`launch`（启动即进入） |
-| `--pip-frame-rate` | 喂帧/镜像帧率，默认 10 |
-| `--pip-keep-foreground` | 回到前台也保持画中画（默认回前台自动退出） |
-| `--pip-no-keep-alive` | 不播放静音音频保活（默认播放，避免后台被提前挂起） |
-| `--background-mode` | 额外追加到 `UIBackgroundModes` 的值，如 `processing` |
-| `--dylib` | 注入任意 dylib，可重复指定 |
-
-tweak 的行为由 `Info.plist` 里的 `IPAToolPiP` 字典控制，上面的参数就是写这个字典，也可以事后自己改：
-
-```xml
-<key>IPAToolPiP</key>
-<dict>
-  <key>Mode</key><string>mirror</string>
-  <key>StartOn</key><string>background</string>
-  <key>StopOnForeground</key><true/>
-  <key>KeepAliveAudio</key><true/>
-  <key>FrameRate</key><integer>10</integer>
-</dict>
-```
 
 ### 切后台继续运行（`--keep-alive`）
 
@@ -200,8 +159,6 @@ python -m ipatool inject game.ipa --keep-alive --keep-alive-fetch \
 # 用近乎无声的底噪代替纯静音
 python -m ipatool inject game.ipa --keep-alive --keep-alive-audio-file quiet.m4a -o out.ipa
 
-# 画中画和保活可以同时用（audio 后台模式只会写一次）
-python -m ipatool inject game.ipa --pip --keep-alive -o out.ipa
 ```
 
 | 参数 | 说明 |
@@ -217,6 +174,8 @@ python -m ipatool inject game.ipa --pip --keep-alive -o out.ipa
 | `--keep-alive-location-indicator` | 显示定位蓝色指示条（默认隐藏） |
 | `--keep-alive-fetch` / `--keep-alive-processing` | 注册 `BGAppRefreshTask` / `BGProcessingTask`，并补 `BGTaskSchedulerPermittedIdentifiers` |
 | `--keep-alive-refresh-interval` | 定时唤醒的最短间隔，默认 900 秒 |
+| `--background-mode` | 额外追加到 `UIBackgroundModes` 的值，如 `processing` |
+| `--dylib` | 注入任意 dylib，可重复指定 |
 | `--allow-arbitrary-loads` | 写 `NSAllowsArbitraryLoads=YES`，热更走明文 HTTP 时需要 |
 
 保活原理（`tweak/KeepAlive.m`），按可靠性排序：
@@ -251,7 +210,7 @@ python -m ipatool inject game.ipa --pip --keep-alive -o out.ipa
 
 ### 应用内悬浮控制面板（`ControlPanel.dylib`）
 
-注入 `--pip`、`--keep-alive` 或 `--files` 时会**顺带注入一个悬浮窗**：App 里出现一个可拖动的小胶囊按钮，点开就是控制面板，能实时开关上面这些功能及其子项，不用改包重启。
+注入 `--keep-alive` 或 `--files` 时会**顺带注入一个悬浮窗**：App 里出现一个可拖动的小胶囊按钮，点开就是控制面板，能实时开关上面这些功能，不用改包重启。
 
 - 按钮默认显示 `IPAT`（`--panel-title` 可改）；有功能开着是绿色，全关是灰色
 - 按钮可拖到任意位置，位置会被记住；面板贴着按钮弹出
@@ -260,15 +219,15 @@ python -m ipatool inject game.ipa --pip --keep-alive -o out.ipa
 - 不要界面就用 `--no-panel`
 
 ```bash
-python -m ipatool inject game.ipa --pip --keep-alive -o out.ipa          # 默认带悬浮窗
-python -m ipatool inject game.ipa --pip --no-panel -o out.ipa            # 只要功能，不要界面
+python -m ipatool inject game.ipa --keep-alive -o out.ipa                # 默认带悬浮窗
+python -m ipatool inject game.ipa --keep-alive --no-panel -o out.ipa      # 只要功能，不要界面
 python -m ipatool inject game.ipa --panel --panel-title 调试 -o out.ipa  # 只要悬浮窗
 python -m ipatool inject game.ipa --files -o out.ipa                     # 文件导入导出（带悬浮窗）
 ```
 
 | 参数 | 说明 |
 | --- | --- |
-| `--panel` | 强制注入悬浮窗（不配 `--pip/--keep-alive/--files` 也能单独用，会显示“没有可控制的功能”） |
+| `--panel` | 强制注入悬浮窗（不配 `--keep-alive/--files` 也能单独用，会显示“没有可控制的功能”） |
 | `--no-panel` | 不注入悬浮窗 |
 | `--panel-dylib` | 悬浮窗 dylib 路径，默认找 `tweak/build/`（macOS 上找不到会自动编译） |
 | `--panel-title` | 悬浮按钮上的文字，默认 `IPAT` |
@@ -277,12 +236,7 @@ python -m ipatool inject game.ipa --files -o out.ipa                     # 文�
 
 | 面板项 | 对应配置 | 立即生效 |
 | --- | --- | --- |
-| 画中画（总开关） | `IPAToolPiP.Enabled` | 是 |
-| ├ 画面：黑屏 / 镜像 | `IPAToolPiP.Mode` | 是（喂帧时每帧重读，用 `--pip-video` 时该项无意义） |
-| └ 回前台自动退出 | `IPAToolPiP.StopOnForeground` | 是 |
 | 后台保活（总开关） | `IPAToolKeepAlive.Enabled` | 是 |
-| ├ 静音音频 | `SilentAudio` | 是 |
-| └ 后台任务续期 | `RenewBackgroundTask` | 是 |
 | 文件导入导出（常开） | `IPAToolFiles.Enabled` | 否（注入即用，面板没有开关；要关只能改 Info.plist） |
 | ├ 浏览并导出文件（动作行） | — | 打开沙盒文件浏览器 |
 | ├ 导入文件（动作行） | `IPAToolFiles.ImportDir`（默认落地目录） | 挑好落地目录后，在「文件」App 里选文件（可多选） |
@@ -292,7 +246,7 @@ python -m ipatool inject game.ipa --files -o out.ipa                     # 文�
 
 | 隐藏项 | 参数 / 配置键 | 为什么不在面板里 |
 | --- | --- | --- |
-| 画中画的保活音频 | `--pip-no-keep-alive` / `IPAToolPiP.KeepAliveAudio` | 和保活的静音音频重复，关掉还可能导致画中画在后台起不来 |
+| 静音音频 / 任务续期 | `--keep-alive-no-audio` / `SilentAudio`、`--keep-alive-no-task-renew` / `RenewBackgroundTask` | 默认全开，面板只留一个总开关 |
 | 后台定位 | `--keep-alive-location` / `Location` | 要用户授「始终」权限、耗电，且不符合 App Store 审核 |
 | 定时唤醒 | `--keep-alive-fetch` / `Fetch` | 开启要重启 App（launch handler 只能在启动阶段注册），面板上点了也没用 |
 | 导入默认落地目录 | `--files-import-dir` / `ImportDir` | 导入时现挑目录更直观，面板不再预设 |
@@ -302,7 +256,7 @@ python -m ipatool inject game.ipa --files -o out.ipa                     # 文�
 实现约定在 `tweak/IPATControlShared.h`：面板和功能 dylib 之间**只用「通知 + NSUserDefaults」通信**，不引用彼此的类、不链接彼此的符号。因此三者可以任意组合注入、加载顺序随意，单独删掉面板也不影响功能；以后加新功能只要向面板"注册"自己的开关，`ControlPanel.m` 不用改。
 
 > ⚠️ 悬浮窗是一个独立的高层级 `UIWindow`（`windowLevel = UIWindowLevelAlert + 100`），并重写 `canBecomeKeyWindow` 返回 `NO`：不抢 App 的 keyWindow，空白区域的触摸会穿透给 App。但 App 若自己遍历窗口（录屏、镜像、越狱检测）仍可能看到这个多余窗口。
-> 面板只能在 App 前台点开——App 退到后台、画中画浮起来之后是点不到它的。
+> 面板只能在 App 前台点开——App 退到后台之后是点不到它的。
 
 ### 文件导入导出（`--files`）
 
@@ -360,7 +314,7 @@ python -m ipatool inject game.ipa --files --no-files-sharing -o out.ipa   # 不�
 ### 编译内置 tweak
 
 ```bash
-./tweak/build.sh                                       # 产物：tweak/build/{PiPBackground,KeepAlive,ControlPanel,FileBridge}.dylib
+./tweak/build.sh                                       # 产物：tweak/build/{KeepAlive,ControlPanel,FileBridge}.dylib
 IPATOOL_TARGETS=KeepAlive ./tweak/build.sh             # 只编译保活
 IPATOOL_TARGETS=ControlPanel ./tweak/build.sh          # 只编译悬浮窗
 IPATOOL_TARGETS=FileBridge ./tweak/build.sh            # 只编译文件导入导出
@@ -368,15 +322,7 @@ IPATOOL_ARCHS="arm64 arm64e" ./tweak/build.sh
 IPATOOL_MIN_IOS=15.0 ./tweak/build.sh
 ```
 
-tweak 的实现思路（`tweak/PiPBackground.m`）：
-
-- 启动后用 `AVSampleBufferDisplayLayer`（iOS 15+）或 `AVPlayer`（iOS 9+，配合 `--pip-video`）建立一个挂在窗口上的视频层；
-- 用 `AVPictureInPictureController`（iOS 15+ 走 `AVPictureInPictureControllerContentSource`）并打开 `canStartPictureInPictureAutomaticallyFromInline`；
-- 监听 `UIApplicationDidEnterBackgroundNotification`，在切后台时调用 `startPictureInPicture`；
-- 同时以 `.playback` 类别激活 `AVAudioSession` 并循环播放一段内存生成的静音音频，保证有足够的后台执行时间把画中画拉起来；
-- 回到前台（默认）自动 `stopPictureInPicture`。
-
-> ⚠️ 这个 tweak 的源码是按 Apple 公开 API 写的，但我无法在这里编译/真机验证（需要 macOS + Xcode + 真实设备）。真机上如果画中画起不来，优先看控制台里 `[ipatool-pip]` 前缀的日志，常见原因是：`UIBackgroundModes` 没有 `audio`、App 与 dylib 签名不一致、或系统版本低于 iOS 15 且没配 `--pip-video`。
+> ⚠️ 这些 tweak 的源码是按 Apple 公开 API 写的，但我无法在这里编译/真机验证（需要 macOS + Xcode + 真实设备）。
 >
 > 另外请只对你自己有权修改的 App 使用注入功能。
 
@@ -397,11 +343,10 @@ ipatool/
   plistutil.py plist 与 InfoPlist.strings 读写
   bundle.py    bundle 发现与 ID / 名称改写
   macho.py     Mach-O 解析与 LC_LOAD_DYLIB 注入
-  inject.py    dylib 落位、Info.plist 注入配置（画中画 / 后台保活 / 文件导入导出 / 后台模式 / ATS）
+  inject.py    dylib 落位、Info.plist 注入配置（后台保活 / 文件导入导出 / 后台模式 / ATS）
   keystore.py  签名身份管理：身份列举 / p12 导入钥匙串 / Windows 证书导出
   signer.py    codesign / zsign 重签名
 tweak/
-  PiPBackground.m       画中画注入 dylib 源码
   KeepAlive.m           后台保活注入 dylib 源码
   ControlPanel.m        应用内悬浮控制面板（悬浮按钮 + 开关小窗口）
   FileBridge.m          沙盒文件浏览 / 导出到「文件」App / 从「文件」App 导入

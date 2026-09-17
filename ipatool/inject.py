@@ -1,8 +1,7 @@
 """
 dylib 注入：把动态库放进 App 的 Frameworks/ 并给主可执行文件加 LC_LOAD_DYLIB。
 
-附带两种「切后台之后还能继续跑」的配置：
-  - 画中画（--pip）：UIBackgroundModes 补 audio + 写入 IPAToolPiP 配置字典
+附带「切后台之后还能继续跑」的配置：
   - 后台保活（--keep-alive）：UIBackgroundModes 补 audio（可选 location/fetch/processing）
     + 写入 IPAToolKeepAlive 配置字典 + 定时唤醒任务标识 + 定位权限说明
 
@@ -24,11 +23,6 @@ import subprocess
 from . import ipa as ipa_mod
 from . import macho, plistutil
 from .bundle import Bundle, Change
-
-PIP_DYLIB_NAME = "PiPBackground.dylib"
-PIP_INFO_KEY = "IPAToolPiP"
-PIP_DEFAULT_VIDEO = "ipatool_pip.mp4"
-PIP_REQUIRED_BACKGROUND_MODE = "audio"
 
 KEEP_ALIVE_DYLIB_NAME = "KeepAlive.dylib"
 KEEP_ALIVE_INFO_KEY = "IPAToolKeepAlive"
@@ -53,7 +47,6 @@ FILES_DEFAULT_IMPORT_DIR = "Documents"
 
 # 注入的内置 tweak：名字 -> (dylib 文件名, 环境变量)
 TWEAKS = {
-    "PiPBackground": (PIP_DYLIB_NAME, "IPATOOL_PIP_DYLIB"),
     "KeepAlive": (KEEP_ALIVE_DYLIB_NAME, "IPATOOL_KEEPALIVE_DYLIB"),
     PANEL_NAME: (CONTROL_PANEL_DYLIB_NAME, "IPATOOL_CONTROL_DYLIB"),
     FILES_NAME: (FILES_DYLIB_NAME, "IPATOOL_FILES_DYLIB"),
@@ -141,10 +134,6 @@ def locate_tweak_dylib(
     )
 
 
-def locate_pip_dylib(explicit: str | None = None, auto_build: bool = True, log=print) -> str:
-    return locate_tweak_dylib("PiPBackground", explicit=explicit, auto_build=auto_build, log=log)
-
-
 def locate_keep_alive_dylib(explicit: str | None = None, auto_build: bool = True, log=print) -> str:
     return locate_tweak_dylib("KeepAlive", explicit=explicit, auto_build=auto_build, log=log)
 
@@ -211,34 +200,6 @@ def inject_dylib(
     if not added:
         logs.append(f"{os.path.basename(executable)} 中已存在 {load_path}，未重复添加")
     return logs
-
-
-# --------------------------------------------------------------------------- #
-# 画中画配置
-# --------------------------------------------------------------------------- #
-def build_pip_options(
-    mode: str | None = None,
-    start_on: str | None = None,
-    stop_on_foreground: bool | None = None,
-    keep_alive_audio: bool | None = None,
-    frame_rate: int | None = None,
-    video_file: str | None = None,
-) -> dict:
-    """只写入显式指定的项，其余交给 dylib 里的默认值。"""
-    options: dict = {}
-    if mode:
-        options["Mode"] = mode
-    if start_on:
-        options["StartOn"] = start_on
-    if stop_on_foreground is not None:
-        options["StopOnForeground"] = stop_on_foreground
-    if keep_alive_audio is not None:
-        options["KeepAliveAudio"] = keep_alive_audio
-    if frame_rate:
-        options["FrameRate"] = int(frame_rate)
-    if video_file:
-        options["VideoFile"] = video_file
-    return options
 
 
 def build_keep_alive_options(
@@ -380,7 +341,7 @@ def configure_plist(
     changes: list[Change] = []
     warnings: list[str] = []
 
-    # 1) 后台模式（画中画和保活都会要 audio，这里去重）
+    # 1) 后台模式（保活要 audio，这里去重）
     modes = data.get("UIBackgroundModes")
     modes = list(modes) if isinstance(modes, list) else []
     wanted: list[str] = []
@@ -476,12 +437,6 @@ def place_bundle_file(
         except OSError:
             pass
     return [Change(app.rel, dest_name, None, "已放入包内", note=note)]
-
-
-def place_pip_video(app: Bundle, video: str, dry_run: bool = False) -> tuple[list[Change], list[str]]:
-    changes = place_bundle_file(app, video, PIP_DEFAULT_VIDEO, "画中画视频", dry_run=dry_run)
-    warnings = ["自定义视频会以静音方式循环播放，iOS 需支持该编码（H.264 mp4 最稳）"]
-    return changes, warnings
 
 
 def place_keep_alive_audio(app: Bundle, audio: str, dry_run: bool = False) -> tuple[list[Change], list[str]]:

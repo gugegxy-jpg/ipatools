@@ -163,16 +163,6 @@ class IpatoolGui:
         self.v_dry_run = tk.BooleanVar(value=False)
         self.v_verbose = tk.BooleanVar(value=False)
 
-        # 画中画
-        self.v_pip = tk.BooleanVar(value=False)
-        self.v_pip_dylib = tk.StringVar()
-        self.v_pip_video = tk.StringVar()
-        self.v_pip_mode = tk.StringVar(value=OPT_DEFAULT)
-        self.v_pip_start_on = tk.StringVar(value=OPT_DEFAULT)
-        self.v_pip_frame_rate = tk.StringVar()
-        self.v_pip_keep_foreground = tk.BooleanVar(value=False)
-        self.v_pip_no_keep_alive = tk.BooleanVar(value=False)
-
         # 后台保活
         self.v_keep_alive = tk.BooleanVar(value=False)
         self.v_ka_dylib = tk.StringVar()
@@ -370,34 +360,10 @@ class IpatoolGui:
         page.columnconfigure(0, weight=1, uniform="col")
         page.columnconfigure(1, weight=1, uniform="col")
 
-        self._build_pip_group(page).grid(row=0, column=0, sticky="new", padx=(0, 6), pady=(0, 8))
-        self._build_files_group(page).grid(row=0, column=1, sticky="new", padx=(6, 0), pady=(0, 8))
-        self._build_keepalive_group(page).grid(row=1, column=0, sticky="new", padx=(0, 6), pady=(0, 8))
-        self._build_panel_group(page).grid(row=1, column=1, sticky="new", padx=(6, 0), pady=(0, 8))
+        self._build_files_group(page).grid(row=0, column=0, sticky="new", padx=(0, 6), pady=(0, 8))
+        self._build_keepalive_group(page).grid(row=0, column=1, sticky="new", padx=(6, 0), pady=(0, 8))
+        self._build_panel_group(page).grid(row=1, column=0, sticky="new", padx=(0, 6), pady=(0, 8))
         self._build_misc_group(page).grid(row=2, column=0, columnspan=2, sticky="new", pady=(0, 4))
-
-    def _build_pip_group(self, parent) -> ttk.LabelFrame:
-        box = ttk.LabelFrame(parent, text=" 画中画 ", padding=(10, 6))
-        box.columnconfigure(0, weight=1)
-
-        ttk.Checkbutton(
-            box, text="注入画中画 tweak（切后台自动进入画中画，从而继续运行）",
-            variable=self.v_pip,
-        ).grid(row=0, column=0, columnspan=3, sticky="w")
-        self._entry(box, 1, "tweak 路径", self.v_pip_dylib, "留空自动查找 tweak/build/（macOS 上会自动编译）", browse=self._pick_pip_dylib, width=30)
-        self._entry(box, 2, "循环视频", self.v_pip_video, "mp4，不给则显示黑屏/镜像", browse=lambda: self._pick_file(self.v_pip_video, [("视频", "*.mp4"), ("所有文件", "*.*")]), width=30)
-        self._combo(box, 3, "画面", self.v_pip_mode, ["black", "mirror"])
-        self._combo(box, 4, "启动时机", self.v_pip_start_on, ["background", "resignActive", "launch"])
-        self._entry(box, 5, "帧率", self.v_pip_frame_rate, "默认 10", width=12)
-        ttk.Checkbutton(
-            box, text="回到前台也保持画中画（--pip-keep-foreground）",
-            variable=self.v_pip_keep_foreground,
-        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(4, 0))
-        ttk.Checkbutton(
-            box, text="不播放静音音频保活（--pip-no-keep-alive）",
-            variable=self.v_pip_no_keep_alive,
-        ).grid(row=7, column=0, columnspan=3, sticky="w")
-        return box
 
     def _build_keepalive_group(self, parent) -> ttk.LabelFrame:
         box = ttk.LabelFrame(parent, text=" 后台保活 ", padding=(10, 6))
@@ -590,9 +556,6 @@ class IpatoolGui:
         path = filedialog.askopenfilename(title="选择文件", filetypes=filetypes or [("所有文件", "*.*")])
         if path:
             var.set(path)
-
-    def _pick_pip_dylib(self) -> None:
-        self._pick_file(self.v_pip_dylib, [("动态库", "*.dylib"), ("所有文件", "*.*")])
 
     def _pick_ka_dylib(self) -> None:
         self._pick_file(self.v_ka_dylib, [("动态库", "*.dylib"), ("所有文件", "*.*")])
@@ -816,16 +779,6 @@ class IpatoolGui:
             return None
         argv = ["inject", src]
 
-        if self.v_pip.get():
-            argv.append("--pip")
-            _add(argv, "--pip-dylib", self.v_pip_dylib.get())
-            _add(argv, "--pip-video", self.v_pip_video.get())
-            _add(argv, "--pip-mode", _opt(self.v_pip_mode))
-            _add(argv, "--pip-start-on", _opt(self.v_pip_start_on))
-            _add(argv, "--pip-frame-rate", self.v_pip_frame_rate.get())
-            _flag(argv, "--pip-keep-foreground", self.v_pip_keep_foreground.get())
-            _flag(argv, "--pip-no-keep-alive", self.v_pip_no_keep_alive.get())
-
         if self.v_keep_alive.get():
             argv.append("--keep-alive")
             _add(argv, "--keep-alive-dylib", self.v_ka_dylib.get())
@@ -864,12 +817,12 @@ class IpatoolGui:
         argv += self._common_args()
 
         if not self.custom_dylibs and not any(
-            (self.v_pip.get(), self.v_keep_alive.get(), self.v_files.get(),
+            (self.v_keep_alive.get(), self.v_files.get(),
              self.v_panel.get(), self.v_background_mode.get().strip(), self.v_allow_arbitrary_loads.get())
         ):
             messagebox.showwarning(
                 "没有要注入的东西",
-                "请勾选画中画 / 后台保活 / 文件导入导出 / 悬浮窗，或添加自定义 dylib。",
+                "请勾选后台保活 / 文件导入导出 / 悬浮窗，或添加自定义 dylib。",
             )
             return None
         return argv

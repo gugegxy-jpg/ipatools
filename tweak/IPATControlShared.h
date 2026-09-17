@@ -1,6 +1,6 @@
 //
 //  IPATControlShared.h
-//  悬浮控制面板（ControlPanel.dylib）与各功能 dylib（PiPBackground / KeepAlive）之间的约定。
+//  悬浮控制面板（ControlPanel.dylib）与各功能 dylib（KeepAlive / FileBridge）之间的约定。
 //
 //  刻意只用「通知 + NSUserDefaults」通信：
 //    - 不引用彼此的类、不链接彼此的符号，谁先加载都不影响
@@ -34,7 +34,6 @@
 
 #pragma mark - 功能标识
 
-#define IPATFeaturePiP @"pip"
 #define IPATFeatureKeepAlive @"keepalive"
 #define IPATFeatureFiles @"files"
 
@@ -87,14 +86,7 @@
 // 键的取值含义与 Info.plist 里同名配置保持一致（不取反），面板上的文案负责表达。
 // 面板只暴露常用项；标注「仅 plist」的没有面板开关，只能用 Info.plist / 命令行参数配置。
 
-#define IPATKeyPiPEnabled @"IPAToolPanelPiPEnabled"
-#define IPATKeyPiPMode @"IPAToolPanelPiPMode"
-#define IPATKeyPiPStopOnForeground @"IPAToolPanelPiPStopOnForeground"
-#define IPATKeyPiPAudio @"IPAToolPanelPiPAudio"  // 仅 plist：画中画的保活音频，默认开，关了可能起不来画中画
-
 #define IPATKeyKAEnabled @"IPAToolPanelKeepAliveEnabled"
-#define IPATKeyKASilentAudio @"IPAToolPanelKeepAliveAudio"
-#define IPATKeyKARenew @"IPAToolPanelKeepAliveRenew"
 #define IPATKeyKAFetch @"IPAToolPanelKeepAliveFetch"        // 仅 plist：开启要重启 App，面板上点了没用
 #define IPATKeyKALocation @"IPAToolPanelKeepAliveLocation"  // 仅 plist：要授权、耗电、过不了审
 

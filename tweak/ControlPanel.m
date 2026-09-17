@@ -1,6 +1,6 @@
 //
 //  ControlPanel.m
-//  ipatool 注入用 dylib：应用内悬浮窗 + 小面板，实时开关「画中画」「后台保活」「文件导入导出」。
+//  ipatool 注入用 dylib：应用内悬浮窗 + 小面板，实时开关「后台保活」「文件导入导出」。
 //
 //  设计要点：
 //    1. 自己建一个高层级 UIWindow（canBecomeKeyWindow = NO）：
@@ -105,7 +105,6 @@ static UIWindowScene *IPATCpActiveWindowScene(void) {
 #pragma mark - 悬浮窗 / 穿透视图
 
 /// 悬浮窗：绝不能变成 keyWindow，否则 App 自己的窗口会 resignKey（游戏可能直接暂停）
-/// 注意：类名被 PiPBackground.m 当成字符串常量用来跳过悬浮窗（overlayWindowClass），改名要同步
 @interface IPATCpWindow : UIWindow
 @end
 
@@ -553,7 +552,7 @@ static UIWindowScene *IPATCpActiveWindowScene(void) {
         empty.numberOfLines = 2;
         empty.font = [UIFont systemFontOfSize:12.0];
         empty.textColor = [UIColor colorWithWhite:1.0 alpha:0.6];
-        empty.text = @"没有检测到可控制的功能。\n请确认注入了画中画 / 后台保活 / 文件导入导出组件。";
+        empty.text = @"没有检测到可控制的功能。\n请确认注入了后台保活 / 文件导入导出组件。";
         [self.contentView addSubview:empty];
         y += 52;
     } else {
@@ -580,7 +579,7 @@ static UIWindowScene *IPATCpActiveWindowScene(void) {
 
 /// 顺序固定一下，免得每次加载顺序不同导致界面跳来跳去
 - (NSArray<NSString *> *)sortedFeatureIds {
-    NSArray *order = @[IPATFeaturePiP, IPATFeatureKeepAlive, IPATFeatureFiles];
+    NSArray *order = @[IPATFeatureKeepAlive, IPATFeatureFiles];
     NSMutableArray<NSString *> *ids = [NSMutableArray array];
     for (NSString *featureId in order) {
         if (self.features[featureId]) [ids addObject:featureId];

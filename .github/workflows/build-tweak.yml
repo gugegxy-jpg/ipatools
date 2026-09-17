@@ -42,7 +42,7 @@ jobs:
         env:
           IPATOOL_MIN_IOS: ${{ inputs.min_ios || '14.0' }}
           IPATOOL_ARCHS: ${{ inputs.archs || 'arm64' }}
-          IPATOOL_TARGETS: PiPBackground KeepAlive ControlPanel FileBridge
+          IPATOOL_TARGETS: KeepAlive ControlPanel FileBridge
         run: |
           mkdir -p tweak/build
           chmod +x tweak/build.sh
@@ -80,7 +80,7 @@ jobs:
         continue-on-error: true
         run: |
           python3 -m ipatool inject demo/build/IPATDemo.ipa \
-            --pip --keep-alive --files --in-place --sign none 2>&1 | tee demo-inject.log
+            --keep-alive --files --in-place --sign none 2>&1 | tee demo-inject.log
           echo "=== 注入后核对 ===" | tee -a demo-inject.log
           python3 -m ipatool inject demo/build/IPATDemo.ipa --list 2>&1 | tee -a demo-inject.log
           python3 -m ipatool info demo/build/IPATDemo.ipa 2>&1 | tee -a demo-inject.log

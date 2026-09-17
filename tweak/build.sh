@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 #
-# 编译注入用的 dylib（画中画 / 后台保活 / 悬浮控制面板 / 文件导入导出）。需要 macOS + Xcode 命令行工具：
+# 编译注入用的 dylib（后台保活 / 悬浮控制面板 / 文件导入导出）。需要 macOS + Xcode 命令行工具：
 #   xcode-select --install
 #
-#   ./tweak/build.sh                               编译全部（四个目标）
+#   ./tweak/build.sh                               编译全部（三个目标）
 #   IPATOOL_TARGETS=KeepAlive ./tweak/build.sh     只编译指定目标
 #
 # 可通过环境变量调整：
-#   IPATOOL_MIN_IOS   最低系统版本，默认 14.0（画中画内置画面源需要 iOS 15+）
+#   IPATOOL_MIN_IOS   最低系统版本，默认 14.0
 #   IPATOOL_ARCHS     架构列表，默认 "arm64"（可写 "arm64 arm64e"）
 #   IPATOOL_OUT_DIR   产物目录，默认 tweak/build
-#   IPATOOL_TARGETS   目标列表，默认 "PiPBackground KeepAlive ControlPanel FileBridge"
+#   IPATOOL_TARGETS   目标列表，默认 "KeepAlive ControlPanel FileBridge"
 #
 set -euo pipefail
 
@@ -18,7 +18,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT_DIR="${IPATOOL_OUT_DIR:-$HERE/build}"
 MIN_IOS="${IPATOOL_MIN_IOS:-14.0}"
 ARCHS="${IPATOOL_ARCHS:-arm64}"
-TARGETS="${IPATOOL_TARGETS:-PiPBackground KeepAlive ControlPanel FileBridge}"
+TARGETS="${IPATOOL_TARGETS:-KeepAlive ControlPanel FileBridge}"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "错误：编译 iOS dylib 需要 macOS + Xcode 命令行工具（当前系统：$(uname -s)）" >&2
@@ -49,7 +49,6 @@ build_target() {
   fi
 
   case "$name" in
-    PiPBackground) extra=(-weak_framework AVKit) ;;
     KeepAlive)     extra=(-framework CoreLocation -weak_framework BackgroundTasks) ;;
     ControlPanel)  extra=() ;;
     # UniformTypeIdentifiers 是 iOS 14 才有的框架，用 weak 链接兼容更低的部署目标
