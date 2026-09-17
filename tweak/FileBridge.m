@@ -31,7 +31,6 @@
 
 /// 动作行的标识（只是本 dylib 内部的字符串，不写 NSUserDefaults）
 static NSString *const IPATFbActionBrowse = @"files.browse";
-static NSString *const IPATFbActionImport = @"files.import";
 static NSString *const IPATFbActionImportTo = @"files.importTo";
 
 /// 浏览器的用途：导出时勾选内容，或给导入挑一个落地文件夹
@@ -529,25 +528,18 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
         IPATRegDetail: @"导出 / 导入游戏热更资源",
         IPATRegMasterKey: IPATKeyFilesEnabled,
         IPATRegEnabled: @(IPATFbEnabled()),
+        // 面板只留两个动作行：导入的落地目录在浏览器里挑，默认取 ImportDir
+        // （Info.plist / --files-import-dir，默认 Documents）
         IPATRegRows: @[
-            @{IPATRowKey: IPATKeyFilesImportDir,
-              IPATRowTitle: @"导入到",
-              IPATRowKind: IPATRowKindSegment,
-              IPATRowOptions: @[@"Documents", @"Library/Caches", @"Library/Application Support"],
-              IPATRowValues: @[@"Documents", @"Library/Caches", @"Library/Application Support"],
-              IPATRowValue: IPATFbImportRelative()},
             @{IPATRowKey: IPATFbActionBrowse,
               IPATRowTitle: @"浏览并导出文件",
               IPATRowKind: IPATRowKindAction,
               IPATRowNote: @"选文件夹或文件，导出到「文件」App"},
-            @{IPATRowKey: IPATFbActionImport,
-              IPATRowTitle: @"从「文件」App 导入",
-              IPATRowKind: IPATRowKindAction,
-              IPATRowNote: @"支持多选文件 / 文件夹，落到上面的目录"},
             @{IPATRowKey: IPATFbActionImportTo,
-              IPATRowTitle: @"导入到指定文件夹",
+              IPATRowTitle: @"导入文件",
               IPATRowKind: IPATRowKindAction,
-              IPATRowNote: @"先挑沙盒里的文件夹，再选要导入的内容"},
+              IPATRowNote: [NSString stringWithFormat:@"进沙盒挑落地目录，默认 %@",
+                                                      IPATFbImportRelative()]},
         ],
     };
     [[NSNotificationCenter defaultCenter] postNotificationName:IPATControlRegisterNotification
@@ -588,8 +580,6 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
     NSString *key = userInfo[IPATActKey];
     if ([key isEqualToString:IPATFbActionBrowse]) {
         [self openBrowserWithMode:IPATFbBrowserModeExport];
-    } else if ([key isEqualToString:IPATFbActionImport]) {
-        [self openImporterToDirectory:nil];
     } else if ([key isEqualToString:IPATFbActionImportTo]) {
         [self openBrowserWithMode:IPATFbBrowserModeImportTarget];
     }
@@ -602,7 +592,16 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
         [self postStatus:@"功能已关闭"];
         return;
     }
+    // 挑落地目录时直接从默认导入目录开始，省得每次从沙盒根一层层点进去
     NSString *root = IPATFbBrowseRoot();
+    if (mode == IPATFbBrowserModeImportTarget) {
+        NSString *import = IPATFbImportDirectory();
+        BOOL importIsDir = NO;
+        if ([[NSFileManager defaultManager] fileExistsAtPath:import isDirectory:&importIsDir]
+            && importIsDir) {
+            root = import;
+        }
+    }
     BOOL isDir = NO;
     if (![[NSFileManager defaultManager] fileExistsAtPath:root isDirectory:&isDir] || !isDir) {
         [self postStatus:@"浏览根目录不存在"];

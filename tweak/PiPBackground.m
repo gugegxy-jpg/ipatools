@@ -514,6 +514,8 @@ static CMSampleBufferRef IPATPipCreateSampleBuffer(CVPixelBufferRef pixelBuffer,
         IPATRegDetail: @"切后台自动进入画中画",
         IPATRegMasterKey: IPATKeyPiPEnabled,
         IPATRegEnabled: @(IPATPipBool(@"Enabled", YES)),
+        // 面板只放常用的两项：保活音频和保活模块重复，而且关掉它会让画中画在后台起不来，
+        // 真要调就改 Info.plist 的 IPAToolPiP.KeepAliveAudio
         IPATRegRows: @[
             @{IPATRowKey: IPATKeyPiPMode,
               IPATRowTitle: @"画面",
@@ -525,9 +527,6 @@ static CMSampleBufferRef IPATPipCreateSampleBuffer(CVPixelBufferRef pixelBuffer,
             @{IPATRowKey: IPATKeyPiPStopOnForeground,
               IPATRowTitle: @"回前台自动退出",
               IPATRowValue: @(IPATPipBool(@"StopOnForeground", YES))},
-            @{IPATRowKey: IPATKeyPiPAudio,
-              IPATRowTitle: @"静音音频保活",
-              IPATRowValue: @(IPATPipBool(@"KeepAliveAudio", YES))},
         ],
     };
     [[NSNotificationCenter defaultCenter] postNotificationName:IPATControlRegisterNotification

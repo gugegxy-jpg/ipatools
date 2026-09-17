@@ -278,17 +278,22 @@ python -m ipatool inject game.ipa --files -o out.ipa                     # 文�
 | --- | --- | --- |
 | 画中画（总开关） | `IPAToolPiP.Enabled` | 是 |
 | ├ 画面：黑屏 / 镜像 | `IPAToolPiP.Mode` | 是（喂帧时每帧重读，用 `--pip-video` 时该项无意义） |
-| ├ 回前台自动退出 | `IPAToolPiP.StopOnForeground` | 是 |
-| └ 静音音频保活 | `IPAToolPiP.KeepAliveAudio` | 是 |
+| └ 回前台自动退出 | `IPAToolPiP.StopOnForeground` | 是 |
 | 后台保活（总开关） | `IPAToolKeepAlive.Enabled` | 是 |
 | ├ 静音音频 | `SilentAudio` | 是 |
-| ├ 后台任务续期 | `RenewBackgroundTask` | 是 |
-| ├ 定时唤醒 | `Fetch` | **开启要重启 App**（launch handler 只能在启动阶段注册），关闭立即生效 |
-| └ 后台定位 | `Location` | 是 |
+| └ 后台任务续期 | `RenewBackgroundTask` | 是 |
 | 文件导入导出（总开关） | `IPAToolFiles.Enabled` | 是（关掉后点动作行只提示“功能已关闭”） |
-| ├ 导入到 | `IPAToolFiles.ImportDir` | 下次导入生效 |
 | ├ 浏览并导出文件（动作行） | — | 打开沙盒文件浏览器 |
-| └ 从「文件」App 导入（动作行） | — | 打开系统文件选择器 |
+| └ 导入文件（动作行） | `IPAToolFiles.ImportDir`（默认落地目录） | 打开沙盒目录选择器，挑完再选「文件」App 里的内容 |
+
+面板刻意只放常用项。下面这些**没有面板开关**，需要就用命令行参数（会写进 Info.plist）：
+
+| 隐藏项 | 参数 / 配置键 | 为什么不在面板里 |
+| --- | --- | --- |
+| 画中画的保活音频 | `--pip-no-keep-alive` / `IPAToolPiP.KeepAliveAudio` | 和保活的静音音频重复，关掉还可能导致画中画在后台起不来 |
+| 后台定位 | `--keep-alive-location` / `Location` | 要用户授「始终」权限、耗电，且不符合 App Store 审核 |
+| 定时唤醒 | `--keep-alive-fetch` / `Fetch` | 开启要重启 App（launch handler 只能在启动阶段注册），面板上点了也没用 |
+| 导入默认落地目录 | `--files-import-dir` / `ImportDir` | 导入时现挑目录更直观，面板不再预设 |
 
 面板写入的值存在 `NSUserDefaults`（键名前缀 `IPAToolPanel`），**优先级高于 Info.plist 里的初始值**：命令行参数只决定"用户还没在面板里改过时"的默认状态。想回到命令行给的默认值，就删掉 App 的偏好设置或卸载重装。
 
@@ -311,11 +316,13 @@ python -m ipatool inject game.ipa --files --no-files-sharing -o out.ipa   # 不�
 怎么用（都在悬浮面板的「文件导入导出」一节里）：
 
 1. **浏览并导出文件**
-   - 点目录进入，点文件打勾，右上角「导出」把勾选的文件导出；
-   - 一个都不勾，就导出**当前文件夹本身**（这就是"手动选文件夹"）；
+   - 点文件夹进入；点文件夹右侧的圆圈 = 勾选整个文件夹，点文件 = 勾选该文件，两者可混选；
+   - 右上角「导出」导出勾选的内容；顶部还有「全选本目录文件」「导出整个文件夹」两个快捷入口；
    - 接着系统的「文件」App 选择器会让你挑保存位置，也可以直接存进「我的 iPhone / 本机」或 iCloud 云盘。
-2. **从「文件」App 导入**
-   - 多选文件 / 文件夹，导入到面板上「导入到」选定的目录（默认 `Documents`）。
+2. **导入文件**
+   - 先打开沙盒目录选择器，停在默认落地目录（`--files-import-dir`，默认 `Documents`），
+     进到想放的目录后点右上角「导入到这里」；
+   - 再在系统「文件」App 里多选文件 / 文件夹，整包带目录结构复制进沙盒。
 
 | 参数 | 说明 |
 | --- | --- |
@@ -342,7 +349,7 @@ python -m ipatool inject game.ipa --files --no-files-sharing -o out.ipa   # 不�
 > - 导出走系统文档选择器，会**先让悬浮窗躲起来**（悬浮窗层级比系统弹窗还高，不躲会盖在选择器上），关掉后自动回来。这是通过共享头里的 `IPATControlVisibility` 通知实现的。
 > - 导出/导入都用 `asCopy`：沙盒里的原文件不受影响；导入的内容由系统先复制到临时目录，再搬进沙盒。
 > - 导入同名文件**不覆盖**，自动加 `-2`、`-3` 后缀；浏览界面默认跳过 `.` 开头的隐藏项。
-> - 用 `--files-import-dir` 指定了面板选项以外的目录时，面板上会显示成第一项，但实际仍按配置的目录走。
+> - `--files-import-dir` 指定的是导入的**默认落地目录**：面板「导入文件」会停在这个目录，动作行下方也会显示它，临时想换别的文件夹在界面里点进去即可。
 > - 装完在「文件」App 里看不到该 App，卸载重装一次（可见性在安装时被系统读取）。
 > - 真机排查看控制台里 `[ipatool-files]` 前缀的日志。
 

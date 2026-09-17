@@ -300,6 +300,8 @@ static NSData *IPATKASilentWAV(double seconds, uint32_t sampleRate) {
         IPATRegDetail: @"切后台后进程不被挂起",
         IPATRegMasterKey: IPATKeyKAEnabled,
         IPATRegEnabled: @(IPATKABool(@"Enabled", YES)),
+        // 面板只放常用的两项：定位要授权还费电、定时唤醒改了要重启 App，
+        // 这两项留给 Info.plist（--keep-alive-location / --keep-alive-fetch）
         IPATRegRows: @[
             @{IPATRowKey: IPATKeyKASilentAudio,
               IPATRowTitle: @"静音音频",
@@ -307,14 +309,6 @@ static NSData *IPATKASilentWAV(double seconds, uint32_t sampleRate) {
             @{IPATRowKey: IPATKeyKARenew,
               IPATRowTitle: @"后台任务续期",
               IPATRowValue: @(IPATKABool(@"RenewBackgroundTask", YES))},
-            @{IPATRowKey: IPATKeyKAFetch,
-              IPATRowTitle: @"定时唤醒",
-              IPATRowValue: @(IPATKABool(@"Fetch", NO)),
-              IPATRowNote: @"注册只能在启动时做，开启需重启 App"},
-            @{IPATRowKey: IPATKeyKALocation,
-              IPATRowTitle: @"后台定位",
-              IPATRowValue: @(IPATKABool(@"Location", NO)),
-              IPATRowNote: @"耗电，需「始终允许」定位权限"},
         ],
     };
     [[NSNotificationCenter defaultCenter] postNotificationName:IPATControlRegisterNotification

@@ -84,20 +84,21 @@
 #pragma mark - 面板写入的 NSUserDefaults 键
 // 功能侧先用这些键查 NSUserDefaults，查不到再回落到 Info.plist 的初始值。
 // 键的取值含义与 Info.plist 里同名配置保持一致（不取反），面板上的文案负责表达。
+// 面板只暴露常用项；标注「仅 plist」的没有面板开关，只能用 Info.plist / 命令行参数配置。
 
 #define IPATKeyPiPEnabled @"IPAToolPanelPiPEnabled"
 #define IPATKeyPiPMode @"IPAToolPanelPiPMode"
 #define IPATKeyPiPStopOnForeground @"IPAToolPanelPiPStopOnForeground"
-#define IPATKeyPiPAudio @"IPAToolPanelPiPAudio"
+#define IPATKeyPiPAudio @"IPAToolPanelPiPAudio"  // 仅 plist：画中画的保活音频，默认开，关了可能起不来画中画
 
 #define IPATKeyKAEnabled @"IPAToolPanelKeepAliveEnabled"
 #define IPATKeyKASilentAudio @"IPAToolPanelKeepAliveAudio"
 #define IPATKeyKARenew @"IPAToolPanelKeepAliveRenew"
-#define IPATKeyKAFetch @"IPAToolPanelKeepAliveFetch"
-#define IPATKeyKALocation @"IPAToolPanelKeepAliveLocation"
+#define IPATKeyKAFetch @"IPAToolPanelKeepAliveFetch"        // 仅 plist：开启要重启 App，面板上点了没用
+#define IPATKeyKALocation @"IPAToolPanelKeepAliveLocation"  // 仅 plist：要授权、耗电、过不了审
 
 #define IPATKeyFilesEnabled @"IPAToolPanelFilesEnabled"
-#define IPATKeyFilesImportDir @"IPAToolPanelFilesImportDir"  // 导入落地目录（相对沙盒）
+#define IPATKeyFilesImportDir @"IPAToolPanelFilesImportDir"  // 仅 plist：导入的默认落地目录（相对沙盒）
 
 #define IPATKeyButtonFrame @"IPAToolPanelButtonFrame"  // 悬浮按钮位置，NSStringFromCGRect
 
