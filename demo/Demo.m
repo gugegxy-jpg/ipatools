@@ -253,7 +253,6 @@ willConnectToSession:(UISceneSession *)session
 
 @implementation IPATAppDelegate
 
-API_AVAILABLE(ios(13.0))
 - (UISceneConfiguration *)application:(UIApplication *)application
 configurationForConnectingSceneSession:(UISceneSession *)session
                               options:(UISceneConnectionOptions *)options {
