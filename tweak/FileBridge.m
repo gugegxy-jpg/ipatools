@@ -161,6 +161,42 @@ static NSString *IPATFbUniquePath(NSString *directory, NSString *name) {
     return [directory stringByAppendingPathComponent:[NSUUID UUID].UUIDString];
 }
 
+/// 先拷到同卷临时名（.ipatool-part），成功后再挪到最终位置。
+/// 热更期间游戏可能在扫描目标目录，直接往里拷会读到半成品；
+/// 同卷 rename 是原子操作，游戏要么看到完整的旧内容、要么看到完整的新内容。
+static BOOL IPATFbCopyThenRename(NSURL *source, NSString *target, BOOL isDirectory, NSError **error) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *staging = [target stringByAppendingPathExtension:@"ipatool-part"];
+    for (NSInteger i = 2; [fm fileExistsAtPath:staging]; i++) {
+        staging = [NSString stringWithFormat:@"%@-%ld.ipatool-part", target, (long)i];
+    }
+
+    BOOL ok = NO;
+    if (isDirectory) {
+        ok = [fm copyItemAtURL:source toURL:[NSURL fileURLWithPath:staging] error:error];
+        if (!ok) {
+            NSError *fallbackError = nil;
+            ok = IPATFbCopyDirectory(source, staging, &fallbackError);
+            if (error && !ok && fallbackError) *error = fallbackError;
+        }
+    } else {
+        ok = [fm copyItemAtURL:source toURL:[NSURL fileURLWithPath:staging] error:error];
+    }
+    if (!ok) {
+        [fm removeItemAtPath:staging error:NULL];   // 拷一半失败不留残缺目录
+        return NO;
+    }
+
+    // 拷贝期间目标位可能被游戏新建了同名文件，最终名重新算一遍
+    NSString *final = IPATFbUniquePath([target stringByDeletingLastPathComponent],
+                                       [target lastPathComponent]);
+    if (![fm moveItemAtPath:staging toPath:final error:error]) {
+        [fm removeItemAtPath:staging error:NULL];
+        return NO;
+    }
+    return YES;
+}
+
 /// 绝对路径 -> 相对沙盒的显示文本，给面板状态用
 static NSString *IPATFbDisplayPath(NSString *path) {
     NSString *home = NSHomeDirectory();
@@ -660,14 +696,24 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
 
 - (void)exportPaths:(NSArray<NSString *> *)paths from:(UIViewController *)presenter {
     NSMutableArray<NSURL *> *urls = [NSMutableArray array];
+    NSInteger missing = 0;
     for (NSString *path in paths) {
         if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
             [urls addObject:[NSURL fileURLWithPath:path]];
+        } else {
+            missing++;   // 常见于热更把文件删了 / 改名了，浏览器列表是旧快照
         }
     }
     if (urls.count == 0) {
-        [self postStatus:@"没有可导出的内容"];
+        [self postStatus:missing > 0
+            ? @"没有可导出的内容（所选文件已不存在，可能被热更删除）"
+            : @"没有可导出的内容"];
         return;
+    }
+    if (missing > 0) {
+        [self postStatus:[NSString stringWithFormat:@"有 %ld 项已不存在被跳过（可能被热更删除）",
+                                                    (long)missing]];
+        IPATFbLog(@"导出跳过 %ld 个不存在的路径", (long)missing);
     }
 
     self.purpose = IPATFbPickerExport;
@@ -778,21 +824,12 @@ static BOOL IPATFbCopyDirectory(NSURL *source, NSString *destination, NSError **
         [url getResourceValue:&isDirectory forKey:NSURLIsDirectoryKey error:NULL];
 
         NSError *copyError = nil;
-        BOOL ok = NO;
-        if ([isDirectory boolValue]) {
-            // 文件夹：先让系统整拷，不行再自己递归
-            ok = [fm copyItemAtURL:url toURL:[NSURL fileURLWithPath:target] error:&copyError];
-            if (!ok) {
-                copyError = nil;
-                ok = IPATFbCopyDirectory(url, target, &copyError);
-            }
-            if (ok) folders++;
-        } else {
-            ok = [fm copyItemAtURL:url toURL:[NSURL fileURLWithPath:target] error:&copyError];
-        }
+        // 临时目录 + 原子 rename：热更运行中导入也不给游戏暴露半成品
+        BOOL ok = IPATFbCopyThenRename(url, target, [isDirectory boolValue], &copyError);
 
         if (ok) {
             copied++;
+            if ([isDirectory boolValue]) folders++;
         } else {
             lastError = copyError;
         }
