@@ -1332,7 +1332,7 @@ static BOOL IPATFbZipParseEntry(const uint8_t *cd, uint64_t cdSize, uint64_t *po
     }
 
     *name = IPATFbZipDecodeName(e + 46, nameLen, *flags);
-    *isDirectory = [name hasSuffix:@"/"] || (extAttr & 0x10) != 0;
+    *isDirectory = [*name hasSuffix:@"/"] || (extAttr & 0x10) != 0;
     *pos += 46 + (uint64_t)nameLen + extraLen + commentLen;
     return YES;
 }
