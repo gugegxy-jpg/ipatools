@@ -41,9 +41,14 @@ jobs:
         env:
           IPATOOL_MIN_IOS: ${{ inputs.min_ios || '14.0' }}
           IPATOOL_ARCHS: ${{ inputs.archs || 'arm64' }}
+          IPATOOL_TARGETS: PiPBackground KeepAlive ControlPanel FileBridge
         run: |
+          mkdir -p tweak/build
           chmod +x tweak/build.sh
-          ./tweak/build.sh
+          ./tweak/build.sh 2>&1 | tee tweak/build/_build.log
+          echo "=== build.sh exit=${PIPESTATUS[0]} ===" | tee -a tweak/build/_build.log
+          echo "=== ls -la tweak/build ===" | tee -a tweak/build/_build.log
+          ls -la tweak/build 2>&1 | tee -a tweak/build/_build.log
 
       - name: Verify artifacts
         run: |
@@ -60,10 +65,17 @@ jobs:
             codesign -dvvv "$f" 2>&1 | head -3 || true
           done
 
+      - name: Pack build directory
+        run: |
+          zip -r build-artifacts.zip tweak/build -x "*.DS_Store"
+          unzip -l build-artifacts.zip
+
       - uses: actions/upload-artifact@v4
         with:
           name: ipatool-tweaks
-          path: tweak/build/*.dylib
+          path: |
+            tweak/build/*.dylib
+            tweak/build/_build.log
           if-no-files-found: error
           retention-days: 90
 
@@ -73,7 +85,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: build-${{ github.run_number }}
         run: |
-          gh release create "$TAG" tweak/build/*.dylib \
+          gh release create "$TAG" tweak/build/*.dylib build-artifacts.zip \
             --title "$TAG" \
             --notes "Actions 自动编译：run ${{ github.run_number }} / commit ${{ github.sha }}" \
             --latest=false
