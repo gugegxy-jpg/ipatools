@@ -27,6 +27,7 @@ echo "编译 ${EXE} (arm64 / min iOS 14.0)"
   -isysroot "$SDK" \
   -miphoneos-version-min=14.0 \
   -fobjc-arc -O2 -Wall \
+  -Wl,-headerpad_max_install_names \
   -framework Foundation \
   -framework UIKit \
   -framework AVFoundation \
