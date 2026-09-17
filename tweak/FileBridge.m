@@ -164,6 +164,9 @@ static NSString *IPATFbUniquePath(NSString *directory, NSString *name) {
 /// 先拷到同卷临时名（.ipatool-part），成功后再挪到最终位置。
 /// 热更期间游戏可能在扫描目标目录，直接往里拷会读到半成品；
 /// 同卷 rename 是原子操作，游戏要么看到完整的旧内容、要么看到完整的新内容。
+/// 前向声明：实现在下面（C 不允许调用未声明的函数）
+static BOOL IPATFbCopyDirectory(NSURL *source, NSString *destination, NSError **error);
+
 static BOOL IPATFbCopyThenRename(NSURL *source, NSString *target, BOOL isDirectory, NSError **error) {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *staging = [target stringByAppendingPathExtension:@"ipatool-part"];
@@ -768,17 +771,21 @@ static BOOL IPATFbCopyDirectory(NSURL *source, NSString *destination, NSError **
     // 安全作用域 / iCloud 的目录要经 NSFileCoordinator 协调后再枚举，
     // 否则没下载完的项会直接枚举失败
     __block NSArray<NSURL *> *items = nil;
+    __block NSError *coordError = nil;
     NSFileCoordinator *coordinator = [[NSFileCoordinator alloc] initWithFilePresenter:nil];
     [coordinator coordinateReadingItemAtURL:source
                                     options:0
-                                      error:error
+                                      error:&coordError
                                  byAccessor:^(NSURL *coordinatedURL) {
         items = [fm contentsOfDirectoryAtURL:coordinatedURL
                  includingPropertiesForKeys:@[NSURLIsDirectoryKey]
                                     options:0
-                                      error:error];
+                                      error:&coordError];
     }];
-    if (!items) return NO;
+    if (!items) {
+        if (error && coordError) *error = coordError;
+        return NO;
+    }
 
     BOOL ok = YES;
     for (NSURL *item in items) {
