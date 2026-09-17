@@ -43,8 +43,9 @@
 #define IPATRegId @"id"             // 功能标识，IPATFeature*，必填
 #define IPATRegTitle @"title"       // 面板里的小标题，必填
 #define IPATRegDetail @"detail"     // 标题下的一行说明，可选
-#define IPATRegMasterKey @"masterKey"  // 主开关写进 NSUserDefaults 的键，必填
+#define IPATRegMasterKey @"masterKey"  // 主开关写进 NSUserDefaults 的键，必填（masterHidden = YES 时可省）
 #define IPATRegEnabled @"enabled"   // 主开关当前值 @(BOOL)，必填
+#define IPATRegMasterHidden @"masterHidden"  // @(YES)：面板不画主开关，功能按 IPATRegEnabled 常开
 #define IPATRegRows @"rows"         // 子选项 @[行]，可选，见 IPATRow*
 
 // 子选项行的键（IPATRegRows 数组元素）
@@ -97,7 +98,7 @@
 #define IPATKeyKAFetch @"IPAToolPanelKeepAliveFetch"        // 仅 plist：开启要重启 App，面板上点了没用
 #define IPATKeyKALocation @"IPAToolPanelKeepAliveLocation"  // 仅 plist：要授权、耗电、过不了审
 
-#define IPATKeyFilesEnabled @"IPAToolPanelFilesEnabled"
+#define IPATKeyFilesEnabled @"IPAToolPanelFilesEnabled"  // 已弃用：文件功能常开，只看 Info.plist 的 Enabled
 #define IPATKeyFilesImportDir @"IPAToolPanelFilesImportDir"  // 仅 plist：导入的默认落地目录（相对沙盒）
 
 #define IPATKeyButtonFrame @"IPAToolPanelButtonFrame"  // 悬浮按钮位置，NSStringFromCGRect

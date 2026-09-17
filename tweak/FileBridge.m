@@ -10,11 +10,12 @@
 //         顶部还有「全选本目录文件」和「导出整个文件夹」两个快捷入口。
 //       这样「手动选择导出哪个文件夹或文件」用同一个界面就能满足，
 //       也避免连续弹 UIAlertController 带来的 present 时序问题。
-//    3. 导入走系统的 UIDocumentPickerViewController（「文件」App），支持多选文件 / 文件夹；
-//       落地目录除了面板上的三个预设，还能用「导入到指定文件夹」在沙盒里任意挑一个目录。
+//    3. 导入走系统的 UIDocumentPickerViewController（「文件」App）：iOS 不允许文件和文件夹
+//       在同一批里混选（混着给 item + folder 类型时文件夹会点不动），
+//       所以拆成「导入文件」「导入文件夹」两个入口，两者都先在沙盒浏览器里挑落地目录。
 //    4. 弹系统界面之前先发 IPATControlVisibility 让悬浮窗躲开：
 //       悬浮窗的 windowLevel 比 Alert 还高，不躲开会盖在文档选择器上面。
-//    5. 导入落地目录可以在面板上改（写进 NSUserDefaults），优先级高于 Info.plist。
+//    5. 导入的默认落地目录取 Info.plist 的 ImportDir（相对沙盒），界面里挑完只用于本次。
 //
 //  Info.plist（ipatool --files 会自动写入 IPAToolFiles）：
 //    Enabled(bool)    默认 YES；NO 表示面板上的动作行点了只提示「功能已关闭」
@@ -32,11 +33,13 @@
 /// 动作行的标识（只是本 dylib 内部的字符串，不写 NSUserDefaults）
 static NSString *const IPATFbActionBrowse = @"files.browse";
 static NSString *const IPATFbActionImportTo = @"files.importTo";
+static NSString *const IPATFbActionImportFolders = @"files.importFolders";
 
 /// 浏览器的用途：导出时勾选内容，或给导入挑一个落地文件夹
 typedef NS_ENUM(NSInteger, IPATFbBrowserMode) {
     IPATFbBrowserModeExport = 0,     // 勾选文件 / 文件夹后导出
-    IPATFbBrowserModeImportTarget,   // 选一个文件夹作为导入落地目录
+    IPATFbBrowserModeImportTarget,   // 选一个文件夹作为导入落地目录，接着导入文件
+    IPATFbBrowserModeImportTargetFolders,  // 同上，接着导入文件夹
 };
 
 static NSString *const IPATFbDefaultImportRelative = @"Documents";
@@ -60,9 +63,9 @@ static id IPATFbStored(NSString *panelKey) {
     return [[NSUserDefaults standardUserDefaults] objectForKey:panelKey];
 }
 
+/// 注入即可用：面板上没有开关，所以只看 Info.plist（故意不读 NSUserDefaults，
+/// 免得以前在面板上关过一次留下 NO，开关拿掉之后就再也开不回来）
 static BOOL IPATFbEnabled(void) {
-    id stored = IPATFbStored(IPATKeyFilesEnabled);
-    if (stored) return [stored boolValue];
     id value = IPATFbConfig()[@"Enabled"];
     return [value respondsToSelector:@selector(boolValue)] ? [value boolValue] : YES;
 }
@@ -203,7 +206,7 @@ static NSString *IPATFbDisplayPath(NSString *path) {
     [super viewDidLoad];
     self.tableView.rowHeight = 52.0;
 
-    if (self.mode == IPATFbBrowserModeImportTarget) {
+    if (self.mode != IPATFbBrowserModeExport) {
         self.navigationItem.prompt = @"进入文件夹后点右上角「导入到这里」";
         self.navigationItem.rightBarButtonItem =
             [[UIBarButtonItem alloc] initWithTitle:@"导入到这里"
@@ -526,9 +529,10 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
         IPATRegId: IPATFeatureFiles,
         IPATRegTitle: @"文件导入导出",
         IPATRegDetail: @"导出 / 导入游戏热更资源",
-        IPATRegMasterKey: IPATKeyFilesEnabled,
+        // 注入即可用，没有「关掉」的场景：面板不画总开关（真要关用 Info.plist 的 Enabled）
+        IPATRegMasterHidden: @YES,
         IPATRegEnabled: @(IPATFbEnabled()),
-        // 面板只留两个动作行：导入的落地目录在浏览器里挑，默认取 ImportDir
+        // 面板只留动作行：导入的落地目录在浏览器里挑，默认取 ImportDir
         // （Info.plist / --files-import-dir，默认 Documents）
         IPATRegRows: @[
             @{IPATRowKey: IPATFbActionBrowse,
@@ -538,8 +542,12 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
             @{IPATRowKey: IPATFbActionImportTo,
               IPATRowTitle: @"导入文件",
               IPATRowKind: IPATRowKindAction,
-              IPATRowNote: [NSString stringWithFormat:@"进沙盒挑落地目录，默认 %@",
+              IPATRowNote: [NSString stringWithFormat:@"挑落地目录，默认 %@",
                                                       IPATFbImportRelative()]},
+            @{IPATRowKey: IPATFbActionImportFolders,
+              IPATRowTitle: @"导入文件夹",
+              IPATRowKind: IPATRowKindAction,
+              IPATRowNote: @"连里面的内容一起导入"},
         ],
     };
     [[NSNotificationCenter defaultCenter] postNotificationName:IPATControlRegisterNotification
@@ -582,6 +590,8 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
         [self openBrowserWithMode:IPATFbBrowserModeExport];
     } else if ([key isEqualToString:IPATFbActionImportTo]) {
         [self openBrowserWithMode:IPATFbBrowserModeImportTarget];
+    } else if ([key isEqualToString:IPATFbActionImportFolders]) {
+        [self openBrowserWithMode:IPATFbBrowserModeImportTargetFolders];
     }
 }
 
@@ -594,7 +604,7 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
     }
     // 挑落地目录时直接从默认导入目录开始，省得每次从沙盒根一层层点进去
     NSString *root = IPATFbBrowseRoot();
-    if (mode == IPATFbBrowserModeImportTarget) {
+    if (mode != IPATFbBrowserModeExport) {
         NSString *import = IPATFbImportDirectory();
         BOOL importIsDir = NO;
         if ([[NSFileManager defaultManager] fileExistsAtPath:import isDirectory:&importIsDir]
@@ -624,7 +634,8 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
         IPATFbBrowserController *strongBrowser = weakBrowser;
         [strongBrowser dismissViewControllerAnimated:YES completion:^{
             dispatch_async(dispatch_get_main_queue(), ^{
-                [weakSelf openImporterToDirectory:path];
+                [weakSelf openImporterToDirectory:path
+                                 selectingFolders:(mode == IPATFbBrowserModeImportTargetFolders)];
             });
         }];
     };
@@ -671,7 +682,7 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
 #pragma mark 导入
 
 /// directory 传 nil 表示用面板上选的预设目录
-- (void)openImporterToDirectory:(NSString *)directory {
+- (void)openImporterToDirectory:(NSString *)directory selectingFolders:(BOOL)foldersOnly {
     if (!IPATFbEnabled()) {
         [self postStatus:@"功能已关闭"];
         return;
@@ -679,17 +690,18 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
 
     self.purpose = IPATFbPickerImport;
     self.importDirectory = directory.length ? [directory copy] : [IPATFbImportDirectory() copy];
+    // 文件和文件夹不能在同一次「文件」App 里混选（混着给类型时文件夹会点不动），
+    // 所以按用途分开弹：只给 UTTypeFolder 时文件夹才可选
     UIDocumentPickerViewController *picker = nil;
     if (@available(iOS 14.0, *)) {
         // asCopy:YES —— 系统先复制到临时目录，省掉安全作用域访问的坑
-        // UTTypeFolder 让「文件」App 里能直接选文件夹（连里面的内容一起带进来）
-        picker = [[UIDocumentPickerViewController alloc]
-            initForOpeningContentTypes:@[UTTypeItem, UTTypeFolder]
-                               asCopy:YES];
+        NSArray<UTType *> *types = foldersOnly ? @[UTTypeFolder] : @[UTTypeItem];
+        picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:types
+                                                                            asCopy:YES];
     } else {
-        picker = [[UIDocumentPickerViewController alloc]
-            initWithDocumentTypes:@[@"public.item", @"public.folder"]
-                           inMode:UIDocumentPickerModeImport];
+        NSArray<NSString *> *types = foldersOnly ? @[@"public.folder"] : @[@"public.item"];
+        picker = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:types
+                                                                       inMode:UIDocumentPickerModeImport];
     }
     picker.allowsMultipleSelection = YES;
     picker.delegate = self;

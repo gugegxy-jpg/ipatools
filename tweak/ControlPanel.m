@@ -594,25 +594,33 @@ static UIWindowScene *IPATCpActiveWindowScene(void) {
 - (CGFloat)addSection:(NSDictionary *)reg y:(CGFloat)y width:(CGFloat)width {
     NSString *featureId = reg[IPATRegId] ?: @"";
     NSString *masterKey = reg[IPATRegMasterKey] ?: @"";
+    // 主开关可以整块不画：比如「文件导入导出」注入即可用，没有需要关的场景
+    BOOL masterHidden = [reg[IPATRegMasterHidden] respondsToSelector:@selector(boolValue)]
+        ? [reg[IPATRegMasterHidden] boolValue] : NO;
     CGFloat contentWidth = width - IPATCpInset * 2;
 
-    UILabel *name = [[UILabel alloc] initWithFrame:CGRectMake(IPATCpInset, y, contentWidth - 60, 24)];
+    UILabel *name = [[UILabel alloc] initWithFrame:CGRectMake(IPATCpInset, y,
+                                                              masterHidden ? contentWidth
+                                                                           : contentWidth - 60,
+                                                              24)];
     name.font = [UIFont systemFontOfSize:14.0 weight:UIFontWeightMedium];
     name.textColor = [UIColor whiteColor];
     name.text = reg[IPATRegTitle] ?: featureId;
     [self.contentView addSubview:name];
 
-    UISwitch *master = [[UISwitch alloc] init];
-    master.onTintColor = [UIColor colorWithRed:0.16 green:0.62 blue:0.36 alpha:1.0];
-    master.on = IPATCpStoredBool(masterKey, [reg[IPATRegEnabled] boolValue]);
-    master.tag = (NSInteger)self.rowModels.count;
-    [master addTarget:self action:@selector(handleControlChanged:)
-     forControlEvents:UIControlEventValueChanged];
-    master.frame = CGRectMake(width - IPATCpInset - master.bounds.size.width,
-                              y + (24.0 - master.bounds.size.height) / 2.0,
-                              master.bounds.size.width, master.bounds.size.height);
-    [self.contentView addSubview:master];
-    [self.rowModels addObject:@{IPATRowKey: masterKey, IPATCpRowFeature: featureId}];
+    if (!masterHidden) {
+        UISwitch *master = [[UISwitch alloc] init];
+        master.onTintColor = [UIColor colorWithRed:0.16 green:0.62 blue:0.36 alpha:1.0];
+        master.on = IPATCpStoredBool(masterKey, [reg[IPATRegEnabled] boolValue]);
+        master.tag = (NSInteger)self.rowModels.count;
+        [master addTarget:self action:@selector(handleControlChanged:)
+         forControlEvents:UIControlEventValueChanged];
+        master.frame = CGRectMake(width - IPATCpInset - master.bounds.size.width,
+                                  y + (24.0 - master.bounds.size.height) / 2.0,
+                                  master.bounds.size.width, master.bounds.size.height);
+        [self.contentView addSubview:master];
+        [self.rowModels addObject:@{IPATRowKey: masterKey, IPATCpRowFeature: featureId}];
+    }
 
     y += IPATCpHeaderHeight;
 
