@@ -4,7 +4,7 @@
 //
 //  设计要点：
 //    1. 自己建一个高层级 UIWindow（canBecomeKeyWindow = NO）：
-//       不抢 App 的 keyWindow，空白区域的触摸直接穿透给 App，不影响正常操作。
+//       不抢 App 的 keyWindow，空白区域的触摸直接穿透给 App，不影响正常操作；面板展开时会临时铺一层透明层接住「点空白处收起」，收起后即撤掉。
 //    2. 与各功能 dylib 只用「通知 + NSUserDefaults」通信（见 IPATControlShared.h）：
 //       面板可以单独注入，也允许只注入其中一个功能，谁先加载都行。
 //    3. 各功能把自己支持的开关注册给面板，面板按注册结果动态生成界面，
@@ -141,6 +141,7 @@ static UIWindowScene *IPATCpActiveWindowScene(void) {
 @property (nonatomic, strong) UIVisualEffectView *panel;
 @property (nonatomic, strong) UIScrollView *scroll;
 @property (nonatomic, strong) UIView *contentView;
+@property (nonatomic, strong) UIView *dismissOverlay;
 
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSDictionary *> *features;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, UILabel *> *detailLabels;
@@ -258,6 +259,7 @@ static UIWindowScene *IPATCpActiveWindowScene(void) {
 
     [self buildButton];
     [self buildPanel];
+    [self buildDismissOverlay];
     [self rebuildContent];
 
     if (self.expanded) {
@@ -418,6 +420,26 @@ static UIWindowScene *IPATCpActiveWindowScene(void) {
     self.contentView = content;
 }
 
+/// 面板展开时铺在下面的一层透明视图：点它就收起面板。收起后立刻隐藏，
+/// 这样平时它不参与命中测试，App 的触摸照旧穿透（见 IPATCpPassThroughView）
+- (void)buildDismissOverlay {
+    UIView *overlay = [[UIView alloc] initWithFrame:self.hostView.bounds];
+    overlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    overlay.backgroundColor = [UIColor clearColor];
+    overlay.alpha = 0.0;
+    overlay.hidden = YES;
+    overlay.userInteractionEnabled = NO;
+    [overlay addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self
+                                                                          action:@selector(handleDismissTap)]];
+    // 垫在面板下面：点面板本身不算「点空白」，点按钮也不算（按钮在最上层）
+    [self.hostView insertSubview:overlay belowSubview:self.panel];
+    self.dismissOverlay = overlay;
+}
+
+- (void)handleDismissTap {
+    [self setExpanded:NO animated:YES];
+}
+
 - (void)setExpanded:(BOOL)expanded animated:(BOOL)animated {
     BOOL alreadyInState = (self.expanded == expanded && self.panel.hidden == !expanded);
     self.expanded = expanded;
@@ -428,32 +450,43 @@ static UIWindowScene *IPATCpActiveWindowScene(void) {
         [self rebuildContent];
         [self layoutPanel];
         self.panel.hidden = NO;
+        self.dismissOverlay.hidden = NO;
+        self.dismissOverlay.userInteractionEnabled = YES;
         [self.hostView bringSubviewToFront:self.button];
         if (!animated) {
             self.panel.alpha = 1.0;
             self.panel.transform = CGAffineTransformIdentity;
+            self.dismissOverlay.alpha = 1.0;
             return;
         }
         self.panel.alpha = 0.0;
         self.panel.transform = CGAffineTransformMakeScale(0.92, 0.92);
+        self.dismissOverlay.alpha = 0.0;
         [UIView animateWithDuration:0.18 animations:^{
             weakSelf.panel.alpha = 1.0;
             weakSelf.panel.transform = CGAffineTransformIdentity;
+            weakSelf.dismissOverlay.alpha = 1.0;
         }];
         return;
     }
 
+    // 先停掉「点空白收起」：收起动画期间再点一次会重复跑这段动画
+    self.dismissOverlay.userInteractionEnabled = NO;
     if (!animated) {
         self.panel.hidden = YES;
+        self.dismissOverlay.hidden = YES;
+        self.dismissOverlay.alpha = 0.0;
         return;
     }
     [UIView animateWithDuration:0.14 animations:^{
         weakSelf.panel.alpha = 0.0;
         weakSelf.panel.transform = CGAffineTransformMakeScale(0.92, 0.92);
+        weakSelf.dismissOverlay.alpha = 0.0;
     } completion:^(BOOL finished) {
         weakSelf.panel.hidden = YES;
         weakSelf.panel.alpha = 1.0;
         weakSelf.panel.transform = CGAffineTransformIdentity;
+        weakSelf.dismissOverlay.hidden = YES;
     }];
 }
 
@@ -507,7 +540,7 @@ static UIWindowScene *IPATCpActiveWindowScene(void) {
     hint.font = [UIFont systemFontOfSize:11.0];
     hint.textColor = [UIColor colorWithWhite:1.0 alpha:0.45];
     hint.textAlignment = NSTextAlignmentRight;
-    hint.text = @"点按钮收起";
+    hint.text = @"点空白收起";
     [self.contentView addSubview:hint];
 
     for (NSString *featureId in [self sortedFeatureIds]) {
@@ -842,6 +875,7 @@ static UIWindowScene *IPATCpActiveWindowScene(void) {
         self.panel = nil;
         self.scroll = nil;
         self.contentView = nil;
+        self.dismissOverlay = nil;
         [self ensureWindowWithAttempts:8];
     }
 }
