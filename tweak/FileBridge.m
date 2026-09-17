@@ -694,10 +694,13 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
     // 所以按用途分开弹：只给 UTTypeFolder 时文件夹才可选
     UIDocumentPickerViewController *picker = nil;
     if (@available(iOS 14.0, *)) {
-        // asCopy:YES —— 系统先复制到临时目录，省掉安全作用域访问的坑
         NSArray<UTType *> *types = foldersOnly ? @[UTTypeFolder] : @[UTTypeItem];
+        // asCopy:YES 选文件夹有坑：点「打开」后系统要整拷到临时目录，
+        // iCloud / 第三方提供方会一直转圈、永不回调。文件夹改 asCopy:NO
+        // （回调立即返回安全作用域 URL，拷贝由 importURLs 自己完成）；
+        // 文件保持 asCopy:YES，省掉安全作用域访问。
         picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:types
-                                                                            asCopy:YES];
+                                                                            asCopy:!foldersOnly];
     } else {
         NSArray<NSString *> *types = foldersOnly ? @[@"public.folder"] : @[@"public.item"];
         picker = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:types
@@ -716,10 +719,19 @@ static BOOL IPATFbCopyDirectory(NSURL *source, NSString *destination, NSError **
     if (![fm createDirectoryAtPath:destination withIntermediateDirectories:YES attributes:nil error:error]) {
         return NO;
     }
-    NSArray<NSURL *> *items = [fm contentsOfDirectoryAtURL:source
-                                includingPropertiesForKeys:@[NSURLIsDirectoryKey]
-                                                   options:0
-                                                     error:error];
+    // 安全作用域 / iCloud 的目录要经 NSFileCoordinator 协调后再枚举，
+    // 否则没下载完的项会直接枚举失败
+    __block NSArray<NSURL *> *items = nil;
+    NSFileCoordinator *coordinator = [[NSFileCoordinator alloc] initWithFilePresenter:nil];
+    [coordinator coordinateReadingItemAtURL:source
+                                    options:0
+                                      error:error
+                                 byAccessor:^(NSURL *coordinatedURL) {
+        items = [fm contentsOfDirectoryAtURL:coordinatedURL
+                 includingPropertiesForKeys:@[NSURLIsDirectoryKey]
+                                    options:0
+                                      error:error];
+    }];
     if (!items) return NO;
 
     BOOL ok = YES;
@@ -749,7 +761,9 @@ static BOOL IPATFbCopyDirectory(NSURL *source, NSString *destination, NSError **
        withIntermediateDirectories:YES
                         attributes:nil
                              error:&error]) {
-        [self finishImport:0 total:(NSInteger)urls.count folders:0 error:error];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self finishImport:0 total:(NSInteger)urls.count folders:0 error:error];
+        });
         return;
     }
 
@@ -784,7 +798,9 @@ static BOOL IPATFbCopyDirectory(NSURL *source, NSString *destination, NSError **
         }
         if (scoped) [url stopAccessingSecurityScopedResource];
     }
-    [self finishImport:copied total:(NSInteger)urls.count folders:folders error:lastError];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self finishImport:copied total:(NSInteger)urls.count folders:folders error:lastError];
+    });
 }
 
 - (void)finishImport:(NSInteger)copied
@@ -819,7 +835,10 @@ static BOOL IPATFbCopyDirectory(NSURL *source, NSString *destination, NSError **
         IPATFbLog(@"导出完成：%lu 项", (unsigned long)urls.count);
         return;
     }
-    [self importURLs:urls];
+    // 拷贝放到后台线程：大文件夹 / iCloud 下载可能很慢，别卡主线程
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        [self importURLs:urls];
+    });
 }
 
 - (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller {
