@@ -84,6 +84,13 @@ def archive(src: str, out_path: str, compresslevel: int = 9) -> None:
 
             for name in files:
                 full = os.path.join(root, name)
+                # 输出文件本身，以及工具在工作目录里生成的中间包（如 zsign 的 unsigned.ipa）
+                # 都不属于 App，不能打进最终产物
+                if os.path.abspath(full) == os.path.abspath(out_path):
+                    continue
+                if rel_root == "." and name.lower().endswith(".ipa"):
+                    continue
+
                 rel = name if rel_root == "." else f"{rel_root}/{name}"
 
                 if os.path.islink(full):
