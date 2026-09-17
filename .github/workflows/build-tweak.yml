@@ -20,6 +20,7 @@ on:
   push:
     paths:
       - "tweak/**"
+      - "demo/**"
       - ".github/workflows/build-tweak.yml"
 
 permissions:
@@ -65,6 +66,27 @@ jobs:
             codesign -dvvv "$f" 2>&1 | head -3 || true
           done
 
+      - name: Build demo app (for on-device testing)
+        run: |
+          chmod +x demo/build-demo.sh
+          ./demo/build-demo.sh
+
+      - name: Inject tweaks into demo app
+        run: |
+          python3 -m ipatool inject demo/build/IPATDemo.ipa \
+            --pip --keep-alive --files --in-place --sign none
+          echo "=== 注入后核对 ==="
+          python3 -m ipatool inject demo/build/IPATDemo.ipa --list
+          python3 -m ipatool info demo/build/IPATDemo.ipa
+          ls -la demo/build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ipatool-demo-ipa
+          path: demo/build/IPATDemo.ipa
+          if-no-files-found: error
+          retention-days: 90
+
       - name: Pack build directory
         run: |
           zip -r build-artifacts.zip tweak/build -x "*.DS_Store"
@@ -85,7 +107,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: build-${{ github.run_number }}
         run: |
-          gh release create "$TAG" tweak/build/*.dylib build-artifacts.zip \
+          gh release create "$TAG" tweak/build/*.dylib build-artifacts.zip demo/build/IPATDemo.ipa \
             --title "$TAG" \
             --notes "Actions 自动编译：run ${{ github.run_number }} / commit ${{ github.sha }}" \
             --latest=false

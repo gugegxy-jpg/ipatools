@@ -751,7 +751,8 @@ class IpatoolGui:
         self._set_text(self.info_detail, "\n".join(lines))
         self._append(
             f"\n已读取：{_txt(data.get('bundle_id'))} / {_txt(data.get('display_name'))}，"
-            f"内嵌 bundle {len(nested)} 个，已注入 dylib {len(injected)} 个\n"
+            f"内嵌 bundle {len(nested)} 个，已注入 dylib {len(injected)} 个"
+            f"（读的是「输入」框里的包，不是产物）\n"
         )
 
         # 顺手把当前值填进「改 ID / 名称」页，少打一次字
@@ -886,10 +887,14 @@ class IpatoolGui:
         self._start(["certs", "--json"], "certs")
 
     def _list_injected(self) -> None:
-        src = self.v_input.get().strip()
+        """核对产物：优先读输出文件，没有产物时才回退到输入包（就地修改时两者相同）。"""
+        src = self.v_input.get().strip() if self.v_inplace.get() else self.v_output.get().strip()
+        if not src or not os.path.isfile(src):
+            src = self.v_input.get().strip()
         if not src:
             messagebox.showwarning("缺少输入", "请先选择要处理的 IPA 文件或已解包目录。")
             return
+        self._append(f"[核对] {src}\n")
         self._start(["inject", src, "--list"], "inject-list")
 
     def _run_current(self, dry_run: bool) -> None:
