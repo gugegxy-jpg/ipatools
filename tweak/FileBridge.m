@@ -1091,11 +1091,14 @@ fail:
     self.importDirectory = directory.length ? [directory copy] : [IPATFbImportDirectory() copy];
     UIDocumentPickerViewController *picker = nil;
     if (@available(iOS 14.0, *)) {
-        // asCopy:NO：回调立即返回安全作用域 URL；asCopy:YES 会先被系统
-        // 白拷一份到 tmp（4G 的 zip 直接双倍占空间），文件夹还会卡到永不回调。
-        // 安全作用域访问由 importURLs 处理。
+        // asCopy:YES：系统先把选中的文件拷到本 App 的 tmp 再回调。
+        // 之前试过 asCopy:NO（省掉这份拷贝），但从第三方文件提供方
+        // （网盘 App、其他 App 的共享目录）选文件时，提供方不支持
+        // 「就地打开」，点「打开」既不关闭选择器也不回调——只能退回来。
+        // 代价是 4G 的 zip 会先占一份 tmp 空间，导入完成后由
+        // importURLs 主动删掉这份副本。
         picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeItem]
-                                                                            asCopy:NO];
+                                                                            asCopy:YES];
     } else {
         picker = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[@"public.item"]
                                                                        inMode:UIDocumentPickerModeImport];
@@ -1624,6 +1627,12 @@ done:
             lastError = copyError;
         }
         if (scoped) [url stopAccessingSecurityScopedResource];
+
+        // asCopy:YES 的回调 URL 是系统拷进 tmp 的副本，导入完就把
+        // 这份副本删掉（4G 的 zip 不删要一直占着空间）
+        if ([url.path hasPrefix:NSTemporaryDirectory()]) {
+            [fm removeItemAtURL:url error:NULL];
+        }
     }
     dispatch_async(dispatch_get_main_queue(), ^{
         [self finishImport:copied total:(NSInteger)urls.count folders:folders
