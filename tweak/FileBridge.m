@@ -10,9 +10,10 @@
 //         顶部还有「全选本目录文件」和「导出整个文件夹」两个快捷入口。
 //       这样「手动选择导出哪个文件夹或文件」用同一个界面就能满足，
 //       也避免连续弹 UIAlertController 带来的 present 时序问题。
-//    3. 导入走系统的 UIDocumentPickerViewController（「文件」App）：iOS 不允许文件和文件夹
-//       在同一批里混选（混着给 item + folder 类型时文件夹会点不动），
-//       所以拆成「导入文件」「导入文件夹」两个入口，两者都先在沙盒浏览器里挑落地目录。
+//    3. 导入走系统的 UIDocumentPickerViewController（「文件」App），只有「导入文件」
+//       一个入口（文件夹场景让用户在电脑/文件 App 里打成 zip，导入时自动解压；
+//       iOS 文档选择器对文件夹的支持坑太多，asCopy:YES 选文件夹会卡到永不回调），
+//       先在沙盒浏览器里挑落地目录。
 //    4. 弹系统界面之前先发 IPATControlVisibility 让悬浮窗躲开：
 //       悬浮窗的 windowLevel 比 Alert 还高，不躲开会盖在文档选择器上面。
 //    5. 导入的默认落地目录取 Info.plist 的 ImportDir（相对沙盒），界面里挑完只用于本次。
@@ -36,13 +37,11 @@
 /// 动作行的标识（只是本 dylib 内部的字符串，不写 NSUserDefaults）
 static NSString *const IPATFbActionBrowse = @"files.browse";
 static NSString *const IPATFbActionImportTo = @"files.importTo";
-static NSString *const IPATFbActionImportFolders = @"files.importFolders";
 
 /// 浏览器的用途：导出时勾选内容，或给导入挑一个落地文件夹
 typedef NS_ENUM(NSInteger, IPATFbBrowserMode) {
     IPATFbBrowserModeExport = 0,     // 勾选文件 / 文件夹后导出
-    IPATFbBrowserModeImportTarget,   // 选一个文件夹作为导入落地目录，接着导入文件
-    IPATFbBrowserModeImportTargetFolders,  // 同上，接着导入文件夹
+    IPATFbBrowserModeImportTarget,   // 选一个文件夹作为导入落地目录，接着导入文件 / zip
 };
 
 static NSString *const IPATFbDefaultImportRelative = @"Documents";
@@ -588,12 +587,8 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
             @{IPATRowKey: IPATFbActionImportTo,
               IPATRowTitle: @"导入文件",
               IPATRowKind: IPATRowKindAction,
-              IPATRowNote: [NSString stringWithFormat:@"挑落地目录，默认 %@",
+              IPATRowNote: [NSString stringWithFormat:@"挑落地目录，默认 %@（zip 自动解压）",
                                                       IPATFbImportRelative()]},
-            @{IPATRowKey: IPATFbActionImportFolders,
-              IPATRowTitle: @"导入文件夹",
-              IPATRowKind: IPATRowKindAction,
-              IPATRowNote: @"连里面的内容一起导入"},
         ],
     };
     [[NSNotificationCenter defaultCenter] postNotificationName:IPATControlRegisterNotification
@@ -636,8 +631,6 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
         [self openBrowserWithMode:IPATFbBrowserModeExport];
     } else if ([key isEqualToString:IPATFbActionImportTo]) {
         [self openBrowserWithMode:IPATFbBrowserModeImportTarget];
-    } else if ([key isEqualToString:IPATFbActionImportFolders]) {
-        [self openBrowserWithMode:IPATFbBrowserModeImportTargetFolders];
     }
 }
 
@@ -680,8 +673,7 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
         IPATFbBrowserController *strongBrowser = weakBrowser;
         [strongBrowser dismissViewControllerAnimated:YES completion:^{
             dispatch_async(dispatch_get_main_queue(), ^{
-                [weakSelf openImporterToDirectory:path
-                                 selectingFolders:(mode == IPATFbBrowserModeImportTargetFolders)];
+                [weakSelf openImporterToDirectory:path];
             });
         }];
     };
@@ -1086,8 +1078,10 @@ fail:
 
 #pragma mark 导入
 
-/// directory 传 nil 表示用面板上选的预设目录
-- (void)openImporterToDirectory:(NSString *)directory selectingFolders:(BOOL)foldersOnly {
+/// directory 传 nil 表示用面板上选的预设目录。
+/// 只保留文件入口：文件夹在 iOS 文档选择器里坑太多（asCopy 卡转圈），
+/// 文件夹场景统一改成打成 zip 再导，导入时自动解压。
+- (void)openImporterToDirectory:(NSString *)directory {
     if (!IPATFbEnabled()) {
         [self postStatus:@"功能已关闭"];
         return;
@@ -1095,19 +1089,15 @@ fail:
 
     self.purpose = IPATFbPickerImport;
     self.importDirectory = directory.length ? [directory copy] : [IPATFbImportDirectory() copy];
-    // 文件和文件夹不能在同一次「文件」App 里混选（混着给类型时文件夹会点不动），
-    // 所以按用途分开弹：只给 UTTypeFolder 时文件夹才可选
     UIDocumentPickerViewController *picker = nil;
     if (@available(iOS 14.0, *)) {
-        NSArray<UTType *> *types = foldersOnly ? @[UTTypeFolder] : @[UTTypeItem];
-        // 全部用 asCopy:NO：asCopy:YES 有两个坑——选文件夹时系统整拷会卡到
-        // 永不回调；选大文件时会先把整个文件白拷到 tmp 才开始回调
-        // （4G 的 zip 直接双倍占空间）。安全作用域访问由 importURLs 处理。
-        picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:types
+        // asCopy:NO：回调立即返回安全作用域 URL；asCopy:YES 会先被系统
+        // 白拷一份到 tmp（4G 的 zip 直接双倍占空间），文件夹还会卡到永不回调。
+        // 安全作用域访问由 importURLs 处理。
+        picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeItem]
                                                                             asCopy:NO];
     } else {
-        NSArray<NSString *> *types = foldersOnly ? @[@"public.folder"] : @[@"public.item"];
-        picker = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:types
+        picker = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[@"public.item"]
                                                                        inMode:UIDocumentPickerModeImport];
     }
     picker.allowsMultipleSelection = YES;
@@ -1535,6 +1525,7 @@ done:
     }
 
     NSString *zipName = url.lastPathComponent;
+    IPATFbLog(@"解压 %@ -> 临时目录 %@", zipName, staging);
     __block uint64_t totalBytes = 0, doneBytes = 0, lastReport = 0;
     void (^progress)(uint64_t) = ^(uint64_t added) {
         doneBytes += added;
@@ -1580,6 +1571,7 @@ done:
 - (void)importURLs:(NSArray<NSURL *> *)urls {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *destination = self.importDirectory.length ? self.importDirectory : IPATFbImportDirectory();
+    IPATFbLog(@"导入落地目录：%@", destination);
     NSError *error = nil;
     if (![fm createDirectoryAtPath:destination
        withIntermediateDirectories:YES
@@ -1609,6 +1601,12 @@ done:
         BOOL isZip = !isDir && [url.pathExtension.lowercaseString isEqualToString:@"zip"];
         if (isZip) {
             NSInteger extracted = 0;
+            IPATFbLog(@"按 zip 解压：%@（%.2f GB）", url.lastPathComponent,
+                      [[fm attributesOfItemAtPath:url.path error:NULL][NSFileSize]
+                       unsignedLongLongValue] / 1073741824.0);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self postStatus:[NSString stringWithFormat:@"开始解压 %@…", url.lastPathComponent]];
+            });
             ok = [self importZip:url toDirectory:destination files:&extracted error:&copyError];
             if (ok) {
                 zips++;
@@ -1665,6 +1663,11 @@ done:
 
 - (void)documentPicker:(UIDocumentPickerViewController *)controller
         didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+    IPATFbLog(@"选择器回调：%lu 项 -> %@", (unsigned long)urls.count, urls);
+    if (urls.count == 0) {
+        [self postStatus:@"没有选中任何内容"];
+        return;
+    }
     if (self.purpose == IPATFbPickerExport) {
         [self postStatus:[NSString stringWithFormat:@"已导出 zip（%ld 项）", (long)self.exportItemCount]];
         IPATFbLog(@"导出完成：zip（%ld 项）", (long)self.exportItemCount);
@@ -1676,7 +1679,10 @@ done:
         self.currentExportZip = nil;
         return;
     }
-    // 拷贝放到后台线程：大文件夹 / iCloud 下载可能很慢，别卡主线程
+    // 拷贝放到后台线程：大文件夹 / iCloud 下载可能很慢，别卡主线程。
+    // 先给个即时状态，免得大文件导入的头几分钟看起来像没反应
+    [self postStatus:[NSString stringWithFormat:@"正在导入 %lu 项（大文件要等一会儿）…",
+                                                (unsigned long)urls.count]];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         [self importURLs:urls];
     });
