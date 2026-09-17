@@ -521,6 +521,10 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
 
 @property (nonatomic, assign) IPATFbPickerPurpose purpose;
 @property (nonatomic, copy) NSString *lastStatus;
+/// 本次导出打的临时 zip（导出完成后清理）
+@property (nonatomic, copy) NSString *currentExportZip;
+/// 本次导出打包的条目数（状态行用）
+@property (nonatomic, assign) NSInteger exportItemCount;
 /// 本次导入的落地目录（用「导入到指定文件夹」挑过之后才有值）
 @property (nonatomic, copy) NSString *importDirectory;
 
@@ -580,7 +584,7 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
             @{IPATRowKey: IPATFbActionBrowse,
               IPATRowTitle: @"浏览并导出文件",
               IPATRowKind: IPATRowKindAction,
-              IPATRowNote: @"选文件夹或文件，导出到「文件」App"},
+              IPATRowNote: @"选文件夹或文件，打包 zip 导出到「文件」App"},
             @{IPATRowKey: IPATFbActionImportTo,
               IPATRowTitle: @"导入文件",
               IPATRowKind: IPATRowKindAction,
@@ -698,19 +702,320 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
     [top presentViewController:controller animated:YES completion:nil];
 }
 
+#pragma mark - ZIP 打包（导出用）
+
+/// 导出统一打成 zip（store 不压缩 + ZIP64）：热更资源多是已压缩格式，
+/// deflate 只费电不省空间；store 是纯 I/O，几个 G 也是分钟级。
+/// 生成的包用「导入文件」导回来会自动解压，正好配套。
+
+static void IPATFbZipAppend16(NSMutableData *d, uint16_t v) {
+    uint8_t b[2] = { (uint8_t)(v & 0xFF), (uint8_t)(v >> 8) };
+    [d appendBytes:b length:2];
+}
+
+static void IPATFbZipAppend32(NSMutableData *d, uint32_t v) {
+    uint8_t b[4] = { (uint8_t)(v & 0xFF), (uint8_t)((v >> 8) & 0xFF),
+                     (uint8_t)((v >> 16) & 0xFF), (uint8_t)(v >> 24) };
+    [d appendBytes:b length:4];
+}
+
+static void IPATFbZipAppend64(NSMutableData *d, uint64_t v) {
+    IPATFbZipAppend32(d, (uint32_t)(v & 0xFFFFFFFFULL));
+    IPATFbZipAppend32(d, (uint32_t)(v >> 32));
+}
+
+static void IPATFbZipDosTimestamp(uint16_t *dosTime, uint16_t *dosDate) {
+    NSDateComponents *c = [[NSCalendar currentCalendar]
+        components:(NSCalendarUnitHour | NSCalendarUnitMinute | NSCalendarUnitSecond |
+                    NSCalendarUnitYear | NSCalendarUnitMonth | NSCalendarUnitDay)
+          fromDate:[NSDate date]];
+    *dosTime = (uint16_t)(((c.hour & 0x1F) << 11) | ((c.minute & 0x3F) << 5) | ((c.second / 2) & 0x1F));
+    *dosDate = (uint16_t)((((c.year - 1980) & 0x7F) << 9) | ((c.month & 0xF) << 5) | (c.day & 0x1F));
+}
+
+/// 收集一个导出项（文件或整个目录）的条目列表；name 是 zip 内的相对路径
+static BOOL IPATFbZipCollectEntry(NSString *path, NSString *name,
+                                  NSMutableArray<NSDictionary *> *entries,
+                                  uint64_t *totalBytes, NSError **error) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL isDir = NO;
+    if (![fm fileExistsAtPath:path isDirectory:&isDir]) {
+        if (error) *error = [NSError errorWithDomain:@"IPAToolFiles" code:8
+                                         userInfo:@{NSLocalizedDescriptionKey:
+                                                    [NSString stringWithFormat:@"路径不存在：%@", path]}];
+        return NO;
+    }
+
+    if (!isDir) {
+        uint64_t size = [[fm attributesOfItemAtPath:path error:error][NSFileSize]
+                         unsignedLongLongValue];
+        if (*error && [*error code]) return NO;
+        [entries addObject:@{@"path": path, @"name": name,
+                             @"size": @(size), @"dir": @NO}];
+        *totalBytes += size;
+        return YES;
+    }
+
+    [entries addObject:@{@"path": [NSNull null], @"name": [name stringByAppendingString:@"/"],
+                         @"size": @0, @"dir": @YES}];
+    NSDirectoryEnumerator<NSURL *> *en =
+        [fm enumeratorAtURL:[NSURL fileURLWithPath:path]
+         includingPropertiesForKeys:@[NSURLIsDirectoryKey, NSURLFileSizeKey]
+                            options:0
+                       errorHandler:^BOOL(NSURL *url, NSError *e) { return YES; }];
+    for (NSURL *item in en) {
+        NSString *rel = [item.path substringFromIndex:MIN(path.length, item.path.length)];
+        rel = [rel stringByReplacingOccurrencesOfString:@"/" withString:@"" options:0 range:NSMakeRange(0, 1)];
+        NSString *entryName = [name stringByAppendingPathComponent:rel];
+        NSNumber *isDirNum = nil;
+        [item getResourceValue:&isDirNum forKey:NSURLIsDirectoryKey error:NULL];
+        if ([isDirNum boolValue]) {
+            [entries addObject:@{@"path": [NSNull null], @"name": [entryName stringByAppendingString:@"/"],
+                                 @"size": @0, @"dir": @YES}];
+        } else {
+            uint64_t size = [[fm attributesOfItemAtPath:item.path error:NULL][NSFileSize]
+                             unsignedLongLongValue];
+            [entries addObject:@{@"path": item.path, @"name": entryName,
+                                 @"size": @(size), @"dir": @NO}];
+            *totalBytes += size;
+        }
+    }
+    return YES;
+}
+
+/// 打包：entries 先收集好（顺带得到总体积），逐条写入并回填 CRC
+static BOOL IPATFbZipWrite(NSArray<NSDictionary *> *entries, uint64_t totalBytes,
+                           NSString *zipPath,
+                           void (^progress)(uint64_t done, uint64_t total),
+                           NSError **error) {
+    // ZIP64：数据超 4G 或条目超 65535 才启用；平时保持最普通的 zip 格式
+    BOOL need64 = totalBytes > 0xFFFFFFFFULL || (uint64_t)entries.count > 0xFFFF;
+    for (NSDictionary *e in entries) {
+        if ([e[@"size"] unsignedLongLongValue] > 0xFFFFFFFFULL) { need64 = YES; break; }
+    }
+
+    FILE *out = fopen(zipPath.fileSystemRepresentation, "wb");
+    if (!out) {
+        if (error) *error = [NSError errorWithDomain:@"IPAToolFiles" code:9
+                                         userInfo:@{NSLocalizedDescriptionKey: @"创建临时 zip 失败"}];
+        return NO;
+    }
+
+    BOOL ok = NO;
+    NSMutableData *cd = [NSMutableData data];
+    uint8_t *buf = malloc(1024 * 1024);
+    uint16_t dosTime, dosDate;
+    IPATFbZipDosTimestamp(&dosTime, &dosDate);
+    uint64_t offset = 0, done = 0, lastReport = 0;
+    uint16_t version = need64 ? 45 : 20;
+
+    for (NSDictionary *e in entries) {
+        if ([e[@"dir"] boolValue]) {
+            // 目录条目：只有头，没有数据
+            NSData *name = [e[@"name"] dataUsingEncoding:NSUTF8StringEncoding];
+            NSMutableData *h = [NSMutableData data];
+            IPATFbZipAppend32(h, 0x04034b50);
+            IPATFbZipAppend16(h, version);
+            IPATFbZipAppend16(h, 0x800);          // UTF-8 文件名
+            IPATFbZipAppend16(h, 0);              // store
+            IPATFbZipAppend16(h, dosTime);
+            IPATFbZipAppend16(h, dosDate);
+            IPATFbZipAppend32(h, 0);              // crc
+            IPATFbZipAppend32(h, 0);              // comp size
+            IPATFbZipAppend32(h, 0);              // uncomp size
+            IPATFbZipAppend16(h, (uint16_t)name.length);
+            IPATFbZipAppend16(h, 0);              // extra len
+            [h appendData:name];
+            if (fwrite(h.bytes, 1, h.length, out) != h.length) goto fail;
+            offset += h.length;
+
+            IPATFbZipAppend32(cd, 0x02014b50);
+            IPATFbZipAppend16(cd, version);       // made by
+            IPATFbZipAppend16(cd, version);
+            IPATFbZipAppend16(cd, 0x800);
+            IPATFbZipAppend16(cd, 0);
+            IPATFbZipAppend16(cd, dosTime);
+            IPATFbZipAppend16(cd, dosDate);
+            IPATFbZipAppend32(cd, 0);
+            IPATFbZipAppend32(cd, 0);
+            IPATFbZipAppend32(cd, 0);
+            IPATFbZipAppend16(cd, (uint16_t)name.length);
+            IPATFbZipAppend16(cd, 0);
+            IPATFbZipAppend16(cd, 0);             // comment
+            IPATFbZipAppend16(cd, 0);             // disk start
+            IPATFbZipAppend16(cd, 0);             // internal attr
+            IPATFbZipAppend32(cd, 0x10);          // external attr：目录位
+            IPATFbZipAppend32(cd, (uint32_t)offset);
+            [cd appendData:name];
+            continue;
+        }
+
+        uint64_t size = [e[@"size"] unsignedLongLongValue];
+        NSData *name = [e[@"name"] dataUsingEncoding:NSUTF8StringEncoding];
+        NSMutableData *h = [NSMutableData data];
+        IPATFbZipAppend32(h, 0x04034b50);
+        IPATFbZipAppend16(h, version);
+        IPATFbZipAppend16(h, 0x800);
+        IPATFbZipAppend16(h, 0);                  // store
+        IPATFbZipAppend16(h, dosTime);
+        IPATFbZipAppend16(h, dosDate);
+        IPATFbZipAppend32(h, 0);                  // crc 占位，写完回填
+        if (need64) {
+            IPATFbZipAppend32(h, 0xFFFFFFFF);
+            IPATFbZipAppend32(h, 0xFFFFFFFF);
+        } else {
+            IPATFbZipAppend32(h, (uint32_t)size);
+            IPATFbZipAppend32(h, (uint32_t)size);
+        }
+        IPATFbZipAppend16(h, (uint16_t)name.length);
+        if (need64) {
+            IPATFbZipAppend16(h, 20);             // zip64 extra：uncomp + comp
+        } else {
+            IPATFbZipAppend16(h, 0);
+        }
+        [h appendData:name];
+        if (need64) {
+            IPATFbZipAppend16(h, 0x0001);
+            IPATFbZipAppend16(h, 16);
+            IPATFbZipAppend64(h, size);
+            IPATFbZipAppend64(h, size);
+        }
+        uint64_t headerOffset = offset;
+        if (fwrite(h.bytes, 1, h.length, out) != h.length) goto fail;
+        offset += h.length;
+
+        FILE *in = fopen([e[@"path"] fileSystemRepresentation], "rb");
+        if (!in) goto fail;
+        uLong crc = crc32(0, Z_NULL, 0);
+        uint64_t remaining = size;
+        for (;;) {
+            size_t n = fread(buf, 1, remaining < 1024 * 1024 ? (size_t)remaining : 1024 * 1024, in);
+            if (n == 0) break;
+            if (fwrite(buf, 1, n, out) != n) { fclose(in); goto fail; }
+            crc = crc32(crc, buf, (uInt)n);
+            done += n;
+            remaining -= n;
+            if (progress && done - lastReport >= 256ULL * 1024 * 1024) {
+                lastReport = done;
+                progress(done, totalBytes);
+            }
+        }
+        fclose(in);
+        offset += size;
+
+        // 回填 CRC（little endian）
+        uint8_t cb[4] = { (uint8_t)(crc & 0xFF), (uint8_t)((crc >> 8) & 0xFF),
+                          (uint8_t)((crc >> 16) & 0xFF), (uint8_t)((crc >> 24) & 0xFF) };
+        if (fseeko(out, (off_t)(headerOffset + 14), SEEK_SET) != 0 ||
+            fwrite(cb, 1, 4, out) != 4 ||
+            fseeko(out, (off_t)offset, SEEK_SET) != 0) goto fail;
+
+        IPATFbZipAppend32(cd, 0x02014b50);
+        IPATFbZipAppend16(cd, version);
+        IPATFbZipAppend16(cd, version);
+        IPATFbZipAppend16(cd, 0x800);
+        IPATFbZipAppend16(cd, 0);
+        IPATFbZipAppend16(cd, dosTime);
+        IPATFbZipAppend16(cd, dosDate);
+        IPATFbZipAppend32(cd, (uint32_t)crc);
+        if (need64) {
+            IPATFbZipAppend32(cd, 0xFFFFFFFF);
+            IPATFbZipAppend32(cd, 0xFFFFFFFF);
+        } else {
+            IPATFbZipAppend32(cd, (uint32_t)size);
+            IPATFbZipAppend32(cd, (uint32_t)size);
+        }
+        IPATFbZipAppend16(cd, (uint16_t)name.length);
+        if (need64) IPATFbZipAppend16(cd, 28);    // zip64 extra：uncomp + comp + offset
+        else IPATFbZipAppend16(cd, 0);
+        IPATFbZipAppend16(cd, 0);
+        IPATFbZipAppend16(cd, 0);
+        IPATFbZipAppend16(cd, 0);
+        IPATFbZipAppend32(cd, 0x20);              // external attr：普通文件
+        if (need64) IPATFbZipAppend32(cd, 0xFFFFFFFF);
+        else IPATFbZipAppend32(cd, (uint32_t)headerOffset);
+        [cd appendData:name];
+        if (need64) {
+            IPATFbZipAppend16(cd, 0x0001);
+            IPATFbZipAppend16(cd, 24);
+            IPATFbZipAppend64(cd, size);
+            IPATFbZipAppend64(cd, size);
+            IPATFbZipAppend64(cd, headerOffset);
+        }
+    }
+
+    uint64_t cdOffset = offset;
+    if (fwrite(cd.bytes, 1, cd.length, out) != cd.length) goto fail;
+    offset += cd.length;
+
+    if (need64) {
+        // ZIP64 EOCD + 定位器
+        NSMutableData *z = [NSMutableData data];
+        IPATFbZipAppend32(z, 0x06064b50);
+        IPATFbZipAppend64(z, 44);                 // 本记录剩余长度
+        IPATFbZipAppend16(z, 45);
+        IPATFbZipAppend16(z, 45);
+        IPATFbZipAppend32(z, 0);
+        IPATFbZipAppend32(z, 0);
+        IPATFbZipAppend64(z, entries.count);
+        IPATFbZipAppend64(z, entries.count);
+        IPATFbZipAppend64(z, cd.length);
+        IPATFbZipAppend64(z, cdOffset);
+        if (fwrite(z.bytes, 1, z.length, out) != z.length) goto fail;
+
+        NSMutableData *loc = [NSMutableData data];
+        IPATFbZipAppend32(loc, 0x07064b50);
+        IPATFbZipAppend32(loc, 0);
+        IPATFbZipAppend64(loc, offset);
+        IPATFbZipAppend32(loc, 1);
+        if (fwrite(loc.bytes, 1, loc.length, out) != loc.length) goto fail;
+        offset += z.length + loc.length;
+    }
+
+    {
+        NSMutableData *eocd = [NSMutableData data];
+        IPATFbZipAppend32(eocd, 0x06054b50);
+        IPATFbZipAppend16(eocd, 0);
+        IPATFbZipAppend16(eocd, 0);
+        IPATFbZipAppend16(eocd, need64 ? 0xFFFF : (uint16_t)entries.count);
+        IPATFbZipAppend16(eocd, need64 ? 0xFFFF : (uint16_t)entries.count);
+        IPATFbZipAppend32(eocd, need64 ? 0xFFFFFFFF : (uint32_t)cd.length);
+        IPATFbZipAppend32(eocd, need64 ? 0xFFFFFFFF : (uint32_t)cdOffset);
+        IPATFbZipAppend16(eocd, 0);
+        if (fwrite(eocd.bytes, 1, eocd.length, out) != eocd.length) goto fail;
+    }
+
+    ok = YES;
+    if (progress) progress(totalBytes, totalBytes);
+
+fail:
+    if (!ok) {
+        if (error && !*error)
+            *error = [NSError errorWithDomain:@"IPAToolFiles" code:9
+                                 userInfo:@{NSLocalizedDescriptionKey:
+                                            [NSString stringWithFormat:@"打包中断（%@）：沙盒空间不足或文件被热更改动",
+                                                       zipPath.lastPathComponent]}];
+        [[NSFileManager defaultManager] removeItemAtPath:zipPath error:NULL];
+    }
+    free(buf);
+    fclose(out);
+    return ok;
+}
+
 #pragma mark 导出
 
 - (void)exportPaths:(NSArray<NSString *> *)paths from:(UIViewController *)presenter {
-    NSMutableArray<NSURL *> *urls = [NSMutableArray array];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSMutableArray<NSString *> *valid = [NSMutableArray array];
     NSInteger missing = 0;
     for (NSString *path in paths) {
-        if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
-            [urls addObject:[NSURL fileURLWithPath:path]];
+        if ([fm fileExistsAtPath:path]) {
+            [valid addObject:path];
         } else {
             missing++;   // 常见于热更把文件删了 / 改名了，浏览器列表是旧快照
         }
     }
-    if (urls.count == 0) {
+    if (valid.count == 0) {
         [self postStatus:missing > 0
             ? @"没有可导出的内容（所选文件已不存在，可能被热更删除）"
             : @"没有可导出的内容"];
@@ -722,13 +1027,61 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
         IPATFbLog(@"导出跳过 %ld 个不存在的路径", (long)missing);
     }
 
-    self.purpose = IPATFbPickerExport;
-    // asCopy:YES —— 导出的是副本，沙盒里的原文件留着不动
-    UIDocumentPickerViewController *picker =
-        [[UIDocumentPickerViewController alloc] initForExportingURLs:urls asCopy:YES];
-    picker.delegate = self;
-    IPATFbLog(@"准备导出 %lu 项", (unsigned long)urls.count);
-    [presenter presentViewController:picker animated:YES completion:nil];
+    // 清掉之前导出留下的临时 zip
+    for (NSURL *f in [fm contentsOfDirectoryAtURL:[NSURL fileURLWithPath:NSTemporaryDirectory()]
+                    includingPropertiesForKeys:nil options:0 error:NULL]) {
+        if ([f.lastPathComponent hasPrefix:@"IPAToolExport-"]) [fm removeItemAtURL:f error:NULL];
+    }
+
+    // 包名：单选跟原名字，多选用时间戳
+    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+    fmt.dateFormat = @"yyyyMMdd-HHmmss";
+    NSString *base = valid.count == 1
+        ? [valid[0].lastPathComponent stringByDeletingPathExtension]
+        : [NSString stringWithFormat:@"IPAToolExport-%@", [fmt stringFromDate:[NSDate date]]];
+    if (base.length == 0) base = @"IPAToolExport";
+    NSString *zipPath = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                         [NSString stringWithFormat:@"%@.zip", base]];
+
+    self.exportItemCount = (NSInteger)valid.count;
+    [self postStatus:[NSString stringWithFormat:@"正在打包 %ld 项为 zip…", (long)valid.count]];
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        // 先收集条目（顺带统计总体积），再打包
+        NSMutableArray<NSDictionary *> *entries = [NSMutableArray array];
+        uint64_t totalBytes = 0;
+        NSError *error = nil;
+        BOOL ok = YES;
+        for (NSString *path in valid) {
+            NSString *name = path.lastPathComponent;
+            if (!IPATFbZipCollectEntry(path, name, entries, &totalBytes, &error)) { ok = NO; break; }
+        }
+        if (ok) {
+            ok = IPATFbZipWrite(entries, totalBytes, zipPath,
+                ^(uint64_t done, uint64_t total) {
+                    long percent = total > 0 ? (long)((double)done / (double)total * 100.0) : 0;
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [self postStatus:[NSString stringWithFormat:@"打包中 %ld%%", percent]];
+                    });
+                }, &error);
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!ok) {
+                [self postStatus:[NSString stringWithFormat:@"打包失败：%@",
+                                                                    error.localizedDescription ?: @"未知错误"]];
+                return;
+            }
+            self.currentExportZip = zipPath;
+            self.purpose = IPATFbPickerExport;
+            // asCopy:YES —— 系统把 zip 拷到用户选的位置，沙盒原文件不受影响
+            UIDocumentPickerViewController *picker =
+                [[UIDocumentPickerViewController alloc] initForExportingURLs:
+                    @[[NSURL fileURLWithPath:zipPath]] asCopy:YES];
+            picker.delegate = self;
+            IPATFbLog(@"导出 zip 就绪：%ld 项 -> %@", (long)valid.count, zipPath);
+            [presenter presentViewController:picker animated:YES completion:nil];
+        });
+    });
 }
 
 #pragma mark 导入
@@ -1310,8 +1663,14 @@ done:
 - (void)documentPicker:(UIDocumentPickerViewController *)controller
         didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     if (self.purpose == IPATFbPickerExport) {
-        [self postStatus:[NSString stringWithFormat:@"已导出 %lu 项", (unsigned long)urls.count]];
-        IPATFbLog(@"导出完成：%lu 项", (unsigned long)urls.count);
+        [self postStatus:[NSString stringWithFormat:@"已导出 zip（%ld 项）", (long)self.exportItemCount]];
+        IPATFbLog(@"导出完成：zip（%ld 项）", (long)self.exportItemCount);
+        // 系统已把 zip 拷到用户选的位置，临时文件清掉（就算还没拷完，
+        // 下次导出开头也会按前缀统一清理，不会堆积）
+        if (self.currentExportZip) {
+            [[NSFileManager defaultManager] removeItemAtPath:self.currentExportZip error:NULL];
+        }
+        self.currentExportZip = nil;
         return;
     }
     // 拷贝放到后台线程：大文件夹 / iCloud 下载可能很慢，别卡主线程
@@ -1323,6 +1682,10 @@ done:
 - (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller {
     if (self.purpose == IPATFbPickerImport) {
         IPATFbSetOverlayVisible(YES);   // 导出模式下悬浮窗由浏览器负责恢复
+    }
+    if (self.currentExportZip) {
+        [[NSFileManager defaultManager] removeItemAtPath:self.currentExportZip error:NULL];
+        self.currentExportZip = nil;
     }
     [self postStatus:@"已取消"];
 }
