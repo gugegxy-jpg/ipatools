@@ -1,0 +1,4 @@
+# ipatool 仅依赖 Python 标准库（Python >= 3.8），无需安装第三方包。
+# 重签名能力依赖外部工具（可选）：
+#   - macOS: 系统自带 codesign
+#   - 任意平台: zsign (https://github.com/zhlynn/zsign)

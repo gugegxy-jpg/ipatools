@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*.so
+*.dylib
+
+# 编译产物
+tweak/build/
+build/
+dist/
+
+# 虚拟环境
+.venv/
+venv/
+
+# 本地私密文件：证书、描述文件、IPA
+*.ipa
+*.p12
+*.mobileprovision
+*.cer
+*.key
+
+.DS_Store

@@ -1,0 +1,79 @@
+# 在 GitHub 官方的 macOS 云主机上编译四个注入用 dylib。
+#
+# 用法：把仓库推到 GitHub 后，Actions → Build iOS Tweaks → Run workflow，
+# 跑完在页面底部的 Artifacts 里下载 ipatool-tweaks.zip（内含 *.dylib）。
+# 之所以必须跑在 macOS runner 上：iPhoneOS SDK 与 codesign 只能在 Apple 工具链里使用，
+# Linux 容器拿不到合法 SDK。
+name: Build iOS Tweaks
+
+on:
+  workflow_dispatch:
+    inputs:
+      min_ios:
+        description: 最低 iOS 版本
+        required: false
+        default: "14.0"
+      archs:
+        description: 架构（arm64e 需自行处理 ptrauth 签名）
+        required: false
+        default: "arm64"
+  push:
+    paths:
+      - "tweak/**"
+      - ".github/workflows/build-tweak.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcode-select -p
+          xcrun --sdk iphoneos --show-sdk-version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Build dylibs
+        env:
+          IPATOOL_MIN_IOS: ${{ inputs.min_ios || '14.0' }}
+          IPATOOL_ARCHS: ${{ inputs.archs || 'arm64' }}
+        run: |
+          chmod +x tweak/build.sh
+          ./tweak/build.sh
+
+      - name: Verify artifacts
+        run: |
+          shopt -s nullglob
+          files=(tweak/build/*.dylib)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "没有生成任何 dylib" >&2
+            exit 1
+          fi
+          for f in "${files[@]}"; do
+            echo "=== $f"
+            file "$f"
+            lipo -info "$f"
+            codesign -dvvv "$f" 2>&1 | head -3 || true
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ipatool-tweaks
+          path: tweak/build/*.dylib
+          if-no-files-found: error
+          retention-days: 90
+
+      # Release asset 可以匿名下载，Artifact 必须登录，所以额外发一份到 Release
+      - name: Publish dylibs as release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: build-${{ github.run_number }}
+        run: |
+          gh release create "$TAG" tweak/build/*.dylib \
+            --title "$TAG" \
+            --notes "Actions 自动编译：run ${{ github.run_number }} / commit ${{ github.sha }}" \
+            --latest=false

@@ -1,0 +1,2 @@
+# macOS / Linux 的 CI 上执行脚本必须是 LF，Windows 检出时才转 CRLF
+*.sh text eol=lf
