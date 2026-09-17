@@ -57,19 +57,29 @@ build_target() {
   esac
 
   echo "编译 $name: min-iOS=$MIN_IOS archs=$ARCHS"
-  xcrun -sdk iphoneos clang \
+
+  # 注意两点：
+  # 1) 新版 iOS SDK 里 UIKit 不再间接导出 CoreGraphics 的 C 符号，用到
+  #    CGBitmapContextCreate / CGAffineTransform* / CGRectGet* 必须显式链接 CoreGraphics；
+  # 2) 必须用 if ! 显式判失败：build_target 是作为 `... || status=1` 的左操作数调用的，
+  #    在那种上下文里 bash 会禁用函数内的 set -e，链接失败会被静默吞掉（还会误报"已生成"）。
+  if ! xcrun -sdk iphoneos clang \
     -dynamiclib -fobjc-arc -O2 \
     "${ARCH_FLAGS[@]}" \
     -mios-version-min="$MIN_IOS" \
     -isysroot "$SDK" \
-    -framework Foundation -framework UIKit -framework AVFoundation \
-    -framework CoreMedia -framework CoreVideo -framework QuartzCore \
+    -framework Foundation -framework UIKit -framework CoreGraphics \
+    -framework AVFoundation -framework CoreMedia -framework CoreVideo \
+    -framework QuartzCore \
     ${extra[@]+"${extra[@]}"} \
     -install_name "@executable_path/Frameworks/$name.dylib" \
-    -o "$out" "$src"
+    -o "$out" "$src"; then
+    echo "编译失败: $name（详见上方 clang 输出）" >&2
+    return 1
+  fi
 
   # 先用 ad-hoc 签名占位，正式签名由 ipatool 重签时用 codesign/zsign 覆盖
-  if command -v codesign >/dev/null 2>&1; then
+  if [[ -f "$out" ]] && command -v codesign >/dev/null 2>&1; then
     codesign --force --sign - "$out" >/dev/null 2>&1 || true
   fi
 
