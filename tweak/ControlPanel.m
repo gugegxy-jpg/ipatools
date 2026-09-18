@@ -90,7 +90,9 @@ static void IPATCpStore(NSString *key, id value) {
 
 #pragma mark - 取当前场景（iOS 13+ 一个 App 可能有多个 scene）
 
-static UIWindowScene *IPATCpActiveWindowScene(void) {
+/// requireActive = YES：只要已经在前台的 scene。挂到没激活的 scene 上窗口
+/// 根本不显示（表现就是第一次进游戏看不到悬浮按钮，切后台再回来才出现）
+static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
     UIWindowScene *foreground = nil;
     UIWindowScene *fallback = nil;
     if (@available(iOS 13.0, *)) {
@@ -99,10 +101,12 @@ static UIWindowScene *IPATCpActiveWindowScene(void) {
             UIWindowScene *windowScene = (UIWindowScene *)scene;
             if (windowScene.activationState == UISceneActivationStateForegroundActive) {
                 foreground = windowScene;
+                break;
             }
             if (!fallback) fallback = windowScene;
         }
     }
+    if (requireActive) return foreground;
     return foreground ?: fallback;
 }
 
@@ -118,6 +122,25 @@ static UIWindowScene *IPATCpActiveWindowScene(void) {
     return NO;
 }
 
+/// 诊断用：这个窗口要是吃掉了触摸，游戏就整个点不动了，而窗口是透明的，
+/// 光看屏幕看不出来。命中了谁就记一句（节流，别刷屏）
+- (void)sendEvent:(UIEvent *)event {
+    [super sendEvent:event];
+    if (event.type != UIEventTypeTouches) return;
+    static CFTimeInterval lastLog = 0;
+    CFTimeInterval now = CACurrentMediaTime();
+    if (now - lastLog < 3.0) return;
+    UITouch *touch = [event allTouches].anyObject;
+    if (!touch) return;
+    CGPoint point = [touch locationInView:self];
+    UIView *hit = [self hitTest:point withEvent:event];
+    if (!hit) return;          // 空白区：穿透了，正常
+    lastLog = now;
+    IPATCpLog(@"触摸命中 %@ frame=%@ hidden=%d alpha=%.2f 交互=%d",
+              NSStringFromClass(hit.class), NSStringFromCGRect(hit.frame),
+              hit.hidden, hit.alpha, hit.userInteractionEnabled);
+}
+
 @end
 
 /// 根视图：空白区域返回 nil，让触摸继续落到下层（App 的）窗口
@@ -128,7 +151,10 @@ static UIWindowScene *IPATCpActiveWindowScene(void) {
 
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hit = [super hitTest:point withEvent:event];
-    return hit == self ? nil : hit;
+    if (hit == self) return nil;                    // 空白：让触摸落到下面的游戏窗口
+    // 收起动画期间、或者已经隐藏的东西都不该继续吃触摸
+    if (hit && (hit.hidden || !hit.userInteractionEnabled || hit.alpha < 0.01)) return nil;
+    return hit;
 }
 
 @end
@@ -240,7 +266,8 @@ static UIWindowScene *IPATCpActiveWindowScene(void) {
         self.window.hidden = NO;
         return;
     }
-    UIWindowScene *scene = IPATCpActiveWindowScene();
+    // 前 30 次（7.5 秒）只认前台 scene；实在等不到就退而求其次，别一直不显示
+    UIWindowScene *scene = IPATCpActiveWindowScene(attempts > 10);
     if (scene) {
         [self attachWindowInScene:scene];
         return;
@@ -291,7 +318,58 @@ static UIWindowScene *IPATCpActiveWindowScene(void) {
         [self setExpanded:YES animated:NO];
     }
     window.hidden = NO;
-    IPATCpLog(@"悬浮窗已创建");
+    IPATCpLog(@"悬浮窗已创建 frame=%@ bounds=%@ center=%@ transform=%@ host=%@",
+              NSStringFromCGRect(window.frame), NSStringFromCGRect(window.bounds),
+              NSStringFromCGPoint(window.center), NSStringFromCGAffineTransform(window.transform),
+              NSStringFromCGRect(host.bounds));
+    [self scheduleWindowCheck];
+}
+
+/// 建好之后复查一次：挂到没激活的 scene 上、或者被系统收走的窗口是不显示的
+///（表现就是「第一次进游戏看不到按钮，切后台再回来才出现」）
+- (void)scheduleWindowCheck {
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [weakSelf checkWindowVisibleAndRebuildIfNeeded:3];
+    });
+}
+
+- (void)checkWindowVisibleAndRebuildIfNeeded:(NSInteger)rounds {
+    if (!self.window) {
+        [self ensureWindowWithAttempts:8];
+        return;
+    }
+    BOOL bad = self.window.hidden || self.window.bounds.size.width <= 0;
+    if (@available(iOS 13.0, *)) {
+        UIWindowScene *scene = self.window.windowScene;
+        if (!scene || scene.activationState != UISceneActivationStateForegroundActive) bad = YES;
+    }
+    if (!bad) return;
+    if (rounds <= 0) return;
+    IPATCpLog(@"悬浮窗看着没显示出来，重建（hidden=%d）", self.window.hidden);
+    [self rebuildWindow];
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [weakSelf checkWindowVisibleAndRebuildIfNeeded:rounds - 1];
+    });
+}
+
+/// 连窗口带里面的视图整个换掉。重建一律收起面板：展开状态下那层
+///「点空白收起」的遮罩是全屏的，留着它游戏就整个点不动了
+- (void)rebuildWindow {
+    self.window = nil;
+    self.hostView = nil;
+    self.button = nil;
+    self.buttonLabel = nil;
+    self.buttonImageView = nil;
+    self.panel = nil;
+    self.scroll = nil;
+    self.contentView = nil;
+    self.dismissOverlay = nil;
+    self.expanded = NO;
+    [self ensureWindowWithAttempts:8];
 }
 
 #pragma mark 悬浮按钮
@@ -364,27 +442,36 @@ static UIWindowScene *IPATCpActiveWindowScene(void) {
     return [UIFont systemFontOfSize:12.0 weight:UIFontWeightSemibold];
 }
 
-/// 位置记在 NSUserDefaults 里，下次进来还在顺手的位置（存成 "x,y"）
+/// 位置记在 NSUserDefaults 里，存成「相对悬浮窗的比例」而不是绝对坐标：
+/// 转屏之后窗口长宽会换过来，绝对坐标经常落到屏幕外面（按钮就「飘出去」了）
 - (void)restoreButtonPosition {
     CGRect host = self.hostView.bounds;
+    if (host.size.width <= 0 || host.size.height <= 0) return;
+    CGFloat rx = 0.85, ry = 0.32;   // 默认：右侧偏上，避开大多数 App 的底部操作区
     NSString *saved = IPATCpStoredString(IPATKeyButtonFrame, nil);
     NSArray<NSString *> *parts = saved.length > 0 ? [saved componentsSeparatedByString:@","] : nil;
     if (parts.count == 2) {
-        self.button.center = CGPointMake(parts[0].doubleValue + self.button.bounds.size.width / 2.0,
-                                        parts[1].doubleValue + self.button.bounds.size.height / 2.0);
-        [self clampButton];
-        return;
+        double a = parts[0].doubleValue, b = parts[1].doubleValue;
+        if (a >= 0 && a <= 1.5 && b >= 0 && b <= 1.5) {
+            rx = (CGFloat)a;
+            ry = (CGFloat)b;
+        } else {
+            // 老版本存的是绝对像素，换算成比例接着用
+            rx = (CGFloat)(a / host.size.width);
+            ry = (CGFloat)(b / host.size.height);
+        }
     }
-    // 默认：右侧、屏幕偏上，避开大多数 App 的底部操作区
-    self.button.center = CGPointMake(host.size.width - self.button.bounds.size.width / 2.0 - 8.0,
-                                    host.size.height * 0.32);
+    self.button.center = CGPointMake(rx * host.size.width, ry * host.size.height);
     [self clampButton];
 }
 
 - (void)persistButtonPosition {
-    CGRect frame = self.button.frame;
+    CGRect host = self.hostView.bounds;
+    if (host.size.width <= 0 || host.size.height <= 0) return;
+    CGPoint center = self.button.center;
     IPATCpStore(IPATKeyButtonFrame,
-                [NSString stringWithFormat:@"%.0f,%.0f", frame.origin.x, frame.origin.y]);
+                [NSString stringWithFormat:@"%.4f,%.4f",
+                 center.x / host.size.width, center.y / host.size.height]);
 }
 
 - (void)clampButton {
@@ -921,32 +1008,30 @@ static UIWindowScene *IPATCpActiveWindowScene(void) {
     if (label) label.text = detail;
 }
 
-/// 屏幕方向变了：窗口跟着转过去，按钮别跑到屏幕外面
+/// 屏幕方向变了：窗口跟着转过去，按钮按「记下来的比例」重新落位，
+/// 别留在屏幕外面（绝对坐标转屏之后必然跑偏）
 - (void)handleOrientationChange {
     if (!self.window) return;
     IPATAlignWindowToInterface(self.window, IPATAppKeyWindowExcluding(self.window));
-    [self clampButton];
+    [self restoreButtonPosition];
     [self layoutPanel];
 }
 
 - (void)handleDidBecomeActive {
-    // App 可能重建过窗口（比如 scene 重连），窗口没了或挂不到 scene 上就整个重建
+    // App 可能重建过窗口（比如 scene 重连），窗口没了或挂不到前台 scene 上就整个重建
     BOOL orphaned = NO;
     if (@available(iOS 13.0, *)) {
-        orphaned = (self.window.windowScene == nil);
+        UIWindowScene *scene = self.window.windowScene;
+        orphaned = (scene == nil) || (scene.activationState != UISceneActivationStateForegroundActive);
     }
     if (!self.window || orphaned) {
-        self.window = nil;
-        self.hostView = nil;
-        self.button = nil;
-        self.buttonLabel = nil;
-        self.panel = nil;
-        self.scroll = nil;
-        self.contentView = nil;
-        self.dismissOverlay = nil;
-        [self ensureWindowWithAttempts:8];
+        [self rebuildWindow];
     }
     IPATAlignWindowToInterface(self.window, IPATAppKeyWindowExcluding(self.window));
+    IPATCpLog(@"回到前台 frame=%@ bounds=%@ transform=%@ host=%@ 展开=%d",
+              NSStringFromCGRect(self.window.frame), NSStringFromCGRect(self.window.bounds),
+              NSStringFromCGAffineTransform(self.window.transform),
+              NSStringFromCGRect(self.hostView.bounds), self.expanded);
 }
 
 @end

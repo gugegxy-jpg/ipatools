@@ -178,6 +178,23 @@ static UIViewController *IPATFbTopViewController(void) {
 /// 却完全点不动。平时不抢焦点，只在弹系统界面时才 makeKeyAndVisible
 - (BOOL)canBecomeKeyWindow { return YES; }
 
+/// 诊断用：这个窗口是常驻的透明窗口，一旦吃掉触摸游戏就整个点不动了，
+/// 而屏幕上看不出来。命中了谁就记一句（节流，别刷屏）
+- (void)sendEvent:(UIEvent *)event {
+    [super sendEvent:event];
+    if (event.type != UIEventTypeTouches) return;
+    static NSTimeInterval lastLog = 0;
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    if (now - lastLog < 3.0) return;
+    UITouch *touch = [event allTouches].anyObject;
+    if (!touch) return;
+    UIView *hit = [self hitTest:[touch locationInView:self] withEvent:event];
+    if (!hit) return;          // 穿透了，正常
+    lastLog = now;
+    IPATFbLog(@"触摸命中 %@ frame=%@ hidden=%d alpha=%.2f",
+              NSStringFromClass(hit.class), NSStringFromCGRect(hit.frame), hit.hidden, hit.alpha);
+}
+
 @end
 
 /// 根视图：空白区域返回 nil，触摸继续落到下层窗口，

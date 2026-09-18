@@ -149,10 +149,11 @@ static inline UIInterfaceOrientation IPATInterfaceOrientation(void) {
     return orientation == UIInterfaceOrientationUnknown ? UIInterfaceOrientationPortrait : orientation;
 }
 
-/// 把窗口对齐到游戏当前的方向。
-/// 尺寸一律用屏幕大小：App 的 key window 未必是全屏的（有些游戏会挂小窗口、
-/// 或者给它加缩放），照抄它的 bounds/center 会把我们的窗口甩到屏幕外面去。
-/// 方向只跟「整 90°/180°」的旋转：主窗口（或它的根视图）转过就照抄那个角度
+/// 把窗口对齐到游戏当前的方向，保证窗口在屏幕上正好铺满一屏。
+/// 尺寸只认屏幕自己（iOS 8+ 的 UIScreen.bounds 已经是「当前界面方向」下的尺寸）：
+/// App 的 key window 未必全屏（小窗口、带缩放的都有），照抄它会被甩出屏幕；
+/// 而 statusBarOrientation 在全屏游戏里基本不更新，拿它判断横竖屏算出来的尺寸
+/// 经常跟屏幕反着 —— 窗口盖不满或者盖到屏幕外，悬浮按钮就「飘出去」了。
 static inline void IPATAlignWindowToInterface(UIWindow *window, UIWindow *appWindow) {
     if (!window) return;
     window.transform = CGAffineTransformIdentity;
@@ -166,29 +167,29 @@ static inline void IPATAlignWindowToInterface(UIWindow *window, UIWindow *appWin
     }
     CGAffineTransform rotation = CGAffineTransformIdentity;
     if (!CGAffineTransformIsIdentity(candidate)) {
-        CGFloat angle = fabsf(atan2f((float)candidate.b, (float)candidate.a));
-        // 只认整 90°/180° 的旋转，缩放之类的花活儿不跟
-        if (fabsf(angle - (float)M_PI_2) < 0.05f || fabsf(angle - (float)M_PI) < 0.05f) {
-            rotation = candidate;
+        // 只跟「整 90°/180°」的旋转，而且只取角度、不带缩放
+        CGFloat angle = atan2f((float)candidate.b, (float)candidate.a);
+        CGFloat quarters = roundf(angle / (float)M_PI_2);
+        if (fabsf(angle - quarters * (float)M_PI_2) < 0.05f) {
+            rotation = CGAffineTransformMakeRotation(quarters * (CGFloat)M_PI_2);
         }
     }
 
+    CGRect screen = [UIScreen mainScreen].bounds;
+    if (screen.size.width <= 0 || screen.size.height <= 0) return;
+
     if (!CGAffineTransformIsIdentity(rotation)) {
-        // 转过的：尺寸用「没转时」的屏幕大小（fixedCoordinateSpace 永远是竖屏）
-        CGRect fixed = [UIScreen mainScreen].fixedCoordinateSpace.bounds;
-        window.bounds = fixed;
-        window.center = CGPointMake(CGRectGetMidX(fixed), CGRectGetMidY(fixed));
+        // 游戏是自己转过窗口的（系统不知道）：照抄角度，尺寸用「转回来」的大小，
+        // 这样转出去之后正好铺满屏幕
+        CGRect unrotated = CGRectApplyAffineTransform(
+            CGRectMake(0, 0, screen.size.width, screen.size.height),
+            CGAffineTransformInvert(rotation));
+        window.bounds = CGRectMake(0, 0, fabs(unrotated.size.width), fabs(unrotated.size.height));
+        window.center = CGPointMake(CGRectGetMidX(screen), CGRectGetMidY(screen));
         window.transform = rotation;
     } else {
-        CGRect frame = [UIScreen mainScreen].bounds;
-        UIInterfaceOrientation orientation = IPATInterfaceOrientation();
-        BOOL wantLandscape = (orientation == UIInterfaceOrientationLandscapeLeft ||
-                              orientation == UIInterfaceOrientationLandscapeRight);
-        BOOL isLandscape = frame.size.width > frame.size.height;
-        if (wantLandscape != isLandscape) {
-            frame = CGRectMake(0.0, 0.0, frame.size.height, frame.size.width);
-        }
-        window.frame = frame;
+        window.frame = screen;
+    }
     }
     window.rootViewController.view.frame = window.bounds;
 }
