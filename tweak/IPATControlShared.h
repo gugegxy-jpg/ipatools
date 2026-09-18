@@ -195,14 +195,54 @@ static inline UIInterfaceOrientation IPATInterfaceOrientation(void) {
     return orientation == UIInterfaceOrientationUnknown ? UIInterfaceOrientationPortrait : orientation;
 }
 
-/// 把窗口对齐到游戏当前的方向，保证窗口在屏幕上正好铺满一屏。
-/// 尺寸只认屏幕自己（iOS 8+ 的 UIScreen.bounds 已经是「当前界面方向」下的尺寸）：
-/// App 的 key window 未必全屏（小窗口、带缩放的都有），照抄它会被甩出屏幕；
-/// 而 statusBarOrientation 在全屏游戏里基本不更新，拿它判断横竖屏算出来的尺寸
-/// 经常跟屏幕反着 —— 窗口盖不满或者盖到屏幕外，悬浮按钮就「飘出去」了。
+/// 游戏画面现在是横的还是竖的（只看 App 主窗口的实际尺寸，不看系统的界面方向）。
+/// 横屏游戏锁死方向、手机却竖着拿时，系统的界面方向是竖的、画面是横的，
+/// 跟着系统走悬浮窗就会自己转成竖的，跟游戏画面错开。
+static inline UIInterfaceOrientationMask IPATAppOrientationMask(void) {
+    UIWindow *app = IPATAppKeyWindowExcluding(nil);
+    CGSize size = app ? app.bounds.size : CGSizeZero;
+    if (size.width <= 0 || size.height <= 0) size = [UIScreen mainScreen].bounds.size;
+    if (app && !CGAffineTransformIsIdentity(app.transform)) {
+        // 窗口被游戏自己转过 90°/270°：bounds 记的是转之前的尺寸，宽高要换回来
+        CGFloat angle = atan2f((float)app.transform.b, (float)app.transform.a);
+        if (fabs(fabs(angle) - (float)M_PI_2) < 0.05f) {
+            CGFloat swap = size.width;
+            size.width = size.height;
+            size.height = swap;
+        }
+    }
+    if (size.width <= 0 || size.height <= 0) return UIInterfaceOrientationMaskAll;
+    if (size.width > size.height) return UIInterfaceOrientationMaskLandscape;
+    return UIInterfaceOrientationMaskPortrait | UIInterfaceOrientationMaskPortraitUpsideDown;
+}
+
+/// 把我们自己的窗口对齐到游戏窗口：屏幕坐标里的位置、内容坐标里的尺寸、
+/// 旋转角一律照抄。这样游戏画面怎么转，悬浮窗就怎么转，两者永远重合。
+/// 拿不到游戏窗口（或它不是全屏的）时才退回按屏幕尺寸算。
 static inline void IPATAlignWindowToInterface(UIWindow *window, UIWindow *appWindow) {
     if (!window) return;
     window.transform = CGAffineTransformIdentity;
+    window.rootViewController.view.transform = CGAffineTransformIdentity;
+
+    CGRect screen = [UIScreen mainScreen].bounds;
+    BOOL hasScreen = (screen.size.width > 0 && screen.size.height > 0);
+
+    if (appWindow) {
+        CGRect target = appWindow.bounds;
+        CGFloat area = target.size.width * target.size.height;
+        CGFloat screenArea = screen.size.width * screen.size.height;
+        // 面积够大就认定它是主窗口，直接绑死（小窗/带缩放的 App 窗口不适用）
+        if (area > 0 && (!hasScreen || screenArea <= 0 || area >= screenArea * 0.6)) {
+            window.bounds = target;
+            window.center = appWindow.center;
+            window.transform = appWindow.transform;
+            if (window.rootViewController.view) {
+                window.rootViewController.view.frame = window.bounds;
+            }
+            return;
+        }
+    }
+    if (!hasScreen) return;
 
     CGAffineTransform candidate = CGAffineTransformIdentity;
     UIView *appRoot = appWindow ? appWindow.rootViewController.view : nil;
@@ -220,9 +260,6 @@ static inline void IPATAlignWindowToInterface(UIWindow *window, UIWindow *appWin
             rotation = CGAffineTransformMakeRotation(quarters * (CGFloat)M_PI_2);
         }
     }
-
-    CGRect screen = [UIScreen mainScreen].bounds;
-    if (screen.size.width <= 0 || screen.size.height <= 0) return;
 
     if (!CGAffineTransformIsIdentity(rotation)) {
         // 游戏是自己转过窗口的（系统不知道）：照抄角度，尺寸用「转回来」的大小，

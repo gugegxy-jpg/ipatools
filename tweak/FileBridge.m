@@ -237,7 +237,9 @@ static UIViewController *IPATFbTopViewController(void) {
 
 - (BOOL)shouldAutorotate { return YES; }
 
-- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskAll; }
+/// 只允许转到「游戏现在这个方向」：横屏游戏锁方向、手机竖着拿时，
+/// 系统界面方向是竖的，全方向会让这个窗口自己转成竖的，跟画面错开
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return IPATAppOrientationMask(); }
 
 @end
 

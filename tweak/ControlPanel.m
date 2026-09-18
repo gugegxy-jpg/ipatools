@@ -181,7 +181,9 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
 
 - (BOOL)shouldAutorotate { return YES; }
 
-- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskAll; }
+/// 只允许转到「游戏现在这个方向」：横屏游戏锁方向、手机竖着拿时系统界面
+/// 方向是竖的，给全方向的话这个窗口会自己转成竖的，跟游戏画面错开
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return IPATAppOrientationMask(); }
 
 @end
 
@@ -1026,6 +1028,18 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
 /// 屏幕方向变了：窗口跟着转过去，按钮按「记下来的比例」重新落位，
 /// 别留在屏幕外面（绝对坐标转屏之后必然跑偏）
 - (void)handleOrientationChange {
+    [self alignToAppWindow];
+    // 系统转屏动画有 0.4 秒左右，动画期间设好的 bounds/transform 会被它盖回去，
+    // 所以等动画收尾再对一次
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [weakSelf alignToAppWindow];
+    });
+}
+
+/// 和游戏窗口绑死：位置、尺寸、旋转角一律照抄，跟游戏画面永远重合
+- (void)alignToAppWindow {
     if (!self.window) return;
     IPATAlignWindowToInterface(self.window, IPATAppKeyWindowExcluding(self.window));
     [self restoreButtonPosition];
@@ -1042,12 +1056,15 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
     if (!self.window || orphaned) {
         [self rebuildWindow];
     }
-    IPATAlignWindowToInterface(self.window, IPATAppKeyWindowExcluding(self.window));
-    IPATCpLog(@"回到前台 frame=%@ bounds=%@ transform=%@ host=%@ 展开=%d 按钮=%@",
-              NSStringFromCGRect(self.window.frame), NSStringFromCGRect(self.window.bounds),
+    UIWindow *app = IPATAppKeyWindowExcluding(self.window);
+    IPATAlignWindowToInterface(self.window, app);
+    [self restoreButtonPosition];
+    [self layoutPanel];
+    IPATCpLog(@"回到前台 窗口=%@ transform=%@ / 游戏窗口=%@ transform=%@ 展开=%d 按钮=%@",
+              NSStringFromCGRect(self.window.bounds),
               NSStringFromCGAffineTransform(self.window.transform),
-              NSStringFromCGRect(self.hostView.bounds), self.expanded,
-              NSStringFromCGRect(self.button.frame));
+              NSStringFromCGRect(app.bounds), NSStringFromCGAffineTransform(app.transform),
+              self.expanded, NSStringFromCGRect(self.button.frame));
 }
 
 @end
