@@ -524,6 +524,8 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
 @property (nonatomic, copy) NSString *currentExportZip;
 /// 本次导出打包的条目数（状态行用）
 @property (nonatomic, assign) NSInteger exportItemCount;
+/// 导入进度弹窗（导入期间悬浮面板是藏着的，状态行看不见）
+@property (nonatomic, strong) UIAlertController *importAlert;
 /// 本次导入的落地目录（用「导入到指定文件夹」挑过之后才有值）
 @property (nonatomic, copy) NSString *importDirectory;
 
@@ -1054,6 +1056,14 @@ fail:
     self.exportItemCount = (NSInteger)valid.count;
     [self postStatus:[NSString stringWithFormat:@"正在打包 %ld 项为 zip…", (long)valid.count]];
 
+    // 打包大目录要跑好几分钟，进度直接显示在浏览器上——
+    // 悬浮面板这时是藏起来的，状态行发了也看不见
+    UIAlertController *packAlert =
+        [UIAlertController alertControllerWithTitle:@"正在打包 zip…"
+                                            message:@"扫描文件中…"
+                                     preferredStyle:UIAlertControllerStyleAlert];
+    [presenter presentViewController:packAlert animated:YES completion:nil];
+
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         IPATFbLog(@"开始导出 %ld 项：%@", (long)valid.count, valid);
         // 先收集条目（顺带统计总体积），再打包
@@ -1076,41 +1086,78 @@ fail:
             ok = NO;
             error = [NSError errorWithDomain:@"IPAToolFiles" code:10
                                  userInfo:@{NSLocalizedDescriptionKey:
-                                            @"没有收集到任何文件（目录可能已被游戏清空或正在重写，"
-                                            "等热更结束再试，或改选具体文件）"}];
+                                            [NSString stringWithFormat:
+                                             @"没有收集到任何文件（%ld 个子目录里都没有文件，"
+                                             "可能已被游戏清空或正在重写）", (long)collectedDirs]}];
         }
         if (ok) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                packAlert.message = [NSString stringWithFormat:
+                                     @"文件 %ld、目录 %ld，共 %.2f GB\n写入中…",
+                                     (long)collectedFiles, (long)collectedDirs,
+                                     totalBytes / 1073741824.0];
+            });
             ok = IPATFbZipWrite(entries, totalBytes, zipPath,
                 ^(uint64_t done, uint64_t total) {
                     long percent = total > 0 ? (long)((double)done / (double)total * 100.0) : 0;
+                    NSString *text = [NSString stringWithFormat:
+                                      @"文件 %ld、目录 %ld，共 %.2f GB\n写入中 %ld%%",
+                                      (long)collectedFiles, (long)collectedDirs,
+                                      totalBytes / 1073741824.0, percent];
                     dispatch_async(dispatch_get_main_queue(), ^{
+                        packAlert.message = text;
                         [self postStatus:[NSString stringWithFormat:@"打包中 %ld%%", percent]];
                     });
                 }, &error);
         }
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (!ok) {
-                [self postStatus:[NSString stringWithFormat:@"打包失败：%@",
-                                                                    error.localizedDescription ?: @"未知错误"]];
-                return;
+            void (^showResult)(void) = ^{
+                UIViewController *base = packAlert.presentingViewController ?: presenter;
+                if (!ok) {
+                    IPATFbLog(@"打包失败：%@", error.localizedDescription ?: @"未知错误");
+                    [self postStatus:[NSString stringWithFormat:@"打包失败：%@",
+                                                                error.localizedDescription ?: @"未知错误"]];
+                    if (base.view.window) {
+                        UIAlertController *alert =
+                            [UIAlertController alertControllerWithTitle:@"打包失败"
+                                message:error.localizedDescription ?: @"未知错误"
+                                preferredStyle:UIAlertControllerStyleAlert];
+                        [alert addAction:[UIAlertAction actionWithTitle:@"好"
+                                                                  style:UIAlertActionStyleDefault
+                                                                handler:nil]];
+                        [base presentViewController:alert animated:YES completion:nil];
+                    }
+                    return;
+                }
+                self.currentExportZip = zipPath;
+                self.purpose = IPATFbPickerExport;
+                // asCopy:YES —— 系统把 zip 拷到用户选的位置，沙盒原文件不受影响
+                UIDocumentPickerViewController *picker =
+                    [[UIDocumentPickerViewController alloc] initForExportingURLs:
+                        @[[NSURL fileURLWithPath:zipPath]] asCopy:YES];
+                picker.delegate = self;
+                NSInteger fileCount = 0, dirCount = 0;
+                uint64_t zipBytes = 0;
+                for (NSDictionary *e in entries) {
+                    if ([e[@"dir"] boolValue]) dirCount++;
+                    else { fileCount++; zipBytes += [e[@"size"] unsignedLongLongValue]; }
+                }
+                IPATFbLog(@"导出 zip 就绪：%ld 项（文件 %ld、目录 %ld，共 %.2f GB）-> %@",
+                          (long)valid.count, (long)fileCount, (long)dirCount,
+                          zipBytes / 1073741824.0, zipPath);
+                if (base.view.window) {
+                    [base presentViewController:picker animated:YES completion:nil];
+                } else {
+                    // 浏览器已经关了：选择器没地方弹，删掉临时包，提示重试
+                    [self postStatus:@"打包完成但界面已关闭，请重新点一次导出"];
+                    [[NSFileManager defaultManager] removeItemAtPath:zipPath error:NULL];
+                }
+            };
+            if (packAlert.view.window) {
+                [packAlert dismissViewControllerAnimated:YES completion:showResult];
+            } else {
+                showResult();
             }
-            self.currentExportZip = zipPath;
-            self.purpose = IPATFbPickerExport;
-            // asCopy:YES —— 系统把 zip 拷到用户选的位置，沙盒原文件不受影响
-            UIDocumentPickerViewController *picker =
-                [[UIDocumentPickerViewController alloc] initForExportingURLs:
-                    @[[NSURL fileURLWithPath:zipPath]] asCopy:YES];
-            picker.delegate = self;
-            NSInteger fileCount = 0, dirCount = 0;
-            uint64_t zipBytes = 0;
-            for (NSDictionary *e in entries) {
-                if ([e[@"dir"] boolValue]) dirCount++;
-                else { fileCount++; zipBytes += [e[@"size"] unsignedLongLongValue]; }
-            }
-            IPATFbLog(@"导出 zip 就绪：%ld 项（文件 %ld、目录 %ld，共 %.2f GB）-> %@",
-                      (long)valid.count, (long)fileCount, (long)dirCount,
-                      zipBytes / 1073741824.0, zipPath);
-            [presenter presentViewController:picker animated:YES completion:nil];
         });
     });
 }
@@ -1589,6 +1636,8 @@ done:
             long percent = totalBytes > 0 ? (long)((double)doneBytes / (double)totalBytes * 100.0) : 0;
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self postStatus:[NSString stringWithFormat:@"解压 %@：%ld%%", zipName, percent]];
+                self.importAlert.message =
+                    [NSString stringWithFormat:@"解压 %@：%ld%%", zipName, percent];
             });
         }
     };
@@ -1661,6 +1710,8 @@ done:
                        unsignedLongLongValue] / 1073741824.0);
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self postStatus:[NSString stringWithFormat:@"开始解压 %@…", url.lastPathComponent]];
+                self.importAlert.message =
+                    [NSString stringWithFormat:@"解压 %@…", url.lastPathComponent];
             });
             ok = [self importZip:url toDirectory:destination files:&extracted error:&copyError];
             if (ok) {
@@ -1699,6 +1750,10 @@ done:
            extracted:(NSInteger)extractedFiles
                error:(NSError *)error {
     IPATFbSetOverlayVisible(YES);
+    // 收起导入进度弹窗后再显示结果（都在主线程）
+    UIAlertController *alert = self.importAlert;
+    self.importAlert = nil;
+    void (^body)(void) = ^{
     NSString *where = IPATFbDisplayPath(self.importDirectory.length
                                         ? self.importDirectory
                                         : IPATFbImportDirectory());
@@ -1718,6 +1773,12 @@ done:
     }
     IPATFbLog(@"导入完成：%ld/%ld（文件夹 %ld，压缩包 %ld）-> %@",
               (long)copied, (long)total, (long)folders, (long)zips, where);
+    };
+    if (alert.view.window) {
+        [alert dismissViewControllerAnimated:YES completion:body];
+    } else {
+        body();
+    }
 }
 
 #pragma mark UIDocumentPickerDelegate
@@ -1741,9 +1802,14 @@ done:
         return;
     }
     // 拷贝放到后台线程：大文件夹 / iCloud 下载可能很慢，别卡主线程。
-    // 先给个即时状态，免得大文件导入的头几分钟看起来像没反应
-    [self postStatus:[NSString stringWithFormat:@"正在导入 %lu 项（大文件要等一会儿）…",
-                                                (unsigned long)urls.count]];
+    // 进度直接显示成弹窗——导入期间悬浮面板是藏着的，状态行看不见
+    UIAlertController *progress =
+        [UIAlertController alertControllerWithTitle:@"正在导入…"
+                                            message:@"请稍候（大文件要等一会儿）"
+                                     preferredStyle:UIAlertControllerStyleAlert];
+    self.importAlert = progress;
+    UIViewController *top = IPATFbTopViewController();
+    if (top.view.window) [top presentViewController:progress animated:YES completion:nil];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         [self importURLs:urls];
     });
