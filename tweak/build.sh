@@ -37,6 +37,34 @@ fi
 SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
 mkdir -p "$OUT_DIR"
 
+# 把悬浮按钮图标（tweak/AppIcon20x20@2x.png）编码成 C 字节数组编进 dylib，
+# 运行时通过 [UIImage imageWithData:scale:2.0] 加载，不需要额外资源 bundle
+ICON_PNG="$HERE/AppIcon20x20@2x.png"
+ICON_M="$OUT_DIR/IPAToolIcon.m"
+{
+  echo '#include <Foundation/Foundation.h>'
+  echo '#include <UIKit/UIKit.h>'
+  if [[ -f "$ICON_PNG" ]]; then
+    echo '// Icon bytes from AppIcon20x20@2x.png'
+    xxd -i "$ICON_PNG"
+    echo ''
+    echo 'NSData *IPAToolIconImageData(void) {'
+    echo '    return [NSData dataWithBytesNoCopy:(void *)AppIcon20x20_2x_png length:AppIcon20x20_2x_png_len freeWhenDone:NO];'
+    echo '}'
+  else
+    echo 'static const unsigned char kNoIcon[] = {0};'
+    echo ''
+    echo 'NSData *IPAToolIconImageData(void) {'
+    echo '    return nil;'
+    echo '}'
+  fi
+  echo ''
+  echo 'UIImage *IPAToolIconImage(void) {'
+  echo '    NSData *data = IPAToolIconImageData();'
+  echo '    return data ? [UIImage imageWithData:data scale:2.0] : nil;'
+  echo '}'
+} > "$ICON_M"
+
 ARCH_FLAGS=()
 for arch in $ARCHS; do
   ARCH_FLAGS+=(-arch "$arch")
@@ -46,10 +74,14 @@ done
 sources_for_target() {
   case "$1" in
     IPATool)
-      printf '%s\n' "$HERE/KeepAlive.m" "$HERE/ControlPanel.m" "$HERE/FileBridge.m"
+      printf '%s\n' "$HERE/KeepAlive.m" "$HERE/ControlPanel.m" "$HERE/FileBridge.m" "$OUT_DIR/IPAToolIcon.m"
       ;;
     *)
-      printf '%s\n' "$HERE/$1.m"
+      if [[ "$1" == "ControlPanel" ]]; then
+        printf '%s\n' "$HERE/$1.m" "$OUT_DIR/IPAToolIcon.m"
+      else
+        printf '%s\n' "$HERE/$1.m"
+      fi
       ;;
   esac
 }

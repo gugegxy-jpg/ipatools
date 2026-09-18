@@ -25,6 +25,9 @@
 #import <QuartzCore/QuartzCore.h>
 #import "IPATControlShared.h"
 
+/// build.sh 会把 tweak/AppIcon20x20@2x.png 转成 C 字节数组编译进 dylib
+extern UIImage *IPAToolIconImage(void);
+
 #define IPATCpLog(fmt, ...) NSLog(@"[ipatool-panel] " fmt, ##__VA_ARGS__)
 
 #pragma mark - 布局常量
@@ -151,6 +154,7 @@ static UIWindowScene *IPATCpActiveWindowScene(void) {
 @property (nonatomic, strong) IPATCpPassThroughView *hostView;
 @property (nonatomic, strong) UIView *button;
 @property (nonatomic, strong) UILabel *buttonLabel;
+@property (nonatomic, strong) UIImageView *buttonImageView;
 @property (nonatomic, strong) UIVisualEffectView *panel;
 @property (nonatomic, strong) UIScrollView *scroll;
 @property (nonatomic, strong) UIView *contentView;
@@ -294,9 +298,19 @@ static UIWindowScene *IPATCpActiveWindowScene(void) {
 
 - (void)buildButton {
     CGFloat height = IPATCpButtonHeight;
-    NSString *title = IPATCpConfigString(@"Title", @"IPAT");
-    CGSize textSize = [title sizeWithAttributes:@{NSFontAttributeName: [self buttonFont]}];
-    CGFloat width = MAX(58.0, ceil(textSize.width) + 26.0);
+    UIImage *icon = IPAToolIconImage();
+    BOOL hasIcon = (icon && icon.size.width > 0);
+
+    CGFloat width;
+    NSString *title = nil;
+    if (hasIcon) {
+        // 图片按钮做成正方形小圆角胶囊
+        width = height;
+    } else {
+        title = IPATCpConfigString(@"Title", @"IPAT");
+        CGSize textSize = [title sizeWithAttributes:@{NSFontAttributeName: [self buttonFont]}];
+        width = MAX(58.0, ceil(textSize.width) + 26.0);
+    }
 
     UIView *button = [[UIView alloc] initWithFrame:CGRectMake(0, 0, width, height)];
     button.layer.cornerRadius = height / 2.0;
@@ -307,14 +321,30 @@ static UIWindowScene *IPATCpActiveWindowScene(void) {
     button.layer.shadowRadius = 6.0;
     button.layer.shadowOffset = CGSizeMake(0, 2);
 
-    UILabel *label = [[UILabel alloc] initWithFrame:button.bounds];
-    label.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    label.textAlignment = NSTextAlignmentCenter;
-    label.font = [self buttonFont];
-    label.textColor = [UIColor whiteColor];
-    label.text = title;
-    label.userInteractionEnabled = NO;
-    [button addSubview:label];
+    if (hasIcon) {
+        // 图标按按钮大小裁成圆形，留 1pt 边距给边框/阴影
+        CGFloat inset = 1.5;
+        UIImageView *imageView = [[UIImageView alloc] initWithFrame:CGRectInset(button.bounds, inset, inset)];
+        imageView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        imageView.image = icon;
+        imageView.contentMode = UIViewContentModeScaleAspectFill;
+        imageView.clipsToBounds = YES;
+        imageView.layer.cornerRadius = (height - inset * 2.0) / 2.0;
+        imageView.layer.borderWidth = 0;
+        imageView.userInteractionEnabled = NO;
+        [button addSubview:imageView];
+        self.buttonImageView = imageView;
+    } else {
+        UILabel *label = [[UILabel alloc] initWithFrame:button.bounds];
+        label.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        label.textAlignment = NSTextAlignmentCenter;
+        label.font = [self buttonFont];
+        label.textColor = [UIColor whiteColor];
+        label.text = title;
+        label.userInteractionEnabled = NO;
+        [button addSubview:label];
+        self.buttonLabel = label;
+    }
 
     [button addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self
                                                                         action:@selector(handleButtonTap)]];
@@ -325,7 +355,6 @@ static UIWindowScene *IPATCpActiveWindowScene(void) {
 
     [self.hostView addSubview:button];
     self.button = button;
-    self.buttonLabel = label;
 
     [self restoreButtonPosition];
     [self refreshButtonAppearance];
@@ -387,7 +416,9 @@ static UIWindowScene *IPATCpActiveWindowScene(void) {
         ? [UIColor colorWithRed:0.16 green:0.62 blue:0.36 alpha:0.92]   // 有功能开着：绿
         : [UIColor colorWithWhite:0.25 alpha:0.85];                    // 全关：灰
     self.button.backgroundColor = background;
-    self.buttonLabel.textColor = [UIColor colorWithWhite:1.0 alpha:anyEnabled ? 1.0 : 0.72];
+    if (self.buttonLabel) {
+        self.buttonLabel.textColor = [UIColor colorWithWhite:1.0 alpha:anyEnabled ? 1.0 : 0.72];
+    }
 }
 
 - (void)handleButtonTap {
