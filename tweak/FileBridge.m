@@ -284,7 +284,13 @@ static UIWindow *IPATFbAlertWindow(void) {
                                 object:nil
                                  queue:[NSOperationQueue mainQueue]
                             usingBlock:^(NSNotification *note) {
+                    // 系统转屏带动画，通知到的时候往往还没转完，只对齐一次会被
+                    // 系统随后那一转盖掉（表现就是界面自己转过去了），补两次
                     IPATFbSyncWindowGeometry();
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{ IPATFbSyncWindowGeometry(); });
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.9 * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{ IPATFbSyncWindowGeometry(); });
                 }];
             }
         }
@@ -388,6 +394,11 @@ static void IPATFbWatchAlertWindow(void) {
 }
 
 static void IPATFbWatchAlertWindowStep(void) {
+    // 弹窗还开着就顺手纠正一次窗口方向：系统或别的控制器把它转过去了的话，
+    // 最多半秒就被拽回来（对齐是幂等的，方向没变时一个字节都不会动）
+    if (IPATFbAlertWindow().rootViewController.presentedViewController) {
+        IPATFbSyncWindowGeometry();
+    }
     IPATFbCollapseAlertWindowIfIdle();
     UIWindow *window = IPATFbAlertWindow();
     BOOL idle = !window || !window.rootViewController.presentedViewController;
@@ -620,6 +631,20 @@ static NSString *IPATFbDisplayPath(NSString *path) {
 
 #pragma mark - 文件浏览器
 
+/// 浏览器外面这层导航控制器也要把方向锁住：全屏 modal 出来的界面由「最上面那个控制器」
+/// 决定能不能转，系统 UINavigationController 默认跟着 App 声明的方向走 ——
+/// 横屏游戏里手机一竖过来它就自己转成竖的，跟游戏画面错开。
+@interface IPATFbNavigationController : UINavigationController
+@end
+
+@implementation IPATFbNavigationController
+
+- (BOOL)shouldAutorotate { return YES; }
+
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return IPATAppOrientationMask(); }
+
+@end
+
 @interface IPATFbBrowserController : UITableViewController
 
 @property (nonatomic, copy) NSString *directory;
@@ -638,6 +663,11 @@ static NSString *IPATFbDisplayPath(NSString *path) {
 @end
 
 @implementation IPATFbBrowserController
+
+- (BOOL)shouldAutorotate { return YES; }
+
+/// 只许转到「游戏现在这个方向」：自己跟着设备转的话，横屏游戏里一竖过来就错开了
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return IPATAppOrientationMask(); }
 
 - (instancetype)initWithDirectory:(NSString *)directory root:(NSString *)root mode:(IPATFbBrowserMode)mode {
     if ((self = [super initWithStyle:UITableViewStylePlain])) {
@@ -1160,7 +1190,8 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
         }];
     };
 
-    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:browser];
+    IPATFbNavigationController *nav =
+        [[IPATFbNavigationController alloc] initWithRootViewController:browser];
     nav.modalPresentationStyle = UIModalPresentationFullScreen;
     IPATFbSetOverlayVisible(NO);
     [self presentFromTop:nav];
