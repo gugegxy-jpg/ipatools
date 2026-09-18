@@ -474,7 +474,14 @@ static NSData *IPATKASilentWAV(double seconds, uint32_t sampleRate) {
         IPATKALog(@"申请后台任务失败（系统已不再给时间）");
     } else {
         self.renewCount++;
-        IPATKALog(@"后台任务续期，剩余时间约 %.0f 秒", app.backgroundTimeRemaining);
+        // 前台时 backgroundTimeRemaining 是 DBL_MAX（不是真的秒数），
+        // 直接打出来会把日志文件撑爆，看着也莫名其妙
+        NSTimeInterval remaining = app.backgroundTimeRemaining;
+        if (remaining > 1e9) {
+            IPATKALog(@"后台任务已续期（当前在前台，系统不限时）");
+        } else {
+            IPATKALog(@"后台任务续期，剩余时间约 %.0f 秒", remaining);
+        }
     }
 }
 

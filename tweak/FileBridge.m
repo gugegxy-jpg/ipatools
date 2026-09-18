@@ -182,6 +182,14 @@ static UIViewController *IPATFbTopViewController(void) {
 /// 却完全点不动。平时不抢焦点，只在弹系统界面时才 makeKeyAndVisible
 - (BOOL)canBecomeKeyWindow { return YES; }
 
+/// 同上：UIWindow 的 hitTest 在没有子视图命中时返回窗口自己（不是 nil），
+/// 系统就会把这个 level 比悬浮窗还高的透明窗口当成触摸目标——
+/// 表现就是「游戏点不动、连悬浮按钮也点不动」。空白区一律透传。
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit = [super hitTest:point withEvent:event];
+    return hit == self ? nil : hit;
+}
+
 /// 诊断用：这个窗口是常驻的透明窗口，一旦吃掉触摸游戏就整个点不动了，
 /// 而屏幕上看不出来。命中了谁就记一句（节流，别刷屏）
 - (void)sendEvent:(UIEvent *)event {

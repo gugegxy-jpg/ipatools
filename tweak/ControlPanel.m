@@ -126,6 +126,15 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
     return NO;
 }
 
+/// 这个窗口自己绝不能吃触摸：UIWindow 的 hitTest 在「没有子视图命中」时返回的是
+/// 窗口自己（不是 nil），系统于是把这个全屏透明窗口当成触摸的目标窗口，
+/// 下面游戏的窗口就再也收不到任何触摸——表现就是「游戏整个点不动」，
+/// 而窗口是全屏透明的，光看屏幕一点都看不出来。空白区一律返回 nil 透传下去。
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit = [super hitTest:point withEvent:event];
+    return hit == self ? nil : hit;
+}
+
 /// 诊断用：这个窗口要是吃掉了触摸，游戏就整个点不动了，而窗口是透明的，
 /// 光看屏幕看不出来。命中了谁就记一句（节流，别刷屏）
 - (void)sendEvent:(UIEvent *)event {
@@ -322,10 +331,10 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
         [self setExpanded:YES animated:NO];
     }
     window.hidden = NO;
-    IPATCpLog(@"悬浮窗已创建 frame=%@ bounds=%@ center=%@ transform=%@ host=%@",
+    IPATCpLog(@"悬浮窗已创建 frame=%@ bounds=%@ center=%@ transform=%@ host=%@ 按钮=%@",
               NSStringFromCGRect(window.frame), NSStringFromCGRect(window.bounds),
               NSStringFromCGPoint(window.center), NSStringFromCGAffineTransform(window.transform),
-              NSStringFromCGRect(host.bounds));
+              NSStringFromCGRect(host.bounds), NSStringFromCGRect(self.button.frame));
     [self scheduleWindowCheck];
 }
 
@@ -978,8 +987,10 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
     id visible = note.userInfo[IPATVisVisible];
     if (![visible respondsToSelector:@selector(boolValue)]) return;
     BOOL show = [visible boolValue];
+    if (self.window.hidden == !show) return;   // 状态没变就别重复操作、重复记日志
     self.window.hidden = !show;
-    IPATCpLog(@"悬浮窗%@", show ? @"已恢复" : @"临时隐藏");
+    IPATCpLog(@"悬浮窗%@ 窗口hidden=%d 按钮=%@", show ? @"已恢复" : @"临时隐藏",
+              self.window.hidden, NSStringFromCGRect(self.button.frame));
 }
 
 #pragma mark 通知
@@ -1032,10 +1043,11 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
         [self rebuildWindow];
     }
     IPATAlignWindowToInterface(self.window, IPATAppKeyWindowExcluding(self.window));
-    IPATCpLog(@"回到前台 frame=%@ bounds=%@ transform=%@ host=%@ 展开=%d",
+    IPATCpLog(@"回到前台 frame=%@ bounds=%@ transform=%@ host=%@ 展开=%d 按钮=%@",
               NSStringFromCGRect(self.window.frame), NSStringFromCGRect(self.window.bounds),
               NSStringFromCGAffineTransform(self.window.transform),
-              NSStringFromCGRect(self.hostView.bounds), self.expanded);
+              NSStringFromCGRect(self.hostView.bounds), self.expanded,
+              NSStringFromCGRect(self.button.frame));
 }
 
 @end
