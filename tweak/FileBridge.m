@@ -162,6 +162,86 @@ static UIViewController *IPATFbTopViewController(void) {
     return controller;
 }
 
+#pragma mark - 弹窗专用窗口
+
+/// 之前弹窗都挂在「App 当前最上层的控制器」上，宿主窗口由游戏决定：
+/// 游戏自己的窗口、SDK 的透明窗口、我们的悬浮窗（level 比 Alert 还高）
+/// 都可能盖在上面，弹窗显示出来了但触摸落不到它身上——看得见点不动。
+/// 所以自己开一个窗口当宿主，level 压过所有这些，弹窗一定在最上层。
+@interface IPATFbWindow : UIWindow
+@end
+
+@implementation IPATFbWindow
+
+/// 不抢焦点：键盘输入之类的还是归 App 自己的窗口
+- (BOOL)canBecomeKeyWindow { return NO; }
+
+@end
+
+/// 根视图：空白区域返回 nil，触摸继续落到下层窗口，
+/// 免得这个常驻的透明窗口把游戏自己的触摸全吃掉
+@interface IPATFbWindowRootView : UIView
+@end
+
+@implementation IPATFbWindowRootView
+
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit = [super hitTest:point withEvent:event];
+    return hit == self ? nil : hit;
+}
+
+@end
+
+static UIWindow *IPATFbAlertWindow(void) {
+    static UIWindow *window;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        if (@available(iOS 13.0, *)) {
+            // iOS 13 起窗口必须挂在 windowScene 上，否则根本不显示
+            UIWindowScene *scene = nil;
+            for (UIScene *candidate in [UIApplication sharedApplication].connectedScenes) {
+                if (![candidate isKindOfClass:[UIWindowScene class]]) continue;
+                scene = (UIWindowScene *)candidate;
+                if (candidate.activationState == UISceneActivationStateForegroundActive) break;
+            }
+            if (scene && [UIWindow instancesRespondToSelector:@selector(initWithWindowScene:)]) {
+                IPATFbWindow *w = [[IPATFbWindow alloc] initWithWindowScene:scene];
+                w.frame = [UIScreen mainScreen].bounds;
+                w.windowLevel = UIWindowLevelAlert + 200;   // 比悬浮窗（+100）还高
+                w.backgroundColor = [UIColor clearColor];
+                w.opaque = NO;
+                UIViewController *root = [[UIViewController alloc] init];
+                IPATFbWindowRootView *view = [[IPATFbWindowRootView alloc] initWithFrame:w.bounds];
+                view.backgroundColor = [UIColor clearColor];
+                view.opaque = NO;
+                view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+                root.view = view;
+                w.rootViewController = root;
+                w.hidden = NO;
+                window = w;
+            }
+        }
+        if (!window) IPATFbLog(@"拿不到 windowScene，弹窗退回挂在 App 自己的控制器上");
+    });
+    return window;
+}
+
+/// 弹窗收起之后把悬浮窗放回来（导入/导出期间它是藏着的）。
+/// UIAlertController 的按钮没有统一的「关闭」回调，只能盯着它的窗口
+static void IPATFbWatchDismiss(UIViewController *controller) {
+    __weak UIViewController *weakController = controller;
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
+        for (NSInteger i = 0; i < 600; i++) {   // 最多盯 5 分钟
+            [NSThread sleepForTimeInterval:0.5];
+            UIViewController *current = weakController;
+            if (!current || current.view.window == nil || current.isBeingDismissed) {
+                dispatch_async(dispatch_get_main_queue(), ^{ IPATFbSetOverlayVisible(YES); });
+                return;
+            }
+        }
+    });
+}
+
 /// 导入的落地路径。同名不再避让（不生成 xxx-2），直接指向目标位置，
 /// 由 IPATFbReplaceIntoPlace 负责覆盖——导入本来就是为了顶掉旧内容。
 static NSString *IPATFbImportPath(NSString *directory, NSString *name) {
@@ -900,14 +980,37 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
     [self presentFromTop:nav];
 }
 
-- (void)presentFromTop:(UIViewController *)controller {
-    UIViewController *top = IPATFbTopViewController();
-    if (!top) {
+/// 弹窗统一从这里出：挂在专用窗口上（没有就退回 App 自己的顶层控制器）
+- (void)presentNow:(UIViewController *)controller {
+    UIWindow *window = IPATFbAlertWindow();
+    UIViewController *host = window ? window.rootViewController : IPATFbTopViewController();
+    while (host.presentedViewController) host = host.presentedViewController;   // 挂在最上层那个上面
+    if (!host) {
         IPATFbSetOverlayVisible(YES);
         IPATFbLog(@"没有可用的控制器来弹窗");
         return;
     }
-    [top presentViewController:controller animated:YES completion:nil];
+    void (^go)(void) = ^{
+        [host presentViewController:controller animated:YES completion:nil];
+        IPATFbWatchDismiss(controller);
+    };
+    if (host.presentedViewController && host.presentedViewController != controller) {
+        // 上一个还没退干净时 present 会静默失败：表现就是弹不出来，或者弹出来点不动
+        IPATFbLog(@"上一个弹窗还没退干净，先收起再弹");
+        [host dismissViewControllerAnimated:NO completion:^{
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), go);
+        }];
+        return;
+    }
+    go();
+}
+
+/// 下一帧再弹，避开「前一个弹窗正在退场」这个坑
+- (void)presentFromTop:(UIViewController *)controller {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self presentNow:controller];
+    });
 }
 
 #pragma mark - ZIP 打包（导出用）
@@ -2197,8 +2300,9 @@ done:
                                             message:@"请稍候（大文件要等一会儿）"
                                      preferredStyle:UIAlertControllerStyleAlert];
     self.importAlert = progress;
-    UIViewController *top = IPATFbTopViewController();
-    if (top.view.window) [top presentViewController:progress animated:YES completion:nil];
+    // 同步弹：接下来导入是在后台跑的，进度框必须已经挂上窗口，
+    // 否则小文件瞬间导完时「导入完成」会排在它前面弹出来
+    [self presentNow:progress];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         [self importURLs:urls];
     });
