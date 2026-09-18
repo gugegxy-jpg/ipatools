@@ -46,6 +46,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <CoreLocation/CoreLocation.h>
 #import <BackgroundTasks/BackgroundTasks.h>
+#import <objc/runtime.h>
 #import "IPATControlShared.h"
 
 #pragma mark - 配置
@@ -161,6 +162,10 @@ static NSData *IPATKASilentWAV(double seconds, uint32_t sampleRate) {
 @property (nonatomic, assign) BOOL fetchRegistered;
 @property (nonatomic, assign) BOOL processingRegistered;
 @property (nonatomic, assign) NSUInteger renewCount;
+@property (nonatomic, strong) NSTimer *heartbeatTimer;
+@property (nonatomic, assign) NSUInteger heartbeat;              // 心跳总次数
+@property (nonatomic, assign) NSUInteger heartbeatAtBackground;  // 进入后台时的心跳数
+@property (nonatomic, assign) NSTimeInterval enterBackgroundTime;
 @end
 
 @implementation IPATKeepAliveController
@@ -227,12 +232,14 @@ static NSData *IPATKASilentWAV(double seconds, uint32_t sampleRate) {
               IPATKABool(@"Processing", NO));
 
     if (IPATKABool(@"SilentAudio", YES)) {
+        IPATKAInstallCategoryGuard();   // 先把「音频类别」这层护住，再开播
         [self activateAudioSession];
         [self startSilentAudio];
     }
     if (IPATKABool(@"RenewBackgroundTask", YES)) {
         [self startRenewTimer];
     }
+    [self startHeartbeat];
     if (IPATKABool(@"Location", NO)) {
         [self startLocation];
     }
@@ -247,6 +254,8 @@ static NSData *IPATKASilentWAV(double seconds, uint32_t sampleRate) {
     [self stopSilentAudio];
     [self.renewTimer invalidate];
     self.renewTimer = nil;
+    [self.heartbeatTimer invalidate];
+    self.heartbeatTimer = nil;
     [self endBackgroundTask];
     [self stopLocation];
     [self cancelSchedulerTasks];
@@ -325,6 +334,7 @@ static NSData *IPATKASilentWAV(double seconds, uint32_t sampleRate) {
         if (IPATKABool(@"RenewBackgroundTask", YES)) {
             [parts addObject:[NSString stringWithFormat:@"续期 %lu 次", (unsigned long)self.renewCount]];
         }
+        [parts addObject:[NSString stringWithFormat:@"心跳 %lu", (unsigned long)self.heartbeat]];
         if (IPATKABool(@"Location", NO)) {
             [parts addObject:(self.location ? @"定位中" : @"定位待授权")];
         }
@@ -338,6 +348,81 @@ static NSData *IPATKASilentWAV(double seconds, uint32_t sampleRate) {
                                                         object:nil
                                                       userInfo:@{IPATRegId: IPATFeatureKeepAlive,
                                                                  IPATStaDetail: detail}];
+}
+
+#pragma mark 音频类别保护
+
+/// 游戏（音频引擎、各种 SDK）随时可能把音频类别设成 ambient / soloAmbient，
+/// 这两个类别**不支持后台播放**——一设上去我们的静音保活就废了，
+/// 而且系统不会发任何通知，界面上完全看不出来。所以这里顶回去：
+/// 一律改回 playback（带上 MixWithOthers，尽量不影响别的 App）。
+/// Info.plist 里 ForcePlaybackCategory=NO 可以关掉这个行为。
+static BOOL IPATKAForceCategory(AVAudioSessionCategory *category,
+                                AVAudioSessionCategoryOptions *options) {
+    if (!IPATKABool(@"SilentAudio", YES)) return NO;
+    if (!IPATKABool(@"ForcePlaybackCategory", YES)) return NO;
+    if ([*category isEqualToString:AVAudioSessionCategoryPlayback]) return NO;
+    static NSTimeInterval lastLog = 0;
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    if (now - lastLog > 3.0) {   // 游戏可能一秒设好几次，别刷屏
+        lastLog = now;
+        IPATKALog(@"游戏把音频类别设成 %@（这个类别不能后台播放），强制改回 playback", *category);
+    }
+    *category = AVAudioSessionCategoryPlayback;
+    if (options) *options |= AVAudioSessionCategoryOptionMixWithOthers;
+    return YES;
+}
+
+static BOOL (*IPATKAOrigSetCategory)(id, SEL, AVAudioSessionCategory, NSError **) = NULL;
+static BOOL (*IPATKAOrigSetCategoryOptions)(id, SEL, AVAudioSessionCategory,
+                                            AVAudioSessionCategoryOptions, NSError **) = NULL;
+static BOOL (*IPATKAOrigSetCategoryModeOptions)(id, SEL, AVAudioSessionCategory, AVAudioSessionMode,
+                                                AVAudioSessionCategoryOptions, NSError **) = NULL;
+
+static BOOL IPATKASetCategory(id self, SEL _cmd, AVAudioSessionCategory category, NSError **error) {
+    IPATKAForceCategory(&category, NULL);
+    if (IPATKAOrigSetCategory) return IPATKAOrigSetCategory(self, _cmd, category, error);
+    return NO;
+}
+
+static BOOL IPATKASetCategoryOptions(id self, SEL _cmd, AVAudioSessionCategory category,
+                                     AVAudioSessionCategoryOptions options, NSError **error) {
+    IPATKAForceCategory(&category, &options);
+    if (IPATKAOrigSetCategoryOptions) {
+        return IPATKAOrigSetCategoryOptions(self, _cmd, category, options, error);
+    }
+    return NO;
+}
+
+static BOOL IPATKASetCategoryModeOptions(id self, SEL _cmd, AVAudioSessionCategory category,
+                                         AVAudioSessionMode mode,
+                                         AVAudioSessionCategoryOptions options, NSError **error) {
+    IPATKAForceCategory(&category, &options);
+    if (IPATKAOrigSetCategoryModeOptions) {
+        return IPATKAOrigSetCategoryModeOptions(self, _cmd, category, mode, options, error);
+    }
+    return NO;
+}
+
+static void IPATKAInstallCategoryGuard(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        Class cls = [AVAudioSession class];
+        struct { SEL sel; IMP imp; void **out; } entries[] = {
+            { @selector(setCategory:error:), (IMP)IPATKASetCategory, (void **)&IPATKAOrigSetCategory },
+            { @selector(setCategory:withOptions:error:), (IMP)IPATKASetCategoryOptions,
+              (void **)&IPATKAOrigSetCategoryOptions },
+            { @selector(setCategory:mode:options:error:), (IMP)IPATKASetCategoryModeOptions,
+              (void **)&IPATKAOrigSetCategoryModeOptions },
+        };
+        for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); i++) {
+            Method method = class_getInstanceMethod(cls, entries[i].sel);
+            if (!method) continue;
+            *entries[i].out = (void *)method_getImplementation(method);
+            method_setImplementation(method, entries[i].imp);
+        }
+        IPATKALog(@"音频类别保护已安装（游戏改成 ambient 时自动顶回 playback）");
+    });
 }
 
 #pragma mark 静音音频保活
@@ -489,6 +574,48 @@ static NSData *IPATKASilentWAV(double seconds, uint32_t sampleRate) {
     if (self.task == UIBackgroundTaskInvalid) return;
     [[UIApplication sharedApplication] endBackgroundTask:self.task];
     self.task = UIBackgroundTaskInvalid;
+}
+
+#pragma mark 心跳（判断进程到底有没有被挂起）
+
+- (void)startHeartbeat {
+    if (self.heartbeatTimer) return;
+    self.heartbeatTimer = [NSTimer timerWithTimeInterval:5.0
+                                                  target:self
+                                                selector:@selector(tickHeartbeat)
+                                                userInfo:nil
+                                                 repeats:YES];
+    [[NSRunLoop mainRunLoop] addTimer:self.heartbeatTimer forMode:NSRunLoopCommonModes];
+}
+
+/// 心跳是最直接的证据：日志里有心跳 = 进程没被挂起（保活生效，下载能继续）；
+/// 切后台之后心跳就断了 = 进程被挂起，下载当然停在切出去那一刻。
+- (void)tickHeartbeat {
+    self.heartbeat++;
+    // 该播却没播：多半是游戏自己改了音频会话（这种情况没有系统通知），立刻补上
+    if (IPATKABool(@"SilentAudio", YES) && !self.player.isPlaying) {
+        IPATKALog(@"心跳发现音频停了，重新起播（游戏可能改过音频会话）");
+        [self activateAudioSession];
+        [self startSilentAudio];
+    }
+
+    UIApplication *app = [UIApplication sharedApplication];
+    BOOL inBackground = (app.applicationState != UIApplicationStateActive);
+    if (!inBackground && self.heartbeat % 12 != 0) return;   // 前台一分钟记一条就够
+
+    AVAudioSession *session = [AVAudioSession sharedInstance];
+    NSTimeInterval remaining = app.backgroundTimeRemaining;
+    NSTimeInterval behind = self.enterBackgroundTime > 0
+        ? [NSDate timeIntervalSinceReferenceDate] - self.enterBackgroundTime : 0;
+    IPATKALog(@"心跳 %lu 状态=%@ 已后台%.0fs 音频播放=%d 会话=%@ 其它音频在播=%d 后台任务剩余=%@",
+              (unsigned long)self.heartbeat,
+              inBackground ? @"后台" : @"前台",
+              behind,
+              self.player.isPlaying,
+              session.category,
+              session.isOtherAudioPlaying,
+              remaining > 1e9 ? @"不限(前台)" : [NSString stringWithFormat:@"%.0fs", remaining]);
+    [self postStatus];
 }
 
 #pragma mark 定位保活（可选）
@@ -688,6 +815,11 @@ static NSData *IPATKASilentWAV(double seconds, uint32_t sampleRate) {
     if (!IPATKABool(@"Enabled", YES)) return;
     if (!self.started) [self start];
     if (!self.started) return;
+    self.enterBackgroundTime = [NSDate timeIntervalSinceReferenceDate];
+    self.heartbeatAtBackground = self.heartbeat;
+    AVAudioSession *session = [AVAudioSession sharedInstance];
+    IPATKALog(@"进入后台：音频播放=%d 会话=%@ 其它音频在播=%d",
+              self.player.isPlaying, session.category, session.isOtherAudioPlaying);
     // 有些 App 会在自己启动后重设音频会话，这里再确认一次
     if (IPATKABool(@"SilentAudio", YES)) {
         [self activateAudioSession];
@@ -701,7 +833,15 @@ static NSData *IPATKASilentWAV(double seconds, uint32_t sampleRate) {
 }
 
 - (void)handleWillEnterForeground {
+    NSTimeInterval behind = self.enterBackgroundTime > 0
+        ? [NSDate timeIntervalSinceReferenceDate] - self.enterBackgroundTime : 0;
+    IPATKALog(@"回到前台：后台共 %.0fs，其间心跳 %lu 次，音频播放=%d",
+              behind, (unsigned long)(self.heartbeat - self.heartbeatAtBackground),
+              self.player.isPlaying);
+    self.enterBackgroundTime = 0;
+    self.heartbeatAtBackground = self.heartbeat;
     [self endBackgroundTask];
+    [self postStatus];
 }
 
 @end
