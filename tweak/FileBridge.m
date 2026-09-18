@@ -729,43 +729,75 @@ static void IPATFbZipDosTimestamp(uint16_t *dosTime, uint16_t *dosDate) {
 
 /// 收集一个导出项（文件或整个目录）的条目列表；name 是 zip 内的相对路径。
 /// 刻意用和沙盒浏览器同一套列目录方式（contentsOfDirectoryAtPath + fileExists），
-/// 保证「浏览器里看得到，包里就一定有」——深枚举在部分目录上会静默返回空
+/// 保证「浏览器里看得到，包里就一定有」——深枚举在部分目录上会静默返回空。
+/// 几个防呆：
+///  - excludeDir / excludeFile：导出包所在的目录和包本身不进包。之前包直接写
+///    在 tmp 根下，导出 tmp 时上一次的 zip 会被当成普通文件一起打进新包，
+///    体积一轮轮翻倍（几 MB 的目录导出半天就是这么来的）；
+///  - 符号链接不进包：跟着递归会绕回父目录，直接死循环；
+///  - depth / limit：层级过深或条目极多时及时停手，别让打包变成假死。
 static BOOL IPATFbZipCollectEntry(NSString *path, NSString *name,
                                   NSMutableArray<NSDictionary *> *entries,
-                                  uint64_t *totalBytes, NSError **error) {
+                                  uint64_t *totalBytes,
+                                  NSString *excludeDir,
+                                  NSString *excludeFile,
+                                  NSInteger depth,
+                                  NSInteger *counter,
+                                  NSInteger limit,
+                                  void (^tick)(NSInteger count),
+                                  NSError **error) {
     NSFileManager *fm = [NSFileManager defaultManager];
-    BOOL isDir = NO;
-    if (![fm fileExistsAtPath:path isDirectory:&isDir]) {
+
+    if ((excludeDir.length && [path isEqualToString:excludeDir]) ||
+        (excludeFile.length && [path isEqualToString:excludeFile])) {
+        IPATFbLog(@"收集时跳过导出临时目录：%@", path);
+        return YES;
+    }
+    if (depth > 64) {
+        IPATFbLog(@"目录层级过深，不再往下：%@", path);
+        return YES;
+    }
+    if (*counter >= limit) {
         if (error) *error = [NSError errorWithDomain:@"IPAToolFiles" code:8
-                                         userInfo:@{NSLocalizedDescriptionKey:
-                                                    [NSString stringWithFormat:@"路径不存在：%@", path]}];
+                                        userInfo:@{NSLocalizedDescriptionKey:
+                                                   [NSString stringWithFormat:
+                                                    @"条目过多（超过 %ld 项），打包已中止",
+                                                    (long)limit]}];
         return NO;
     }
 
-    if (!isDir) {
-        uint64_t size = [[fm attributesOfItemAtPath:path error:error][NSFileSize]
-                         unsignedLongLongValue];
-        if (*error && [*error code]) return NO;
-        [entries addObject:@{@"path": path, @"name": name,
-                             @"size": @(size), @"dir": @NO}];
-        *totalBytes += size;
+    NSDictionary *attr = [fm attributesOfItemAtPath:path error:NULL];
+    if (!attr) {   // 读不到的（权限 / 已消失）跳过，别让整个导出失败
+        IPATFbLog(@"收集时跳过读不到的项：%@", path);
+        return YES;
+    }
+    NSString *fileType = attr[NSFileType];
+    if ([fileType isEqualToString:NSFileTypeSymbolicLink]) {
+        IPATFbLog(@"收集时跳过符号链接：%@", path);
         return YES;
     }
 
-    [entries addObject:@{@"path": [NSNull null], @"name": [name stringByAppendingString:@"/"],
-                         @"size": @0, @"dir": @YES}];
-    NSArray<NSString *> *names = [fm contentsOfDirectoryAtPath:path error:error] ?: @[];
-    if (*error && [*error code]) return NO;
-    for (NSString *child in [names sortedArrayUsingSelector:@selector(localizedStandardCompare:)]) {
-        NSString *childPath = [path stringByAppendingPathComponent:child];
-        BOOL childIsDir = NO;
-        if (![fm fileExistsAtPath:childPath isDirectory:&childIsDir]) {
-            IPATFbLog(@"收集时跳过已消失的项：%@", childPath);
-            continue;
+    (*counter)++;
+    if (tick && (*counter % 500) == 0) tick(*counter);
+
+    if ([fileType isEqualToString:NSFileTypeDirectory]) {
+        [entries addObject:@{@"path": [NSNull null], @"name": [name stringByAppendingString:@"/"],
+                             @"size": @0, @"dir": @YES}];
+        NSArray<NSString *> *names = [fm contentsOfDirectoryAtPath:path error:NULL] ?: @[];
+        for (NSString *child in [names sortedArrayUsingSelector:@selector(localizedStandardCompare:)]) {
+            NSString *childPath = [path stringByAppendingPathComponent:child];
+            NSString *entryName = [name stringByAppendingPathComponent:child];
+            if (!IPATFbZipCollectEntry(childPath, entryName, entries, totalBytes,
+                                       excludeDir, excludeFile, depth + 1, counter, limit,
+                                       tick, error)) return NO;
         }
-        NSString *entryName = [name stringByAppendingPathComponent:child];
-        if (!IPATFbZipCollectEntry(childPath, entryName, entries, totalBytes, error)) return NO;
+        return YES;
     }
+
+    uint64_t size = [attr[NSFileSize] unsignedLongLongValue];
+    [entries addObject:@{@"path": path, @"name": name,
+                         @"size": @(size), @"dir": @NO}];
+    *totalBytes += size;
     return YES;
 }
 
@@ -793,6 +825,7 @@ static BOOL IPATFbZipWrite(NSArray<NSDictionary *> *entries, uint64_t totalBytes
     uint16_t dosTime, dosDate;
     IPATFbZipDosTimestamp(&dosTime, &dosDate);
     uint64_t offset = 0, done = 0, lastReport = 0;
+    NSInteger fileIndex = 0;
     uint16_t version = need64 ? 45 : 20;
 
     for (NSDictionary *e in entries) {
@@ -882,13 +915,16 @@ static BOOL IPATFbZipWrite(NSArray<NSDictionary *> *entries, uint64_t totalBytes
             crc = crc32(crc, buf, (uInt)n);
             done += n;
             remaining -= n;
-            if (progress && done - lastReport >= 256ULL * 1024 * 1024) {
-                lastReport = done;
-                progress(done, totalBytes);
-            }
         }
         fclose(in);
         offset += size;
+        fileIndex++;
+        // 每 32MB 或每 200 个文件报一次进度：小文件也要看得到在动，
+        // 之前 256MB 一报，导出小目录时进度条会一直停在同一个数字上
+        if (progress && (done - lastReport >= 32ULL * 1024 * 1024 || (fileIndex % 200) == 0)) {
+            lastReport = done;
+            progress(done, totalBytes);
+        }
 
         // 回填 CRC（little endian）
         uint8_t cb[4] = { (uint8_t)(crc & 0xFF), (uint8_t)((crc >> 8) & 0xFF),
@@ -1014,11 +1050,17 @@ fail:
         IPATFbLog(@"导出跳过 %ld 个不存在的路径", (long)missing);
     }
 
-    // 清掉之前导出留下的临时 zip
+    // 清掉旧版本留在 tmp 根下的临时 zip
     for (NSURL *f in [fm contentsOfDirectoryAtURL:[NSURL fileURLWithPath:NSTemporaryDirectory()]
                     includingPropertiesForKeys:nil options:0 error:NULL]) {
         if ([f.lastPathComponent hasPrefix:@"IPAToolExport-"]) [fm removeItemAtURL:f error:NULL];
     }
+    // 导出包统一放 tmp/IPAToolExport/，每次重建。
+    // 之前直接写 tmp 根下：导出 tmp 这类目录时，上一次的 zip 会被当成普通文件
+    // 一起打进新包，包里套包，体积一轮轮翻倍（几 MB 的目录导出半天就是这么来的）
+    NSString *workDir = [NSTemporaryDirectory() stringByAppendingPathComponent:@"IPAToolExport"];
+    [fm removeItemAtPath:workDir error:NULL];
+    [fm createDirectoryAtPath:workDir withIntermediateDirectories:YES attributes:nil error:NULL];
 
     // 包名：单选跟原名字，多选用时间戳
     NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
@@ -1027,7 +1069,7 @@ fail:
         ? [valid[0].lastPathComponent stringByDeletingPathExtension]
         : [NSString stringWithFormat:@"IPAToolExport-%@", [fmt stringFromDate:[NSDate date]]];
     if (base.length == 0) base = @"IPAToolExport";
-    NSString *zipPath = [NSTemporaryDirectory() stringByAppendingPathComponent:
+    NSString *zipPath = [workDir stringByAppendingPathComponent:
                          [NSString stringWithFormat:@"%@.zip", base]];
 
     self.exportItemCount = (NSInteger)valid.count;
@@ -1048,9 +1090,20 @@ fail:
         uint64_t totalBytes = 0;
         NSError *error = nil;
         BOOL ok = YES;
+        NSInteger counter = 0;
+        __weak UIAlertController *weakAlert = packAlert;
+        void (^tick)(NSInteger) = ^(NSInteger count) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                weakAlert.message = [NSString stringWithFormat:@"扫描中：%ld 项…", (long)count];
+            });
+        };
         for (NSString *path in valid) {
             NSString *name = path.lastPathComponent;
-            if (!IPATFbZipCollectEntry(path, name, entries, &totalBytes, &error)) { ok = NO; break; }
+            if (!IPATFbZipCollectEntry(path, name, entries, &totalBytes,
+                                       workDir, zipPath, 0, &counter, 300000, tick, &error)) {
+                ok = NO;
+                break;
+            }
         }
         NSInteger collectedFiles = 0, collectedDirs = 0;
         for (NSDictionary *e in entries) {
@@ -1089,21 +1142,24 @@ fail:
         }
         dispatch_async(dispatch_get_main_queue(), ^{
             void (^showResult)(void) = ^{
-                UIViewController *base = packAlert.presentingViewController ?: presenter;
+                NSInteger fileCount = 0, dirCount = 0;
+                uint64_t zipBytes = 0;
+                for (NSDictionary *e in entries) {
+                    if ([e[@"dir"] boolValue]) dirCount++;
+                    else { fileCount++; zipBytes += [e[@"size"] unsignedLongLongValue]; }
+                }
                 if (!ok) {
                     IPATFbLog(@"打包失败：%@", error.localizedDescription ?: @"未知错误");
                     [self postStatus:[NSString stringWithFormat:@"打包失败：%@",
                                                                 error.localizedDescription ?: @"未知错误"]];
-                    if (base.view.window) {
-                        UIAlertController *alert =
-                            [UIAlertController alertControllerWithTitle:@"打包失败"
-                                message:error.localizedDescription ?: @"未知错误"
-                                preferredStyle:UIAlertControllerStyleAlert];
-                        [alert addAction:[UIAlertAction actionWithTitle:@"好"
-                                                                  style:UIAlertActionStyleDefault
-                                                                handler:nil]];
-                        [base presentViewController:alert animated:YES completion:nil];
-                    }
+                    UIAlertController *alert =
+                        [UIAlertController alertControllerWithTitle:@"打包失败"
+                            message:error.localizedDescription ?: @"未知错误"
+                            preferredStyle:UIAlertControllerStyleAlert];
+                    [alert addAction:[UIAlertAction actionWithTitle:@"好"
+                                                              style:UIAlertActionStyleDefault
+                                                            handler:nil]];
+                    [self presentFromTop:alert];
                     return;
                 }
                 self.currentExportZip = zipPath;
@@ -1113,25 +1169,19 @@ fail:
                     [[UIDocumentPickerViewController alloc] initForExportingURLs:
                         @[[NSURL fileURLWithPath:zipPath]] asCopy:YES];
                 picker.delegate = self;
-                NSInteger fileCount = 0, dirCount = 0;
-                uint64_t zipBytes = 0;
-                for (NSDictionary *e in entries) {
-                    if ([e[@"dir"] boolValue]) dirCount++;
-                    else { fileCount++; zipBytes += [e[@"size"] unsignedLongLongValue]; }
-                }
                 IPATFbLog(@"导出 zip 就绪：%ld 项（文件 %ld、目录 %ld，共 %.2f GB）-> %@",
                           (long)valid.count, (long)fileCount, (long)dirCount,
                           zipBytes / 1073741824.0, zipPath);
-                if (base.view.window) {
-                    [base presentViewController:picker animated:YES completion:nil];
-                } else {
-                    // 浏览器已经关了：选择器没地方弹，删掉临时包，提示重试
-                    [self postStatus:@"打包完成但界面已关闭，请重新点一次导出"];
-                    [[NSFileManager defaultManager] removeItemAtPath:zipPath error:NULL];
-                }
+                [self presentFromTop:picker];
             };
-            if (packAlert.view.window) {
-                [packAlert dismissViewControllerAnimated:YES completion:showResult];
+            // 等打包提示框收完再弹下一个，否则会撞上「正在 present」的静默失败：
+            // 表现就是打包完了但什么都没弹出来
+            if (packAlert.view.window && packAlert.presentingViewController) {
+                [packAlert dismissViewControllerAnimated:YES completion:^{
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                                 (int64_t)(0.25 * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), showResult);
+                }];
             } else {
                 showResult();
             }
