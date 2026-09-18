@@ -17,11 +17,16 @@
 //    4. 弹系统界面之前先发 IPATControlVisibility 让悬浮窗躲开：
 //       悬浮窗的 windowLevel 比 Alert 还高，不躲开会盖在文档选择器上面。
 //    5. 导入的默认落地目录取 Info.plist 的 ImportDir（相对沙盒），界面里挑完只用于本次。
+//    6. 导入一律覆盖：落地目录里已有的同名文件 / 文件夹直接顶掉（文件夹整棵替换），
+//       不再生成 xxx-2 这种副本——热更资源就是要整体换。覆盖走系统的
+//       replaceItemAtURL（同卷原子操作），游戏只会看到旧的完整内容或新的完整内容。
 //
 //  Info.plist（ipatool --files 会自动写入 IPAToolFiles）：
 //    Enabled(bool)    默认 YES；NO 表示面板上的动作行点了只提示「功能已关闭」
 //    Root(string)     浏览根目录，相对沙盒，默认空 = 沙盒根
 //    ImportDir(string) 导入落地目录，相对沙盒，默认 Documents
+//    ImportLock(bool)  默认 YES：导入完把落地内容锁成只读，挡住游戏热更继续往里写。
+//                      下次启动自动恢复可写；设 NO 则只替换不设权限
 //
 
 #import <Foundation/Foundation.h>
@@ -29,6 +34,7 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 #include <zlib.h>
 #import "IPATControlShared.h"
 
@@ -37,6 +43,10 @@
 /// 动作行的标识（只是本 dylib 内部的字符串，不写 NSUserDefaults）
 static NSString *const IPATFbActionBrowse = @"files.browse";
 static NSString *const IPATFbActionImportTo = @"files.importTo";
+
+/// 上次导入锁成只读的路径。记下来是为了下次启动恢复成可写——
+/// 进程可能随时被用户杀掉，不记就永远恢复不了，游戏以后也更新不了
+static NSString *const IPATFbLockedPathsKey = @"IPATFbLockedPaths";
 
 /// 浏览器的用途：导出时勾选内容，或给导入挑一个落地文件夹
 typedef NS_ENUM(NSInteger, IPATFbBrowserMode) {
@@ -152,22 +162,147 @@ static UIViewController *IPATFbTopViewController(void) {
     return controller;
 }
 
-/// 同目录下不覆盖已有文件的重名处理
-static NSString *IPATFbUniquePath(NSString *directory, NSString *name) {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *candidate = [directory stringByAppendingPathComponent:name];
-    if (![fm fileExistsAtPath:candidate]) return candidate;
+/// 导入的落地路径。同名不再避让（不生成 xxx-2），直接指向目标位置，
+/// 由 IPATFbReplaceIntoPlace 负责覆盖——导入本来就是为了顶掉旧内容。
+static NSString *IPATFbImportPath(NSString *directory, NSString *name) {
+    return [directory stringByAppendingPathComponent:name];
+}
 
-    NSString *base = [name stringByDeletingPathExtension];
-    NSString *ext = [name pathExtension];
-    for (NSInteger i = 2; i < 10000; i++) {
-        NSString *variant = ext.length
-            ? [NSString stringWithFormat:@"%@-%ld.%@", base, (long)i, ext]
-            : [NSString stringWithFormat:@"%@-%ld", base, (long)i];
-        candidate = [directory stringByAppendingPathComponent:variant];
-        if (![fm fileExistsAtPath:candidate]) return candidate;
+/// 整棵改成只读 / 恢复可写（只动权限位，不动内容）：目录 0555、文件 0444。
+///
+/// 这是「挡住游戏热更」唯一稳妥的做法。我们和游戏在同一个进程里，
+/// 挂起它的下载线程会让它停在任意一条指令上——很可能正拿着 malloc / 运行时 /
+/// 文件系统的锁，别的线程再来申请同一把锁就是死锁，整个进程卡死；
+/// 挂起整个进程则会把我们自己一起冻住，没法继续替换。所以不去碰线程，
+/// 改成让它写不进来：热更线程继续下载也落不到资源目录里，落盘时拿 EACCES，
+/// 最多是更新失败 / 重试，不会把我们导进去的内容盖回去。
+static void IPATFbSetTreeWritable(NSString *path, BOOL writable) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSURL *root = [NSURL fileURLWithPath:path];
+    NSNumber *rootIsDir = nil;
+    [root getResourceValue:&rootIsDir forKey:NSURLIsDirectoryKey error:NULL];
+
+    NSDirectoryEnumerator *it = [fm enumeratorAtURL:root
+                         includingPropertiesForKeys:@[NSURLIsDirectoryKey]
+                                            options:0
+                                       errorHandler:^BOOL(NSURL *url, NSError *e) { return YES; }];
+    NSInteger n = 0;
+    for (NSURL *url in it) {
+        if (++n > 200000) break;
+        NSNumber *isDir = nil;
+        [url getResourceValue:&isDir forKey:NSURLIsDirectoryKey error:NULL];
+        chmod(url.fileSystemRepresentation,
+              [isDir boolValue] ? (writable ? 0755 : 0555) : (writable ? 0644 : 0444));
     }
-    return [directory stringByAppendingPathComponent:[NSUUID UUID].UUIDString];
+    chmod(path.fileSystemRepresentation,
+          [rootIsDir boolValue] ? (writable ? 0755 : 0555) : (writable ? 0644 : 0444));
+}
+
+/// 导入后是否把落地内容锁成只读（Info.plist 的 ImportLock，默认 YES）
+static BOOL IPATFbLockAfterImport(void) {
+    id value = IPATFbConfig()[@"ImportLock"];
+    return [value respondsToSelector:@selector(boolValue)] ? [value boolValue] : YES;
+}
+
+/// 上次锁成只读、还没恢复成可写的路径
+static NSArray<NSString *> *IPATFbLockedPaths(void) {
+    id value = [[NSUserDefaults standardUserDefaults] objectForKey:IPATFbLockedPathsKey];
+    return [value isKindOfClass:[NSArray class]] ? value : @[];
+}
+
+static void IPATFbRememberLockedPaths(NSArray<NSString *> *paths) {
+    if (paths.count == 0) return;
+    NSMutableArray<NSString *> *all = [IPATFbLockedPaths() mutableCopy];
+    for (NSString *path in paths) {
+        if (![all containsObject:path]) [all addObject:path];
+    }
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    [ud setObject:all forKey:IPATFbLockedPathsKey];
+    [ud synchronize];   // 进程随时会被杀，别等系统的延迟落盘
+}
+
+/// 把已经备好的临时项（同卷）放到 final 位置上；final 上已有同名项就覆盖：
+/// 文件换掉、文件夹整棵替换，保证导入完的内容和包里完全一致（热更目录就是要整体换）。
+///
+/// 替换刻意做成两次 rename，不走「递归删除旧目录 + 移动新目录」：
+/// 删几个 G 的热更目录要几秒到十几秒，这段空窗里游戏扫目录会看到资源没了
+/// （贴图丢失 / 报资源错误 / 闪退）。rename 是同卷原子操作，只有一瞬间；
+/// 旧内容先挂到旁边的垃圾桶名，删它放到后台慢慢做，不挡着替换完成。
+/// 中途失败会把旧内容换回原位，不让目录凭空消失。
+static BOOL IPATFbReplaceIntoPlace(NSString *staging, NSString *final, NSError **error) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:final]) {
+        return [fm moveItemAtPath:staging toPath:final error:error];
+    }
+
+    NSString *trash = [final stringByAppendingFormat:@".ipatool-trash-%@",
+                       [NSUUID UUID].UUIDString];
+    if (![fm moveItemAtPath:final toPath:trash error:error]) return NO;
+
+    NSError *moveError = nil;
+    if (![fm moveItemAtPath:staging toPath:final error:&moveError]) {
+        [fm moveItemAtPath:trash toPath:final error:NULL];   // 换回原位，别让目录消失
+        if (error) *error = moveError;
+        return NO;
+    }
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
+        // 旧内容可能上次被锁成只读了，只读目录里的文件删不掉，先放开权限再清
+        IPATFbSetTreeWritable(trash, YES);
+        [[NSFileManager defaultManager] removeItemAtPath:trash error:NULL];
+    });
+    return YES;
+}
+
+/// 导入用的临时工作目录（tmp 下，每次导入重建）。
+/// 故意不放落地目录里：热更过程中游戏会扫资源目录，看到一个正在解压的
+/// 半成品目录容易被当成异常资源（或把它的条目算进校验）。tmp 和沙盒同一卷，
+/// 从这儿 rename 到落地目录依然是原子操作。
+static NSString *IPATFbImportWorkRoot(void) {
+    return [NSTemporaryDirectory() stringByAppendingPathComponent:@"IPAToolImport"];
+}
+
+/// 清掉上一次导入留下的临时残骸：tmp 的工作目录整个重建，落地目录里
+/// 旧版本可能留下的 .ipatool-part / .ipatool-zip / .ipatool-trash-xxx 也顺手删掉
+static void IPATFbCleanStagingLeftovers(NSString *directory) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *workRoot = IPATFbImportWorkRoot();
+    [fm removeItemAtPath:workRoot error:NULL];
+    [fm createDirectoryAtPath:workRoot withIntermediateDirectories:YES attributes:nil error:NULL];
+
+    NSArray<NSURL *> *items = [fm contentsOfDirectoryAtURL:[NSURL fileURLWithPath:directory]
+                               includingPropertiesForKeys:nil options:0 error:NULL] ?: @[];
+    for (NSURL *item in items) {
+        NSString *name = item.lastPathComponent;
+        if ([name hasSuffix:@".ipatool-part"] || [name hasSuffix:@".ipatool-zip"] ||
+            [name containsString:@".ipatool-trash-"]) {
+            IPATFbLog(@"清理上次导入残留：%@", name);
+            [fm removeItemAtURL:item error:NULL];
+        }
+    }
+}
+
+/// 目录（或文件）里有没有在 since 之后被改动过的东西：用来判断「我们换完之后
+/// 游戏还在往里写」——热更没停的情况下它可能会把下载的内容继续写进来
+static BOOL IPATFbModifiedAfter(NSString *path, NSDate *since, NSInteger limit) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSDate *latest = nil;
+    NSURL *item = [NSURL fileURLWithPath:path];
+    NSDate *m = nil;
+    if ([item getResourceValue:&m forKey:NSURLContentModificationDateKey error:NULL] && m) latest = m;
+
+    NSDirectoryEnumerator *it = [fm enumeratorAtURL:item
+                         includingPropertiesForKeys:@[NSURLContentModificationDateKey]
+                                            options:0
+                                       errorHandler:^BOOL(NSURL *url, NSError *e) { return YES; }];
+    NSInteger n = 0;
+    for (NSURL *u in it) {
+        if (++n > limit) break;
+        NSDate *d = nil;
+        if ([u getResourceValue:&d forKey:NSURLContentModificationDateKey error:NULL] && d) {
+            if (!latest || [d compare:latest] == NSOrderedDescending) latest = d;
+        }
+    }
+    return latest && [latest compare:since] == NSOrderedDescending;
 }
 
 /// 先拷到同卷临时名（.ipatool-part），成功后再挪到最终位置。
@@ -178,9 +313,15 @@ static BOOL IPATFbCopyDirectory(NSURL *source, NSString *destination, NSError **
 
 static BOOL IPATFbCopyThenRename(NSURL *source, NSString *target, BOOL isDirectory, NSError **error) {
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *staging = [target stringByAppendingPathExtension:@"ipatool-part"];
+    NSString *workRoot = IPATFbImportWorkRoot();
+    [fm createDirectoryAtPath:workRoot withIntermediateDirectories:YES attributes:nil error:NULL];
+    // 半成品放 tmp 的工作目录，不放在落地目录里被游戏扫到
+    NSString *staging = [workRoot stringByAppendingPathComponent:
+                         [target.lastPathComponent stringByAppendingString:@".ipatool-part"]];
     for (NSInteger i = 2; [fm fileExistsAtPath:staging]; i++) {
-        staging = [NSString stringWithFormat:@"%@-%ld.ipatool-part", target, (long)i];
+        staging = [workRoot stringByAppendingPathComponent:
+                   [NSString stringWithFormat:@"%@-%ld.ipatool-part",
+                    target.lastPathComponent, (long)i]];
     }
 
     BOOL ok = NO;
@@ -199,10 +340,8 @@ static BOOL IPATFbCopyThenRename(NSURL *source, NSString *target, BOOL isDirecto
         return NO;
     }
 
-    // 拷贝期间目标位可能被游戏新建了同名文件，最终名重新算一遍
-    NSString *final = IPATFbUniquePath([target stringByDeletingLastPathComponent],
-                                       [target lastPathComponent]);
-    if (![fm moveItemAtPath:staging toPath:final error:error]) {
+    // 拷贝期间目标位可能被游戏新建了同名项，最终名再确认一遍（同名直接覆盖）
+    if (!IPATFbReplaceIntoPlace(staging, target, error)) {
         [fm removeItemAtPath:staging error:NULL];
         return NO;
     }
@@ -255,7 +394,7 @@ static NSString *IPATFbDisplayPath(NSString *path) {
     self.tableView.rowHeight = 52.0;
 
     if (self.mode != IPATFbBrowserModeExport) {
-        self.navigationItem.prompt = @"进入文件夹后点右上角「导入到这里」";
+        self.navigationItem.prompt = @"进入文件夹后点右上角「导入到这里」（同名直接覆盖）";
         self.navigationItem.rightBarButtonItem =
             [[UIBarButtonItem alloc] initWithTitle:@"导入到这里"
                                             style:UIBarButtonItemStyleDone
@@ -633,6 +772,7 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
                selector:@selector(handleAction:)
                    name:IPATControlActionNotification
                  object:nil];
+    [self restoreWritableLocks];   // 上次导入锁成只读的目录，这趟启动恢复成可写
     [self registerWithPanel];
     IPATFbLog(@"文件导入导出已就绪（导入目录：%@）", IPATFbImportRelative());
 }
@@ -657,7 +797,7 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
             @{IPATRowKey: IPATFbActionImportTo,
               IPATRowTitle: @"导入文件",
               IPATRowKind: IPATRowKindAction,
-              IPATRowNote: [NSString stringWithFormat:@"挑落地目录，默认 %@（zip 自动解压）",
+              IPATRowNote: [NSString stringWithFormat:@"挑落地目录，默认 %@（zip 自动解压，同名覆盖）",
                                                       IPATFbImportRelative()]},
         ],
     };
@@ -1746,16 +1886,21 @@ done:
 }
 
 /// 导入 .zip：解压到同名 .ipatool-zip 临时目录，全部成功后再把顶层条目
-/// 原子挪进落地目录（中途失败不留半成品）。extractedFiles 返回解出的文件数
+/// 挪进落地目录（同名覆盖，中途失败不留半成品）。
+/// extractedFiles 返回解出的文件数，overwrote 返回被覆盖掉的同名项数
 - (BOOL)importZip:(NSURL *)url toDirectory:(NSString *)destination
-            files:(NSInteger *)extractedFiles error:(NSError **)error {
+            files:(NSInteger *)extractedFiles
+        overwrote:(NSInteger *)overwrote
+           landed:(NSMutableArray<NSString *> *)landed error:(NSError **)error {
     NSFileManager *fm = [NSFileManager defaultManager];
 
     NSString *base = [url.lastPathComponent stringByDeletingPathExtension];
-    NSString *staging = [destination stringByAppendingPathComponent:
+    // 解压到 tmp 的工作目录：落地目录里不会出现正在解压的半成品
+    NSString *workRoot = IPATFbImportWorkRoot();
+    NSString *staging = [workRoot stringByAppendingPathComponent:
                          [NSString stringWithFormat:@"%@.ipatool-zip", base]];
     for (NSInteger i = 2; [fm fileExistsAtPath:staging]; i++) {
-        staging = [destination stringByAppendingPathComponent:
+        staging = [workRoot stringByAppendingPathComponent:
                    [NSString stringWithFormat:@"%@-%ld.ipatool-zip", base, (long)i]];
     }
     if (![fm createDirectoryAtPath:staging withIntermediateDirectories:YES attributes:nil error:error]) {
@@ -1784,7 +1929,7 @@ done:
         return NO;
     }
 
-    // 顶层条目挪进落地目录（move 同卷是原子操作，重名自动避让）
+    // 顶层条目挪进落地目录（同卷 move 是原子操作，重名直接覆盖）
     NSArray<NSURL *> *topLevel =
         [fm contentsOfDirectoryAtURL:[NSURL fileURLWithPath:staging]
           includingPropertiesForKeys:@[NSURLIsDirectoryKey]
@@ -1795,11 +1940,16 @@ done:
         return NO;
     }
     for (NSURL *item in topLevel) {
-        NSString *final = IPATFbUniquePath(destination, item.lastPathComponent);
-        if (![fm moveItemAtURL:item toURL:[NSURL fileURLWithPath:final] error:error]) {
+        NSString *final = IPATFbImportPath(destination, item.lastPathComponent);
+        if ([fm fileExistsAtPath:final]) {
+            if (overwrote) (*overwrote)++;
+            IPATFbLog(@"导入覆盖同名项：%@", final);
+        }
+        if (!IPATFbReplaceIntoPlace(item.path, final, error)) {
             [fm removeItemAtPath:staging error:NULL];
             return NO;
         }
+        if (landed) [landed addObject:final];
     }
     [fm removeItemAtPath:staging error:NULL];   // 挪完应该只剩空壳，顺手清掉
     IPATFbLog(@"解压 %@：%ld 个文件、%ld 个目录（%.2f GB）",
@@ -1818,15 +1968,20 @@ done:
                         attributes:nil
                              error:&error]) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            [self finishImport:0 total:(NSInteger)urls.count folders:0 zips:0 extracted:0 error:error];
+            [self finishImport:0 total:(NSInteger)urls.count folders:0 zips:0 extracted:0
+                   overwritten:0 error:error];
         });
         return;
     }
+
+    IPATFbCleanStagingLeftovers(destination);
 
     NSInteger copied = 0;
     NSInteger folders = 0;
     NSInteger zips = 0;
     NSInteger extractedFiles = 0;
+    NSInteger overwritten = 0;
+    NSMutableArray<NSString *> *landed = [NSMutableArray array];   // 本次落地的条目，事后复查用
     NSError *lastError = nil;
     for (NSURL *url in urls) {
         BOOL scoped = [url startAccessingSecurityScopedResource];
@@ -1849,15 +2004,26 @@ done:
                 self.importAlert.message =
                     [NSString stringWithFormat:@"解压 %@…", url.lastPathComponent];
             });
-            ok = [self importZip:url toDirectory:destination files:&extracted error:&copyError];
+            NSInteger overwrote = 0;
+            ok = [self importZip:url toDirectory:destination
+                           files:&extracted overwrote:&overwrote
+                          landed:landed error:&copyError];
             if (ok) {
                 zips++;
                 extractedFiles += extracted;
+                overwritten += overwrote;
             }
         } else {
-            NSString *target = IPATFbUniquePath(destination, url.lastPathComponent);
+            NSString *target = IPATFbImportPath(destination, url.lastPathComponent);
+            if ([fm fileExistsAtPath:target]) {
+                overwritten++;
+                IPATFbLog(@"导入覆盖同名项：%@", target);
+            }
             ok = IPATFbCopyThenRename(url, target, isDir, &copyError);
-            if (ok && isDir) folders++;
+            if (ok) {
+                if (isDir) folders++;
+                [landed addObject:target];
+            }
         }
 
         if (ok) {
@@ -1873,9 +2039,66 @@ done:
             [fm removeItemAtURL:url error:NULL];
         }
     }
+    NSArray<NSString *> *watched = [landed copy];
+    NSDate *landedAt = [NSDate date];
     dispatch_async(dispatch_get_main_queue(), ^{
         [self finishImport:copied total:(NSInteger)urls.count folders:folders
-                      zips:zips extracted:extractedFiles error:lastError];
+                      zips:zips extracted:extractedFiles overwritten:overwritten
+                     error:lastError];
+        if (copied > 0) {
+            [self watchImportedPaths:watched since:landedAt];
+            [self lockImportedPaths:watched];   // 挡住热更线程继续往里写
+        }
+    });
+}
+
+/// 落地之后复查：等几秒再看这些条目有没有被改动过。
+/// 热更没停时游戏可能在我们换完之后继续往里写（下载/解压），那导入的内容
+/// 就有被盖回去的风险，这里明确告诉用户「还在被写」，让他决定要不要重来 / 杀进程。
+- (void)watchImportedPaths:(NSArray<NSString *> *)paths since:(NSDate *)since {
+    if (paths.count == 0) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
+        NSMutableArray<NSString *> *changed = [NSMutableArray array];
+        for (NSString *path in paths) {
+            if (IPATFbModifiedAfter(path, since, 50000)) [changed addObject:path.lastPathComponent];
+        }
+        if (changed.count == 0) return;
+        IPATFbLog(@"导入后仍在被写入：%@", changed);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self postStatus:[NSString stringWithFormat:
+                              @"注意：%@ 在导入后仍被游戏写入（热更可能还在跑），"
+                              @"建议杀掉游戏进程冷启动，否则可能被它盖回去",
+                              [changed componentsJoinedByString:@"、"]]];
+        });
+    });
+}
+
+/// 导入落地之后把内容锁成只读：热更线程没停的话会继续往资源目录写，
+/// 写不进来就不会把我们刚放进去的内容盖回去（相当于给它踩一脚刹车）。
+/// 锁了哪些路径记进 NSUserDefaults，下次启动（或下次覆盖前）恢复成可写
+- (void)lockImportedPaths:(NSArray<NSString *> *)paths {
+    if (paths.count == 0 || !IPATFbLockAfterImport()) return;
+    IPATFbRememberLockedPaths(paths);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
+        for (NSString *path in paths) IPATFbSetTreeWritable(path, NO);
+        IPATFbLog(@"导入内容已锁成只读，热更写不进来：%@", paths);
+    });
+}
+
+/// 把上次导入锁成只读的目录恢复成可写：不恢复的话游戏以后也没法正常更新了
+- (void)restoreWritableLocks {
+    NSArray<NSString *> *paths = IPATFbLockedPaths();
+    if (paths.count == 0) return;
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    [ud removeObjectForKey:IPATFbLockedPathsKey];
+    [ud synchronize];
+    IPATFbLog(@"恢复上次锁定的目录为可写：%@", paths);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
+        NSFileManager *fm = [NSFileManager defaultManager];
+        for (NSString *path in paths) {
+            if ([fm fileExistsAtPath:path]) IPATFbSetTreeWritable(path, YES);
+        }
     });
 }
 
@@ -1884,6 +2107,7 @@ done:
              folders:(NSInteger)folders
                 zips:(NSInteger)zips
            extracted:(NSInteger)extractedFiles
+         overwritten:(NSInteger)overwritten
                error:(NSError *)error {
     IPATFbSetOverlayVisible(YES);
     // 收起导入进度弹窗后再显示结果（都在主线程）
@@ -1893,22 +2117,51 @@ done:
     NSString *where = IPATFbDisplayPath(self.importDirectory.length
                                         ? self.importDirectory
                                         : IPATFbImportDirectory());
+    // 覆盖了多少个同名项，明确告诉用户旧内容是被顶掉的，不是多出一份
+    NSString *over = overwritten > 0
+        ? [NSString stringWithFormat:@"，覆盖 %ld 个同名项", (long)overwritten]
+        : @"";
     if (copied == 0 && error) {
         [self postStatus:[NSString stringWithFormat:@"导入失败：%@", error.localizedDescription]];
     } else if (copied < total) {
-        [self postStatus:[NSString stringWithFormat:@"已导入 %ld/%ld 项到 %@",
-                                                    (long)copied, (long)total, where]];
+        [self postStatus:[NSString stringWithFormat:@"已导入 %ld/%ld 项到 %@%@",
+                                                    (long)copied, (long)total, where, over]];
     } else if (zips > 0) {
-        [self postStatus:[NSString stringWithFormat:@"已导入 %ld 项（解压 %ld 个文件）到 %@",
-                                                    (long)copied, (long)extractedFiles, where]];
+        [self postStatus:[NSString stringWithFormat:@"已导入 %ld 项（解压 %ld 个文件）到 %@%@",
+                                                    (long)copied, (long)extractedFiles, where, over]];
     } else if (folders > 0) {
-        [self postStatus:[NSString stringWithFormat:@"已导入 %ld 项（含 %ld 个文件夹）到 %@",
-                                                    (long)copied, (long)folders, where]];
+        [self postStatus:[NSString stringWithFormat:@"已导入 %ld 项（含 %ld 个文件夹）到 %@%@",
+                                                    (long)copied, (long)folders, where, over]];
     } else {
-        [self postStatus:[NSString stringWithFormat:@"已导入 %ld 项到 %@", (long)copied, where]];
+        [self postStatus:[NSString stringWithFormat:@"已导入 %ld 项到 %@%@", (long)copied, where, over]];
     }
-    IPATFbLog(@"导入完成：%ld/%ld（文件夹 %ld，压缩包 %ld）-> %@",
-              (long)copied, (long)total, (long)folders, (long)zips, where);
+    IPATFbLog(@"导入完成：%ld/%ld（文件夹 %ld，压缩包 %ld，覆盖 %ld）-> %@",
+              (long)copied, (long)total, (long)folders, (long)zips, (long)overwritten, where);
+
+    // 成功落地后给个「冷启动」的出口：内存里已经加载的旧资源不会因为换目录就变，
+    // 只有冷启动才会按新内容重新加载；同时热更没停时进程一退就不会再往里写，
+    // 免得把我们导进去的内容又盖回去
+    if (copied > 0) {
+        UIAlertController *done =
+            [UIAlertController alertControllerWithTitle:@"导入完成"
+                                                message:[NSString stringWithFormat:
+                                                         @"内容已覆盖到 %@%@。\n\n"
+                                                         @"已把导入的内容锁成只读，热更线程"
+                                                         @"写不进来（重开游戏会自动恢复可写）；"
+                                                         @"进程里已加载的旧资源不会跟着换，"
+                                                         @"杀掉游戏冷启动才会按新内容重新加载。",
+                                                         where, over]
+                                         preferredStyle:UIAlertControllerStyleAlert];
+        [done addAction:[UIAlertAction actionWithTitle:@"知道了"
+                                                 style:UIAlertActionStyleCancel handler:nil]];
+        [done addAction:[UIAlertAction actionWithTitle:@"退出游戏"
+                                                 style:UIAlertActionStyleDestructive
+                                               handler:^(UIAlertAction *action) {
+            IPATFbLog(@"用户选择退出游戏进程（冷启动后按新资源加载）");
+            exit(0);
+        }]];
+        [self presentFromTop:done];
+    }
     };
     if (alert.view.window) {
         [alert dismissViewControllerAnimated:YES completion:body];
