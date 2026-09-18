@@ -17,6 +17,8 @@
 #ifndef IPATOOL_CONTROL_SHARED_H
 #define IPATOOL_CONTROL_SHARED_H
 
+#include <math.h>
+
 #pragma mark - 通知名
 
 /// 面板 -> 功能：开关变了，请重新读取配置并立即应用。userInfo 见 IPATChg*
@@ -147,24 +149,38 @@ static inline UIInterfaceOrientation IPATInterfaceOrientation(void) {
     return orientation == UIInterfaceOrientationUnknown ? UIInterfaceOrientationPortrait : orientation;
 }
 
-/// 把窗口对齐到主窗口的几何：主窗口转过就照抄它的 transform/bounds，
-/// 没转就按界面方向把尺寸换成横的
+/// 把窗口对齐到游戏当前的方向。
+/// 尺寸一律用屏幕大小：App 的 key window 未必是全屏的（有些游戏会挂小窗口、
+/// 或者给它加缩放），照抄它的 bounds/center 会把我们的窗口甩到屏幕外面去。
+/// 方向只跟「整 90°/180°」的旋转：主窗口（或它的根视图）转过就照抄那个角度
 static inline void IPATAlignWindowToInterface(UIWindow *window, UIWindow *appWindow) {
     if (!window) return;
     window.transform = CGAffineTransformIdentity;
+
+    CGAffineTransform candidate = CGAffineTransformIdentity;
     UIView *appRoot = appWindow ? appWindow.rootViewController.view : nil;
     if (appWindow && !CGAffineTransformIsIdentity(appWindow.transform)) {
-        // 游戏把整个窗口转过来了：照抄，方向必然一致
-        window.bounds = appWindow.bounds;
-        window.center = appWindow.center;
-        window.transform = appWindow.transform;
+        candidate = appWindow.transform;
     } else if (appRoot && !CGAffineTransformIsIdentity(appRoot.transform)) {
-        // 游戏是在根视图上转的（窗口本身没转），那就抄根视图的旋转
-        window.bounds = appWindow.bounds;
-        window.center = appWindow.center;
-        window.transform = appRoot.transform;
+        candidate = appRoot.transform;
+    }
+    CGAffineTransform rotation = CGAffineTransformIdentity;
+    if (!CGAffineTransformIsIdentity(candidate)) {
+        CGFloat angle = fabsf(atan2f((float)candidate.b, (float)candidate.a));
+        // 只认整 90°/180° 的旋转，缩放之类的花活儿不跟
+        if (fabsf(angle - (float)M_PI_2) < 0.05f || fabsf(angle - (float)M_PI) < 0.05f) {
+            rotation = candidate;
+        }
+    }
+
+    if (!CGAffineTransformIsIdentity(rotation)) {
+        // 转过的：尺寸用「没转时」的屏幕大小（fixedCoordinateSpace 永远是竖屏）
+        CGRect fixed = [UIScreen mainScreen].fixedCoordinateSpace.bounds;
+        window.bounds = fixed;
+        window.center = CGPointMake(CGRectGetMidX(fixed), CGRectGetMidY(fixed));
+        window.transform = rotation;
     } else {
-        CGRect frame = appWindow ? appWindow.frame : [UIScreen mainScreen].bounds;
+        CGRect frame = [UIScreen mainScreen].bounds;
         UIInterfaceOrientation orientation = IPATInterfaceOrientation();
         BOOL wantLandscape = (orientation == UIInterfaceOrientationLandscapeLeft ||
                               orientation == UIInterfaceOrientationLandscapeRight);

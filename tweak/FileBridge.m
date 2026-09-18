@@ -336,6 +336,9 @@ static void IPATFbCollapseAlertWindowIfIdle(void) {
         window.rootViewController = IPATFbMakeWindowRoot(window.bounds);
     }
     IPATFbGiveBackKeyWindow();
+    // 兜底：不管从哪条路退出来的（完成、取消、直接划掉），弹窗空了悬浮窗就该回来。
+    // 漏掉一次的表现就是「悬浮按钮再也不出现了」
+    IPATFbSetOverlayVisible(YES);
 }
 
 static BOOL IPATFbWatchingAlertWindow = NO;
@@ -358,6 +361,7 @@ static void IPATFbWatchAlertWindowStep(void) {
     UIWindow *window = IPATFbAlertWindow();
     BOOL idle = !window || !window.rootViewController.presentedViewController;
     if (idle || ++IPATFbWatchTicks > 600) {   // 最多盯 5 分钟
+        IPATFbSetOverlayVisible(YES);   // 盯到头了也把悬浮窗放回来，别让它一直藏着
         IPATFbWatchingAlertWindow = NO;
         IPATFbWatchTicks = 0;
         return;
@@ -2470,9 +2474,9 @@ done:
 }
 
 - (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller {
-    if (self.purpose == IPATFbPickerImport) {
-        IPATFbSetOverlayVisible(YES);   // 导出模式下悬浮窗由浏览器负责恢复
-    }
+    // 导入导出都一样：选择器收起来了悬浮窗就要回来。导出时浏览器早就退场了，
+    // 没人会再喊它回来（漏掉的表现就是取消导出后悬浮按钮再也不出现）
+    IPATFbSetOverlayVisible(YES);
     if (self.currentExportZip) {
         [[NSFileManager defaultManager] removeItemAtPath:self.currentExportZip error:NULL];
         self.currentExportZip = nil;
