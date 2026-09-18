@@ -300,10 +300,14 @@ static BOOL IPATPIPWriteVideoFile(NSString *path, UIImage *image) {
 @property (nonatomic, strong) AVPlayerLayer *playerLayer;
 @property (nonatomic, strong) UIView *hostView;
 @property (nonatomic, strong) AVPictureInPictureController *pip;
-@property (nonatomic, assign) BOOL prepared;    // player / 控制器已建好（或已判死）
+@property (nonatomic, assign) BOOL prepared;    // player / 控制器已建好
 @property (nonatomic, assign) BOOL preparing;   // 正在生成占位视频
 @property (nonatomic, assign) BOOL active;      // 正在画中画
 @property (nonatomic, assign) BOOL starting;
+@property (nonatomic, assign) BOOL gaveUp;      // 已确认用不了（系统/包不支持），不再重试
+@property (nonatomic, assign) NSInteger prepareAttempts;
+/// 不可用的具体原因，面板上直接显示，省得猜
+@property (nonatomic, copy) NSString *unavailableReason;
 /// 状态变了（就绪 / 启动 / 停止 / 失败）回调给保活控制器，让它决定要不要补音频
 @property (nonatomic, copy) void (^onStateChange)(void);
 
@@ -314,8 +318,30 @@ static BOOL IPATPIPWriteVideoFile(NSString *path, UIImage *image) {
 + (instancetype)shared {
     static IPATPIPController *shared;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ shared = [[IPATPIPController alloc] init]; });
+    dispatch_once(&once, ^{
+        shared = [[IPATPIPController alloc] init];
+        // dylib 的 constructor 跑得比 App 建窗口还早，第一次准备经常拿不到窗口。
+        // 盯着「窗口出现 / App 变活跃」再补一次，别让第一次失败把画中画判死。
+        NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+        [center addObserver:shared
+                   selector:@selector(handleRetryChance:)
+                       name:UIWindowDidBecomeKeyNotification
+                     object:nil];
+        [center addObserver:shared
+                   selector:@selector(handleRetryChance:)
+                       name:UIWindowDidBecomeVisibleNotification
+                     object:nil];
+        [center addObserver:shared
+                   selector:@selector(handleRetryChance:)
+                       name:UIApplicationDidBecomeActiveNotification
+                     object:nil];
+    });
     return shared;
+}
+
+- (void)handleRetryChance:(NSNotification *)note {
+    if (self.prepared || self.gaveUp) return;
+    [self prepareIfNeeded];
 }
 
 /// player 和控制器都建好了才叫「能顶上」
@@ -326,18 +352,37 @@ static BOOL IPATPIPWriteVideoFile(NSString *path, UIImage *image) {
 #pragma mark 准备
 
 - (void)prepareIfNeeded {
-    if (self.prepared || self.preparing) return;
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self prepareIfNeeded]; });
+        return;
+    }
+    if (self.prepared || self.preparing || self.gaveUp) return;
+    if (self.prepareAttempts >= 8) {
+        // 试了很多次都没成，别再刷日志了
+        self.gaveUp = YES;
+        IPATKALog(@"画中画准备重试 %ld 次仍未成功，放弃并只用静音音频保活", (long)self.prepareAttempts);
+        return;
+    }
+    self.prepareAttempts += 1;
 
     Class cls = NSClassFromString(@"AVPictureInPictureController");
     if (!cls) {
+        self.gaveUp = YES;
+        self.unavailableReason = @"系统无画中画";
         IPATKALog(@"系统没有画中画（AVPictureInPictureController），回退静音音频保活");
-        self.prepared = YES;
+        if (self.onStateChange) self.onStateChange();
         return;
     }
     if (![cls isPictureInPictureSupported]) {
         // 最常见的原因是包里没有 UIBackgroundModes: audio，或者音频会话不是 playback
-        IPATKALog(@"当前 App 不支持画中画，回退静音音频保活（画中画要求 UIBackgroundModes 含 audio）");
-        self.prepared = YES;
+        NSArray *modes = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"UIBackgroundModes"];
+        self.gaveUp = YES;
+        self.unavailableReason = ([modes containsObject:@"audio"] ? @"会话非 playback" : @"缺后台模式 audio");
+        IPATKALog(@"当前 App 不支持画中画，回退静音音频保活（iOS %@，UIBackgroundModes=%@，会话=%@；"
+                  @"画中画要求 UIBackgroundModes 含 audio 且会话是 playback）",
+                  [UIDevice currentDevice].systemVersion, modes ?: @[],
+                  [AVAudioSession sharedInstance].category);
+        if (self.onStateChange) self.onStateChange();
         return;
     }
 
@@ -352,9 +397,10 @@ static BOOL IPATPIPWriteVideoFile(NSString *path, UIImage *image) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         BOOL ok = IPATPIPWriteVideoFile(path, placeholder);
         dispatch_async(dispatch_get_main_queue(), ^{
+            self.preparing = NO;
             if (!ok) {
-                self.preparing = NO;
-                self.prepared = YES;
+                self.gaveUp = YES;
+                self.unavailableReason = @"占位视频生成失败";
                 IPATKALog(@"画中画占位视频生成失败，回退静音音频保活");
                 if (self.onStateChange) self.onStateChange();
                 return;
@@ -366,7 +412,6 @@ static BOOL IPATPIPWriteVideoFile(NSString *path, UIImage *image) {
 
 - (void)finishPreparingWithPath:(NSString *)path {
     self.preparing = NO;
-    self.prepared = YES;
 
     AVPlayerItem *item = [AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:path]];
     AVPlayer *player = [AVPlayer playerWithPlayerItem:item];
@@ -388,8 +433,14 @@ static BOOL IPATPIPWriteVideoFile(NSString *path, UIImage *image) {
 
     UIWindow *appWindow = IPATAppKeyWindowExcluding(nil);
     if (!appWindow) {
-        IPATKALog(@"拿不到游戏窗口，画中画的宿主视图挂不上，回退静音音频保活");
-        if (self.onStateChange) self.onStateChange();
+        // 窗口还没建出来：不判死，等 UIWindowDidBecomeKey / App 变活跃再补一次。
+        // 以前这里会把「已准备」置成 YES，之后再也不重试，面板就一直显示「画中画不可用」。
+        self.prepared = NO;
+        self.unavailableReason = @"未拿到 App 窗口";
+        self.player = nil;
+        self.playerLayer = nil;
+        self.hostView = nil;
+        IPATKALog(@"画中画的宿主视图暂时挂不上（App 窗口还没建好），等窗口出现后重试");
         return;
     }
     [appWindow addSubview:host];
@@ -415,10 +466,19 @@ static BOOL IPATPIPWriteVideoFile(NSString *path, UIImage *image) {
 #pragma clang diagnostic pop
     }
     if (!pip) {
-        IPATKALog(@"创建画中画控制器失败，回退静音音频保活");
+        // 同样不判死：控制器创建可能因为 playerLayer 还没就绪而返回 nil，过一会儿再试
+        self.prepared = NO;
+        self.unavailableReason = @"控制器创建失败";
+        self.player = nil;
+        self.playerLayer = nil;
+        [host removeFromSuperview];
+        self.hostView = nil;
+        IPATKALog(@"创建画中画控制器失败（稍后重试），先回退静音音频保活");
         if (self.onStateChange) self.onStateChange();
         return;
     }
+    self.prepared = YES;
+    self.unavailableReason = nil;
     pip.delegate = self;
     self.pip = pip;
     [player play];   // 保持播放状态，切后台才能立刻进画中画
@@ -445,7 +505,7 @@ static BOOL IPATPIPWriteVideoFile(NSString *path, UIImage *image) {
     if (self.active || self.starting) return;
     if (!self.pip) {
         [self prepareIfNeeded];     // 第一次还没准备好，这次切后台先由音频顶着
-        return;
+        if (!self.pip) return;      // 占位视频已存在时 prepare 是同步的，这次就能用上
     }
     if (self.hostView && !self.hostView.window) {
         // 游戏把窗口重建过（切场景 / 换根视图），宿主视图掉了：重新挂回去，
@@ -477,7 +537,12 @@ static BOOL IPATPIPWriteVideoFile(NSString *path, UIImage *image) {
     }
     if (attempt >= 12) {   // 最多等约 1.2 秒
         self.starting = NO;
-        IPATKALog(@"画中画当前不可用（isPictureInPicturePossible=NO），回退静音音频保活");
+        AVPlayerItem *item = self.player.currentItem;
+        // 这三项基本能定位「为什么起不来」：item 没就绪 / 画面没渲染出来 / 宿主视图不在窗口里
+        IPATKALog(@"画中画当前不可用（possible=NO，item=%ld，layerReady=%d，宿主视图在窗口里=%d），回退静音音频保活",
+                  (long)item.status, self.playerLayer.readyForDisplay, self.hostView.window != nil);
+        self.unavailableReason = (self.playerLayer && !self.playerLayer.readyForDisplay)
+            ? @"画面未渲染" : @"系统拒绝启动";
         if (self.onStateChange) self.onStateChange();
         return;
     }
@@ -623,6 +688,10 @@ failedToStartPictureInPictureWithError:(NSError *)error {
     // 先把「音频类别」这层护住：静音音频和画中画都要求会话是 playback 类别
     IPATKAInstallCategoryGuard();
     [self activateAudioSession];
+    IPATKALog(@"保活环境：iOS %@，UIBackgroundModes=%@，会话=%@",
+              [UIDevice currentDevice].systemVersion,
+              [[NSBundle mainBundle] objectForInfoDictionaryKey:@"UIBackgroundModes"] ?: @[],
+              [AVAudioSession sharedInstance].category);
 
     if (IPATKABool(@"PictureInPicture", YES)) {
         [[IPATPIPController shared] prepareIfNeeded];
@@ -804,8 +873,17 @@ failedToStartPictureInPictureWithError:(NSError *)error {
         NSMutableArray<NSString *> *parts = [NSMutableArray array];
         IPATPIPController *pip = [IPATPIPController shared];
         if (IPATKABool(@"PictureInPicture", YES)) {
-            [parts addObject:(pip.active ? @"画中画进行中"
-                              : (pip.isReady ? @"画中画就绪" : @"画中画不可用"))];
+            NSString *pipText;
+            if (pip.active) {
+                pipText = @"画中画进行中";
+            } else if (pip.isReady) {
+                pipText = @"画中画就绪";
+            } else if (pip.unavailableReason.length > 0) {
+                pipText = [NSString stringWithFormat:@"画中画不可用（%@）", pip.unavailableReason];
+            } else {
+                pipText = @"画中画准备中";
+            }
+            [parts addObject:pipText];
         }
         if (IPATKABool(@"SilentAudio", YES)) {
             NSString *audio = self.player.isPlaying ? @"音频播放中"

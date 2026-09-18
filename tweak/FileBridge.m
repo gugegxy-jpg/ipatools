@@ -34,6 +34,8 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <zlib.h>
 #import "IPATControlShared.h"
@@ -493,6 +495,118 @@ static void IPATFbRememberLockedPaths(NSArray<NSString *> *paths) {
     [ud synchronize];   // 进程随时会被杀，别等系统的延迟落盘
 }
 
+/// 把 NSError 说全：domain / code / 底层 POSIX 错误。move 失败时只打印
+/// localizedDescription 常常只有一句「无法移动」，看不出到底是权限还是空间
+static NSString *IPATFbErrText(NSError *e) {
+    if (!e) return @"（没有错误信息）";
+    NSMutableString *s = [NSMutableString stringWithFormat:@"%@ code=%ld %@",
+                          e.domain, (long)e.code, e.localizedDescription];
+    NSError *under = e.userInfo[NSUnderlyingErrorKey];
+    if (under) {
+        [s appendFormat:@"｜底层 %@ code=%ld %@", under.domain, (long)under.code,
+         under.localizedDescription];
+    }
+    return s;
+}
+
+/// 挪一个条目：先试 rename(2)，不行再退回 NSFileManager。
+/// NSFileManager 的 moveItemAtPath 一旦判断不了「同卷」就会退化成「复制 + 删源」，
+/// 几个 G 的目录复制一遍既慢又要双倍空间（空间不够就直接失败），
+/// 而 rename(2) 是纯粹的原子改指向，也是这里真正想要的动作
+static BOOL IPATFbMoveItem(NSString *src, NSString *dst, NSError **error) {
+    if (rename(src.fileSystemRepresentation, dst.fileSystemRepresentation) == 0) return YES;
+    int err = errno;
+    IPATFbLog(@"rename 失败 errno=%d（%s），退回 NSFileManager：%@ -> %@",
+              err, strerror(err), src.lastPathComponent, dst.lastPathComponent);
+    return [[NSFileManager defaultManager] moveItemAtPath:src toPath:dst error:error];
+}
+
+/// 目标目录「整体改名」被拒时的退路：保留 final 这个目录对象，只换里面的内容。
+///
+/// 真机 App 容器的 Documents 是系统看护的目录（文件 App / 备份 / 文件提供者都盯着它），
+/// 直接 rename 掉它经常被拒（EPERM / EBUSY），而它在 LiveContainer 那种普通子目录里
+/// 又是允许的——同一个包在 LC 里导得进去、在真容器里导不进去就是这么来的。
+/// 目录里的子项改名没人拦，所以改成逐条换：同名子项先挂垃圾桶名再换新的，
+/// 新包里没有的旧子项也清掉，保证结果和整包替换一致。
+static BOOL IPATFbReplaceChildren(NSString *staging, NSString *final, NSError **error) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    // 只有两边都是目录才有得换；文件对文件走不了逐条，别把「什么都没换」报成成功
+    BOOL srcIsDir = NO, dstIsDir = NO;
+    if (!([fm fileExistsAtPath:staging isDirectory:&srcIsDir] && srcIsDir &&
+          [fm fileExistsAtPath:final isDirectory:&dstIsDir] && dstIsDir)) {
+        IPATFbLog(@"逐条落地用不上：源/目标不都是目录（%@ / %@）",
+                  staging.lastPathComponent, final.lastPathComponent);
+        if (error && !*error)
+            *error = [NSError errorWithDomain:@"IPAToolFiles" code:9
+                                  userInfo:@{NSLocalizedDescriptionKey:
+                                             @"整体替换失败，且目标不是目录，没法逐条换"}];
+        return NO;
+    }
+    chmod(final.fileSystemRepresentation, 0755);   // 上次导入可能把它锁成只读，先放开
+    NSArray<NSString *> *wanted = [fm contentsOfDirectoryAtPath:staging error:NULL] ?: @[];
+    NSArray<NSString *> *have   = [fm contentsOfDirectoryAtPath:final   error:NULL] ?: @[];
+    NSMutableArray<NSString *> *trashList = [NSMutableArray array];
+    NSInteger failed = 0, landed = 0;
+
+    for (NSString *name in wanted) {
+        if ([name hasPrefix:@".ipatool-trash-"]) continue;
+        NSString *src  = [staging stringByAppendingPathComponent:name];
+        NSString *dst  = [final stringByAppendingPathComponent:name];
+        NSString *trash = [dst stringByAppendingFormat:@".ipatool-trash-%@",
+                           [NSUUID UUID].UUIDString];
+        if ([fm fileExistsAtPath:dst]) {
+            NSError *e = nil;
+            if (!IPATFbMoveItem(dst, trash, &e)) {
+                IPATFbLog(@"  ‑ 旧 %@ 挪不走：%@", name, IPATFbErrText(e));
+                failed++;
+                continue;
+            }
+            [trashList addObject:trash];
+        }
+        NSError *e2 = nil;
+        if (!IPATFbMoveItem(src, dst, &e2)) {
+            IPATFbLog(@"  ‑ 新 %@ 放不进去：%@", name, IPATFbErrText(e2));
+            failed++;
+            continue;
+        }
+        landed++;
+    }
+
+    // 新包里没有的旧条目按整包替换的语义清掉，同样先挂垃圾桶名再慢慢删
+    NSSet<NSString *> *wantedSet = [NSSet setWithArray:wanted];
+    for (NSString *name in have) {
+        if ([wantedSet containsObject:name] || [name hasPrefix:@".ipatool-trash-"]) continue;
+        NSString *old = [final stringByAppendingPathComponent:name];
+        NSString *trash = [old stringByAppendingFormat:@".ipatool-trash-%@",
+                           [NSUUID UUID].UUIDString];
+        if (IPATFbMoveItem(old, trash, NULL)) [trashList addObject:trash];
+        else IPATFbLog(@"  ‑ 多余的旧项 %@ 挪不走，先留着", name);
+    }
+
+    NSArray<NSString *> *trashes = [trashList copy];
+    NSString *leftover = [staging copy];
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
+        NSFileManager *fm2 = [NSFileManager defaultManager];
+        for (NSString *t in trashes) {
+            IPATFbSetTreeWritable(t, YES);
+            [fm2 removeItemAtPath:t error:NULL];
+        }
+        IPATFbSetTreeWritable(leftover, YES);
+        [fm2 removeItemAtPath:leftover error:NULL];
+    });
+
+    IPATFbLog(@"逐条落地：成功 %ld 项，失败 %ld 项", (long)landed, (long)failed);
+    if (failed > 0) {
+        if (error) *error = [NSError errorWithDomain:@"IPAToolFiles" code:8
+                                         userInfo:@{NSLocalizedDescriptionKey:
+                                                    [NSString stringWithFormat:
+                                                     @"逐条落地时有 %ld 项没进去（成功 %ld 项）",
+                                                     (long)failed, (long)landed]}];
+        return NO;
+    }
+    return YES;
+}
+
 /// 把已经备好的临时项（同卷）放到 final 位置上；final 上已有同名项就覆盖：
 /// 文件换掉、文件夹整棵替换，保证导入完的内容和包里完全一致（热更目录就是要整体换）。
 ///
@@ -503,19 +617,50 @@ static void IPATFbRememberLockedPaths(NSArray<NSString *> *paths) {
 /// 中途失败会把旧内容换回原位，不让目录凭空消失。
 static BOOL IPATFbReplaceIntoPlace(NSString *staging, NSString *final, NSError **error) {
     NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *parent = final.stringByDeletingLastPathComponent;
+
     if (![fm fileExistsAtPath:final]) {
-        return [fm moveItemAtPath:staging toPath:final error:error];
+        NSError *moveError = nil;
+        if (IPATFbMoveItem(staging, final, &moveError)) return YES;
+        // 挪不动多半是目标父目录被锁成只读（上次导入留下的 / 目录本身只读），
+        // 放开权限再试一次：整包解压都做完了，卡在这一步太亏
+        IPATFbLog(@"直接落地失败（%@），放开权限重试", IPATFbErrText(moveError));
+        IPATFbSetTreeWritable(parent, YES);
+        if (IPATFbMoveItem(staging, final, &moveError)) return YES;
+        IPATFbLog(@"放开权限后还是落不进去：%@", IPATFbErrText(moveError));
+        if (error) *error = moveError;
+        return NO;
     }
 
     NSString *trash = [final stringByAppendingFormat:@".ipatool-trash-%@",
                        [NSUUID UUID].UUIDString];
-    if (![fm moveItemAtPath:final toPath:trash error:error]) return NO;
-
     NSError *moveError = nil;
-    if (![fm moveItemAtPath:staging toPath:final error:&moveError]) {
-        [fm moveItemAtPath:trash toPath:final error:NULL];   // 换回原位，别让目录消失
-        if (error) *error = moveError;
-        return NO;
+    if (!IPATFbMoveItem(final, trash, &moveError)) {
+        IPATFbLog(@"旧内容挪不走（%@），放开权限重试", IPATFbErrText(moveError));
+        IPATFbSetTreeWritable(final, YES);
+        IPATFbSetTreeWritable(parent, YES);
+        if (!IPATFbMoveItem(final, trash, &moveError)) {
+            IPATFbLog(@"旧内容还是挪不走：%@", IPATFbErrText(moveError));
+            // 目录对象本身挪不动（真机容器里的 Documents 常这样），
+            // 改成留着它、只换里面的内容
+            IPATFbLog(@"改走逐条落地：保留 %@ 这个目录，只替换里面的条目", final.lastPathComponent);
+            return IPATFbReplaceChildren(staging, final, error);
+        }
+    }
+
+    NSError *inError = nil;
+    if (!IPATFbMoveItem(staging, final, &inError)) {
+        IPATFbLog(@"新内容挪不进去：%@（正在把旧内容换回原位）", IPATFbErrText(inError));
+        IPATFbMoveItem(trash, final, NULL);   // 换回原位，别让目录消失
+        // 换回也失败的话落地目录就凭空没了，这个必须留痕
+        if (![fm fileExistsAtPath:final]) {
+            IPATFbLog(@"⚠️ 旧内容换回失败！%@ 现在叫 %@，手动改回来才能恢复",
+                      final, trash.lastPathComponent);
+            if (error) *error = inError;
+            return NO;
+        }
+        IPATFbLog(@"改走逐条落地：保留 %@ 这个目录，只替换里面的条目", final.lastPathComponent);
+        return IPATFbReplaceChildren(staging, final, error);
     }
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
         // 旧内容可能上次被锁成只读了，只读目录里的文件删不掉，先放开权限再清
@@ -530,10 +675,17 @@ static BOOL IPATFbReplaceIntoPlace(NSString *staging, NSString *final, NSError *
 /// 半成品目录容易被当成异常资源（或把它的条目算进校验）。tmp 和沙盒同一卷，
 /// 从这儿 rename 到落地目录依然是原子操作。
 static NSString *IPATFbImportWorkRoot(void) {
-    return [NSTemporaryDirectory() stringByAppendingPathComponent:@"IPAToolImport"];
+    // 放 Caches 而不是 tmp：iOS 在磁盘紧张（以及 App 不在前台）时会直接清掉 tmp 里的
+    // 文件，几个 G 的包解压到 90% 多被系统收走，表现就是「进度停在 97% 然后什么都没了」。
+    // Caches 与落地目录同一卷，解完 rename 过去照样是原子操作。
+    NSArray<NSString *> *dirs = NSSearchPathForDirectoriesInDomains(NSCachesDirectory,
+                                                                   NSUserDomainMask, YES);
+    NSString *root = [dirs firstObject];
+    if (root.length == 0) root = NSTemporaryDirectory();
+    return [root stringByAppendingPathComponent:@"IPAToolImport"];
 }
 
-/// 清掉上一次导入留下的临时残骸：tmp 的工作目录整个重建，落地目录里
+/// 清掉上一次导入留下的临时残骸：工作目录（Caches 下）整个重建，落地目录里
 /// 旧版本可能留下的 .ipatool-part / .ipatool-zip / .ipatool-trash-xxx 也顺手删掉
 static void IPATFbCleanStagingLeftovers(NSString *directory) {
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -1895,10 +2047,11 @@ static BOOL IPATFbZipSafePath(NSString *root, NSString *name, NSString **outPath
 }
 
 /// 单个条目的解压：method 0 直拷，method 8 zlib 流式 inflate
+/// progress 返回 NO 表示「别解了」（空间不够等），就地收手
 static BOOL IPATFbZipInflateEntry(FILE *fp, off_t dataOffset, uint16_t method,
                                   uint64_t compSize,
                                   NSString *outPath,
-                                  void (^progress)(uint64_t added),
+                                  BOOL (^progress)(uint64_t added),
                                   NSError **error) {
     if (fseeko(fp, dataOffset, SEEK_SET) != 0) {
         if (error) *error = [NSError errorWithDomain:@"IPAToolFiles" code:1
@@ -1917,6 +2070,7 @@ static BOOL IPATFbZipInflateEntry(FILE *fp, off_t dataOffset, uint16_t method,
     static const size_t kChunk = 256 * 1024;
     BOOL ok = NO;
     BOOL badWrite = NO;
+    BOOL cancelled = NO;
 
     if (method == 0) {
         // store：直接落盘
@@ -1926,11 +2080,11 @@ static BOOL IPATFbZipInflateEntry(FILE *fp, off_t dataOffset, uint16_t method,
             size_t n = fread(buf, 1, remaining < kChunk ? (size_t)remaining : kChunk, fp);
             if (n == 0) break;
             if (fwrite(buf, 1, n, out) != n) { badWrite = YES; break; }
-            progress(n);
+            if (progress && !progress(n)) { cancelled = YES; break; }
             remaining -= n;
         }
         free(buf);
-        ok = !badWrite && remaining == 0;
+        ok = !badWrite && !cancelled && remaining == 0;
     } else {
         // deflate：raw inflate 流式解
         uint8_t *inBuf = malloc(kChunk);
@@ -1953,7 +2107,7 @@ static BOOL IPATFbZipInflateEntry(FILE *fp, off_t dataOffset, uint16_t method,
                 uInt produced = kChunk - zs.avail_out;
                 if (produced > 0) {
                     if (fwrite(outBuf, 1, produced, out) != produced) { badWrite = YES; break; }
-                    progress(produced);
+                    if (progress && !progress(produced)) { cancelled = YES; break; }
                 }
                 if (ret == Z_STREAM_END) { haveEnd = YES; break; }
                 if (ret != Z_OK) break;                          // 数据损坏 / 不支持
@@ -1967,7 +2121,7 @@ static BOOL IPATFbZipInflateEntry(FILE *fp, off_t dataOffset, uint16_t method,
     }
 
     fclose(out);
-    if (!ok) {
+    if (!ok && !cancelled) {
         [[NSFileManager defaultManager] removeItemAtPath:outPath error:NULL];
         if (error) {
             NSString *msg = badWrite ? @"写文件失败（沙盒空间不足？）"
@@ -2022,9 +2176,11 @@ static BOOL IPATFbZipParseEntry(const uint8_t *cd, uint64_t cdSize, uint64_t *po
 }
 
 /// 解开整个 zip 到 stagingDir；先扫一遍中央目录做空间预检，再逐条解
+/// extraNeedBytes：除解压后的体积外还占着的空间（zip 副本等），预检要一起算
 static BOOL IPATFbZipExtract(NSURL *zipURL, NSString *stagingDir,
                              NSInteger *outFiles, NSInteger *outDirs, uint64_t *outTotalBytes,
-                             void (^progress)(uint64_t added), NSError **error) {
+                             uint64_t extraNeedBytes,
+                             BOOL (^progress)(uint64_t added), NSError **error) {
     NSFileManager *fm = [NSFileManager defaultManager];
     FILE *fp = fopen(zipURL.path.fileSystemRepresentation, "rb");
     if (!fp) {
@@ -2119,12 +2275,19 @@ static BOOL IPATFbZipExtract(NSURL *zipURL, NSString *stagingDir,
     if (outTotalBytes) *outTotalBytes = totalBytes;
     fsAttr = [fm attributesOfFileSystemForPath:stagingDir error:NULL];
     uint64_t freeBytes = [fsAttr[NSFileSystemFreeSize] unsignedLongLongValue];
-    if (freeBytes > 0 && totalBytes > freeBytes) {
+    uint64_t needBytes = totalBytes + extraNeedBytes;
+    IPATFbLog(@"空间预检：解压后 %.2f GB + 还占着的 %.2f GB = 需要 %.2f GB，剩余 %.2f GB",
+              totalBytes / 1073741824.0, extraNeedBytes / 1073741824.0,
+              needBytes / 1073741824.0, freeBytes / 1073741824.0);
+    if (freeBytes > 0 && needBytes > freeBytes) {
         if (error) *error = [NSError errorWithDomain:@"IPAToolFiles" code:6
                                          userInfo:@{NSLocalizedDescriptionKey:
                                                     [NSString stringWithFormat:
-                                                     @"沙盒空间不足：解压需要约 %.1f GB，剩余 %.1f GB",
-                                                     totalBytes / 1073741824.0,
+                                                     @"沙盒空间不足：解压需要约 %.1f GB（含临时副本 %.1f GB），"
+                                                     @"剩余 %.1f GB。覆盖同名目录时旧内容删掉前也占空间，"
+                                                     @"实际需要通常比这更多",
+                                                     needBytes / 1073741824.0,
+                                                     extraNeedBytes / 1073741824.0,
                                                      freeBytes / 1073741824.0]}];
         goto done;
     }
@@ -2238,25 +2401,54 @@ done:
 
     NSString *zipName = url.lastPathComponent;
     IPATFbLog(@"解压 %@ -> 临时目录 %@", zipName, staging);
+    uint64_t zipSize = [[fm attributesOfItemAtPath:url.path error:NULL][NSFileSize]
+                        unsignedLongLongValue];
     __block uint64_t totalBytes = 0, doneBytes = 0, lastReport = 0;
-    void (^progress)(uint64_t) = ^(uint64_t added) {
+    __block BOOL spaceOut = NO;
+    BOOL (^progress)(uint64_t) = ^BOOL(uint64_t added) {
         doneBytes += added;
         if (doneBytes - lastReport >= 256ULL * 1024 * 1024) {   // 每 256MB 报一次进度
             lastReport = doneBytes;
+            // 顺手看一眼剩余空间：等到写失败再报错，用户看到的只是「进度停在某个数字
+            // 然后什么都没了」，根本分不清是空间不够还是包坏了
+            NSDictionary *attr = [fm attributesOfFileSystemForPath:staging error:NULL];
+            uint64_t free = [attr[NSFileSystemFreeSize] unsignedLongLongValue];
+            if (free > 0 && free < 512ULL * 1024 * 1024) {
+                spaceOut = YES;
+                IPATFbLog(@"解压途中剩余空间只剩 %.2f GB，提前中止", free / 1073741824.0);
+                return NO;
+            }
             long percent = totalBytes > 0 ? (long)((double)doneBytes / (double)totalBytes * 100.0) : 0;
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self postStatus:[NSString stringWithFormat:@"解压 %@：%ld%%", zipName, percent]];
                 self.importAlert.message =
-                    [NSString stringWithFormat:@"解压 %@：%ld%%", zipName, percent];
+                    [NSString stringWithFormat:@"解压 %@：%ld%%（剩余空间 %.1f GB）",
+                     zipName, percent, free / 1073741824.0];
             });
         }
+        return YES;
     };
 
     NSInteger files = 0, dirs = 0;
-    if (!IPATFbZipExtract(url, staging, &files, &dirs, &totalBytes, progress, error)) {
+    if (!IPATFbZipExtract(url, staging, &files, &dirs, &totalBytes, zipSize, progress, error)) {
+        if (spaceOut && error) {
+            *error = [NSError errorWithDomain:@"IPAToolFiles" code:6
+                                 userInfo:@{NSLocalizedDescriptionKey:
+                                            @"沙盒空间不足：解压到一半空间就见底了（剩余不到 0.5 GB）。"
+                                            @"删点东西或换个空间宽裕的机器再来"}];
+        }
         [fm removeItemAtPath:staging error:NULL];
         return NO;
     }
+
+    // 解压完到落地这段（几个 G 的目录挪位置、旧内容慢慢删）之前没有任何反馈，
+    // 看上去就像卡在 97%。给一句提示，让人知道还在干活
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSString *text = [NSString stringWithFormat:@"解压完成，正在写入 %@…",
+                          IPATFbDisplayPath(destination)];
+        [self postStatus:text];
+        self.importAlert.message = text;
+    });
 
     // 顶层条目挪进落地目录（同卷 move 是原子操作，重名直接覆盖）
     NSArray<NSURL *> *topLevel =
@@ -2268,6 +2460,7 @@ done:
         [fm removeItemAtPath:staging error:NULL];
         return NO;
     }
+    IPATFbLog(@"落地：%ld 个顶层条目 %@ -> %@", (long)topLevel.count, staging, destination);
     for (NSURL *item in topLevel) {
         NSString *final = IPATFbImportPath(destination, item.lastPathComponent);
         if ([fm fileExistsAtPath:final]) {
@@ -2275,6 +2468,8 @@ done:
             IPATFbLog(@"导入覆盖同名项：%@", final);
         }
         if (!IPATFbReplaceIntoPlace(item.path, final, error)) {
+            IPATFbLog(@"落地失败：%@ -> %@（%@）", item.lastPathComponent, final,
+                      (error && *error) ? (*error).localizedDescription : @"未知原因");
             [fm removeItemAtPath:staging error:NULL];
             return NO;
         }
@@ -2368,6 +2563,10 @@ done:
             [fm removeItemAtURL:url error:NULL];
         }
     }
+    // 工作目录在 Caches 下，用完就删：留着就是几 GB 白占（下次开头也会重建，
+    // 但中途失败留下来的那份要等下次才清，空间先被吃掉了）
+    [fm removeItemAtPath:IPATFbImportWorkRoot() error:NULL];
+
     NSArray<NSString *> *watched = [landed copy];
     NSDate *landedAt = [NSDate date];
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -2451,7 +2650,19 @@ done:
         ? [NSString stringWithFormat:@"，覆盖 %ld 个同名项", (long)overwritten]
         : @"";
     if (copied == 0 && error) {
-        [self postStatus:[NSString stringWithFormat:@"导入失败：%@", error.localizedDescription]];
+        NSString *reason = error.localizedDescription;
+        [self postStatus:[NSString stringWithFormat:@"导入失败：%@", reason]];
+        IPATFbLog(@"导入失败：%@", reason);
+        // 失败一定要弹出来：进度框一收，状态行在面板折叠时根本看不见，
+        // 用户看到的就是「提示消失了」，不知道是失败还是成功
+        UIAlertController *fail =
+            [UIAlertController alertControllerWithTitle:@"导入失败"
+                                                message:reason
+                                         preferredStyle:UIAlertControllerStyleAlert];
+        [fail addAction:[UIAlertAction actionWithTitle:@"知道了"
+                                                 style:UIAlertActionStyleDefault
+                                               handler:nil]];
+        [self presentFromTop:fail];
     } else if (copied < total) {
         [self postStatus:[NSString stringWithFormat:@"已导入 %ld/%ld 项到 %@%@",
                                                     (long)copied, (long)total, where, over]];
@@ -2524,7 +2735,7 @@ done:
     // 进度直接显示成弹窗——导入期间悬浮面板是藏着的，状态行看不见
     UIAlertController *progress =
         [UIAlertController alertControllerWithTitle:@"正在导入…"
-                                            message:@"请稍候（大文件要等一会儿）"
+                                            message:@"请稍候（大文件要等一会儿，别切后台 / 别锁屏）"
                                      preferredStyle:UIAlertControllerStyleAlert];
     self.importAlert = progress;
     // 同步弹：接下来导入是在后台跑的，进度框必须已经挂上窗口，

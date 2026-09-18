@@ -32,8 +32,20 @@ else:
 
 OPT_DEFAULT = "(默认)"
 PASSWORD_MASK = "********"
-APP_TITLE = "ipatool · IPA 注入与重签名"
+APP_TITLE = "ipatool"
+APP_SUBTITLE = "修改 IPA 的 Bundle ID / 名称，注入 dylib 并重新签名"
 CAPTURE_TASKS = ("info", "certs")
+
+# 配色（ttk 的 clam 主题可以改这些值，界面风格统一从这里调）
+BG = "#f4f6f9"          # 窗口底色
+CARD = "#ffffff"        # 输入控件底色
+BORDER = "#d5dae3"      # 分隔线 / 边框
+TEXT = "#1f2937"        # 正文
+MUTED = "#6b7280"       # 次要说明
+ACCENT = "#2563eb"      # 主色（按钮 / 选中态）
+ACCENT_ACTIVE = "#1d4ed8"
+OK = "#0f766e"          # 成功的提示色
+DANGER = "#b3261e"      # 出错的提示色
 
 
 # --------------------------------------------------------------------------- #
@@ -120,22 +132,100 @@ class IpatoolGui:
     def __init__(self) -> None:
         self.root = tk.Tk()
         self.root.title(APP_TITLE)
-        self.root.geometry("1000x860")
-        self.root.minsize(900, 640)
+        self.root.geometry("1020x880")
+        self.root.minsize(940, 660)
+        self.root.configure(background=BG)
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(1, weight=1)
+        self.root.rowconfigure(3, weight=1)
 
         self.q: "queue.Queue[tuple[str, object]]" = queue.Queue()
         self.busy = False
         self.custom_dylibs: list[str] = []
         self.action_buttons: list[ttk.Button] = []
 
+        self._configure_style()
         self._make_vars()
+        self._build_header()
         self._build_inputs()
         self._build_tabs()
         self._build_bottom()
 
         self.root.after(80, self._poll)
+
+    # ------------------------------------------------------------------ #
+    # 界面风格
+    # ------------------------------------------------------------------ #
+    def _configure_style(self) -> None:
+        """统一换一套更干净的 ttk 外观（clam 主题下这些选项都能改）。"""
+        style = ttk.Style(self.root)
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+
+        family = "Microsoft YaHei UI" if sys.platform == "win32" else "Helvetica"
+        self.root.option_add("*Font", (family, 9))
+
+        style.configure(".", background=BG, foreground=TEXT, fieldbackground=CARD, bordercolor=BORDER)
+        style.configure("TFrame", background=BG)
+        style.configure("TLabel", background=BG, foreground=TEXT)
+        style.configure("Muted.TLabel", foreground=MUTED)
+        style.configure("Title.TLabel", font=(family, 15, "bold"), foreground="#111827")
+        style.configure("Sub.TLabel", foreground=MUTED)
+
+        style.configure("TLabelframe", background=BG, bordercolor=BORDER, lightcolor=BG, darkcolor=BORDER)
+        style.configure("TLabelframe.Label", background=BG, foreground="#111827", font=(family, 9, "bold"))
+
+        style.configure("TButton", background=CARD, foreground=TEXT, bordercolor=BORDER,
+                        padding=(10, 5), relief="flat", focuscolor=ACCENT)
+        style.map("TButton",
+                  background=[("active", "#eef2ff"), ("disabled", "#f1f3f7")],
+                  bordercolor=[("focus", ACCENT)])
+        style.configure("Accent.TButton", background=ACCENT, foreground="#ffffff",
+                        bordercolor=ACCENT, padding=(14, 6))
+        style.map("Accent.TButton",
+                  background=[("active", ACCENT_ACTIVE), ("disabled", "#a5c0f5")],
+                  foreground=[("disabled", "#ffffff")])
+
+        style.configure("TCheckbutton", background=BG, foreground=TEXT, indicatorcolor=CARD)
+        style.map("TCheckbutton",
+                  background=[("active", BG)],
+                  indicatorcolor=[("selected", ACCENT), ("active", "#eef2ff")])
+
+        style.configure("TEntry", fieldbackground=CARD, bordercolor=BORDER, padding=(6, 4),
+                        lightcolor=BORDER, darkcolor=BORDER)
+        style.map("TEntry", bordercolor=[("focus", ACCENT)],
+                  lightcolor=[("focus", ACCENT)], darkcolor=[("focus", ACCENT)])
+        style.configure("TCombobox", fieldbackground=CARD, bordercolor=BORDER, padding=(6, 4))
+        style.map("TCombobox", bordercolor=[("focus", ACCENT)],
+                  lightcolor=[("focus", ACCENT)], darkcolor=[("focus", ACCENT)])
+
+        style.configure("TNotebook", background=BG, bordercolor=BORDER, tabmargins=(2, 4, 2, 0))
+        style.configure("TNotebook.Tab", background="#e6e9ef", foreground=TEXT,
+                        bordercolor=BORDER, padding=(16, 7), font=(family, 9, "bold"), focuscolor=BG)
+        style.map("TNotebook.Tab",
+                  background=[("selected", CARD), ("active", "#eef2ff")],
+                  foreground=[("selected", ACCENT)])
+
+        style.configure("Treeview", background=CARD, fieldbackground=CARD, bordercolor=BORDER,
+                        rowheight=26)
+        style.configure("Treeview.Heading", background="#e9edf4", foreground=TEXT, relief="flat")
+        style.map("Treeview",
+                  background=[("selected", "#dbeafe")],
+                  foreground=[("selected", "#111827")])
+
+        style.configure("TSeparator", background=BORDER)
+        style.configure("Vertical.TScrollbar", background="#e9edf4", bordercolor=BORDER,
+                        troughcolor=BG, arrowcolor=TEXT)
+
+    # ------------------------------------------------------------------ #
+    # 顶部标题
+    # ------------------------------------------------------------------ #
+    def _build_header(self) -> None:
+        head = ttk.Frame(self.root, padding=(14, 10, 14, 8))
+        head.grid(row=0, column=0, sticky="ew")
+        head.columnconfigure(0, weight=1)
+        ttk.Label(head, text=APP_TITLE, style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(head, text=APP_SUBTITLE, style="Sub.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ttk.Separator(self.root, orient="horizontal").grid(row=1, column=0, sticky="ew")
 
     # ------------------------------------------------------------------ #
     # 变量
@@ -163,35 +253,7 @@ class IpatoolGui:
         self.v_dry_run = tk.BooleanVar(value=False)
         self.v_verbose = tk.BooleanVar(value=False)
 
-        # 后台保活
-        self.v_keep_alive = tk.BooleanVar(value=False)
-        self.v_ka_dylib = tk.StringVar()
-        self.v_ka_start_on = tk.StringVar(value=OPT_DEFAULT)
-        self.v_ka_no_audio = tk.BooleanVar(value=False)
-        self.v_ka_audio_file = tk.StringVar()
-        self.v_ka_no_task_renew = tk.BooleanVar(value=False)
-        self.v_ka_renew_lead_time = tk.StringVar()
-        self.v_ka_location = tk.BooleanVar(value=False)
-        self.v_ka_location_indicator = tk.BooleanVar(value=False)
-        self.v_ka_fetch = tk.BooleanVar(value=False)
-        self.v_ka_processing = tk.BooleanVar(value=False)
-        self.v_ka_refresh_interval = tk.StringVar()
-
-        # 文件导入导出
-        self.v_files = tk.BooleanVar(value=False)
-        self.v_files_dylib = tk.StringVar()
-        self.v_files_root = tk.StringVar()
-        self.v_files_import_dir = tk.StringVar()
-        self.v_no_files_sharing = tk.BooleanVar(value=False)
-
-        # 悬浮窗
-        self.v_panel = tk.BooleanVar(value=False)
-        self.v_no_panel = tk.BooleanVar(value=False)
-        self.v_panel_dylib = tk.StringVar()
-        self.v_panel_title = tk.StringVar()
-
-        # 其它
-        self.v_dylib_entry = tk.StringVar()
+        # 注入
         self.v_background_mode = tk.StringVar()
         self.v_allow_arbitrary_loads = tk.BooleanVar(value=False)
 
@@ -203,7 +265,7 @@ class IpatoolGui:
     # ------------------------------------------------------------------ #
     def _build_inputs(self) -> None:
         box = ttk.LabelFrame(self.root, text="IPA 文件", padding=(10, 6))
-        box.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 6))
+        box.grid(row=2, column=0, sticky="ew", padx=12, pady=(10, 6))
         box.columnconfigure(1, weight=1)
         box.columnconfigure(4, weight=1)
 
@@ -219,7 +281,7 @@ class IpatoolGui:
         hint = ttk.Label(
             box,
             text="输入可以是 .ipa，也可以是已解包且含 Payload 的目录；输出留空则按默认名字生成（覆盖原文件时忽略此项）。",
-            foreground="#666666",
+            style="Muted.TLabel",
         )
         hint.grid(row=1, column=0, columnspan=6, sticky="w", pady=(6, 0))
 
@@ -227,7 +289,7 @@ class IpatoolGui:
             box, text="直接覆盖输入文件（--in-place）", variable=self.v_inplace, command=self._sync_inplace,
         ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
-        self.msg_io = ttk.Label(box, text="", foreground="#b00020")
+        self.msg_io = ttk.Label(box, text="", foreground=DANGER)
         self.msg_io.grid(row=2, column=3, columnspan=3, sticky="w")
 
     def _sync_inplace(self) -> None:
@@ -265,7 +327,7 @@ class IpatoolGui:
     # ------------------------------------------------------------------ #
     def _build_tabs(self) -> None:
         self.nb = ttk.Notebook(self.root)
-        self.nb.grid(row=1, column=0, sticky="nsew", padx=10)
+        self.nb.grid(row=3, column=0, sticky="nsew", padx=12)
         self._build_info_tab()
         self._build_modify_tab()
         self._build_inject_tab()
@@ -285,7 +347,7 @@ class IpatoolGui:
         ttk.Button(bar, text="选择目录…", command=self._pick_input_dir).pack(side="left", padx=6)
         ttk.Label(
             bar, text="  解析包内的 Bundle ID / 名称 / 内嵌 bundle / 已注入 dylib",
-            foreground="#666666",
+            style="Muted.TLabel",
         ).pack(side="left")
 
         self.info_tree = ttk.Treeview(page, columns=("k", "v"), show="headings", height=9)
@@ -300,7 +362,11 @@ class IpatoolGui:
         detail_box.grid(row=3, column=0, sticky="nsew", pady=(4, 0))
         detail_box.columnconfigure(0, weight=1)
         detail_box.rowconfigure(0, weight=1)
-        self.info_detail = tk.Text(detail_box, height=8, wrap="none", state="disabled", font=("Consolas", 9))
+        self.info_detail = tk.Text(
+            detail_box, height=8, wrap="none", state="disabled", font=("Consolas", 9),
+            background=CARD, foreground=TEXT, relief="solid", borderwidth=1,
+            highlightthickness=1, highlightcolor=BORDER, highlightbackground=BORDER,
+        )
         self.info_detail.grid(row=0, column=0, sticky="nsew")
         bar_y = ttk.Scrollbar(detail_box, orient="vertical", command=self.info_detail.yview)
         bar_y.grid(row=0, column=1, sticky="ns")
@@ -325,7 +391,7 @@ class IpatoolGui:
         ttk.Label(
             tips,
             justify="left",
-            foreground="#444444",
+            style="Muted.TLabel",
             text=(
                 "· 内嵌的 Extension / WatchApp / Framework 的 Bundle ID 会按前缀联动修改，\n"
                 "  plist 里引用旧 ID 的字符串也会被递归替换（WKAppBundleIdentifier、CFBundleURLName 等）。\n"
@@ -336,126 +402,59 @@ class IpatoolGui:
 
     # ---- 注入 --------------------------------------------------------- #
     def _build_inject_tab(self) -> None:
-        outer = ttk.Frame(self.nb, padding=10)
-        self.nb.add(outer, text="  注入功能  ")
-        outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(0, weight=1)
+        page = ttk.Frame(self.nb, padding=12)
+        self.nb.add(page, text="  注入 dylib  ")
+        page.columnconfigure(0, weight=1)
 
-        canvas = tk.Canvas(outer, highlightthickness=0)
-        canvas.grid(row=0, column=0, sticky="nsew")
-        bar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
-        bar.grid(row=0, column=1, sticky="ns")
-        canvas.configure(yscrollcommand=bar.set)
-
-        page = ttk.Frame(canvas)
-        canvas.create_window((0, 0), window=page, anchor="nw")
-        page.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-
-        def on_wheel(event) -> None:
-            canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
-
-        canvas.bind("<MouseWheel>", on_wheel)
-        page.bind("<MouseWheel>", on_wheel)
-
-        page.columnconfigure(0, weight=1, uniform="col")
-        page.columnconfigure(1, weight=1, uniform="col")
-
-        self._build_files_group(page).grid(row=0, column=0, sticky="new", padx=(0, 6), pady=(0, 8))
-        self._build_keepalive_group(page).grid(row=0, column=1, sticky="new", padx=(6, 0), pady=(0, 8))
-        self._build_panel_group(page).grid(row=1, column=0, sticky="new", padx=(0, 6), pady=(0, 8))
-        self._build_misc_group(page).grid(row=2, column=0, columnspan=2, sticky="new", pady=(0, 4))
-
-    def _build_keepalive_group(self, parent) -> ttk.LabelFrame:
-        box = ttk.LabelFrame(parent, text=" 后台保活 ", padding=(10, 6))
-        box.columnconfigure(0, weight=1)
-
-        ttk.Checkbutton(
-            box, text="注入后台保活 tweak（默认靠静音音频，最稳定）",
-            variable=self.v_keep_alive,
-        ).grid(row=0, column=0, columnspan=3, sticky="w")
-        self._entry(box, 1, "tweak 路径", self.v_ka_dylib, "留空自动查找 tweak/build/", browse=self._pick_ka_dylib, width=30)
-        self._combo(box, 2, "音频启动", self.v_ka_start_on, ["launch", "background"])
-        self._entry(box, 3, "音频文件", self.v_ka_audio_file, "改用近乎无声的底噪（可选）", browse=lambda: self._pick_file(self.v_ka_audio_file), width=30)
-        self._entry(box, 4, "续期提前量", self.v_ka_renew_lead_time, "秒，默认 10", width=12)
-        self._entry(box, 5, "唤醒间隔", self.v_ka_refresh_interval, "秒，默认 900", width=12)
-
-        ttk.Checkbutton(box, text="不播放静音音频（只靠后台任务续期，撑不久）", variable=self.v_ka_no_audio).grid(row=6, column=0, columnspan=3, sticky="w", pady=(4, 0))
-        ttk.Checkbutton(box, text="不续期 beginBackgroundTask", variable=self.v_ka_no_task_renew).grid(row=7, column=0, columnspan=3, sticky="w")
-        ttk.Checkbutton(box, text="后台定位保活（耗电、需授权、App Store 会拒）", variable=self.v_ka_location).grid(row=8, column=0, columnspan=3, sticky="w")
-        ttk.Checkbutton(box, text="显示定位蓝条", variable=self.v_ka_location_indicator).grid(row=9, column=0, columnspan=3, sticky="w")
-        ttk.Checkbutton(box, text="注册定时唤醒 BGAppRefreshTask（开启后需重启 App 生效）", variable=self.v_ka_fetch).grid(row=10, column=0, columnspan=3, sticky="w")
-        ttk.Checkbutton(box, text="注册长任务 BGProcessingTask", variable=self.v_ka_processing).grid(row=11, column=0, columnspan=3, sticky="w")
-        return box
-
-    def _build_files_group(self, parent) -> ttk.LabelFrame:
-        box = ttk.LabelFrame(parent, text=" 文件导入导出 ", padding=(10, 6))
-        box.columnconfigure(0, weight=1)
-
-        ttk.Checkbutton(
-            box, text="注入文件桥（在悬浮面板里浏览沙盒 / 导出 / 导入）",
-            variable=self.v_files,
-        ).grid(row=0, column=0, columnspan=3, sticky="w")
-        self._entry(box, 1, "tweak 路径", self.v_files_dylib, "留空自动查找 tweak/build/", browse=self._pick_files_dylib, width=30)
-        self._entry(box, 2, "浏览根目录", self.v_files_root, "相对沙盒，留空 = 沙盒根", width=30)
-        self._entry(box, 3, "导入到", self.v_files_import_dir, "相对沙盒，默认 Documents", width=30)
-        ttk.Checkbutton(
-            box, text="不打开 UIFileSharingEnabled（Documents 不出现在「文件」App）",
-            variable=self.v_no_files_sharing,
-        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(4, 0))
-        ttk.Label(
-            box, foreground="#666666", justify="left",
-            text="导出时悬浮窗会自动躲开系统文件选择器；导入同名文件不覆盖，自动加 -2/-3 后缀。",
-        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
-        return box
-
-    def _build_panel_group(self, parent) -> ttk.LabelFrame:
-        box = ttk.LabelFrame(parent, text=" 应用内悬浮窗 ", padding=(10, 6))
-        box.columnconfigure(0, weight=1)
-
-        ttk.Checkbutton(
-            box, text="强制注入悬浮窗（上面功能默认已带，用于单独只要面板）",
-            variable=self.v_panel, command=lambda: self._sync_panel(True),
-        ).grid(row=0, column=0, columnspan=3, sticky="w")
-        ttk.Checkbutton(
-            box, text="不要悬浮窗（--no-panel：只改配置，不加界面）",
-            variable=self.v_no_panel, command=lambda: self._sync_panel(False),
-        ).grid(row=1, column=0, columnspan=3, sticky="w")
-        self._entry(box, 2, "tweak 路径", self.v_panel_dylib, "留空自动查找 tweak/build/", browse=self._pick_panel_dylib, width=30)
-        self._entry(box, 3, "按钮文字", self.v_panel_title, "默认 IPAT", width=30)
-        ttk.Label(
-            box, foreground="#666666", justify="left",
-            text="面板里的开关立即生效并记住；命令行参数只决定“用户还没在面板改过时”的默认值。",
-        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
-        return box
-
-    def _build_misc_group(self, parent) -> ttk.LabelFrame:
-        box = ttk.LabelFrame(parent, text=" 其它 ", padding=(10, 6))
-        box.columnconfigure(0, weight=0)
-        box.columnconfigure(1, weight=1)
-
-        ttk.Label(box, text="自定义 dylib").grid(row=0, column=0, sticky="nw", padx=(0, 8))
-        list_box = tk.Listbox(box, height=3, selectmode="extended", font=("Consolas", 9))
-        list_box.grid(row=0, column=1, sticky="ew")
-        self.list_dylibs = list_box
-        btns = ttk.Frame(box)
-        btns.grid(row=0, column=2, sticky="nw", padx=(8, 0))
-        ttk.Button(btns, text="添加…", width=9, command=self._add_dylib).pack()
-        ttk.Button(btns, text="移除", width=9, command=self._remove_dylib).pack(pady=4)
-
-        ttk.Label(box, text="后台模式").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
-        ttk.Entry(box, textvariable=self.v_background_mode).grid(row=1, column=1, sticky="ew", pady=(8, 0))
-        ttk.Label(box, text="逗号分隔，追加到 UIBackgroundModes，如 fetch,processing", foreground="#666666").grid(
-            row=1, column=2, sticky="w", padx=(8, 0), pady=(8, 0),
+        box = self._group(page, "要注入的 dylib", 0)
+        wrap = ttk.Frame(box)
+        wrap.grid(row=0, column=0, columnspan=2, sticky="ew")
+        wrap.columnconfigure(0, weight=1)
+        self.list_dylibs = tk.Listbox(
+            wrap, height=6, selectmode="extended", font=("Consolas", 9),
+            background=CARD, foreground=TEXT, relief="solid", borderwidth=1,
+            highlightthickness=1, highlightcolor=BORDER, highlightbackground=BORDER,
+            activestyle="none",
         )
+        self.list_dylibs.grid(row=0, column=0, sticky="ew")
+        bar_y = ttk.Scrollbar(wrap, orient="vertical", command=self.list_dylibs.yview)
+        bar_y.grid(row=0, column=1, sticky="ns")
+        self.list_dylibs.configure(yscrollcommand=bar_y.set)
 
-        bottom = ttk.Frame(box)
-        bottom.grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        btns = ttk.Frame(box)
+        btns.grid(row=0, column=2, sticky="nw", padx=(10, 0))
+        ttk.Button(btns, text="添加…", width=10, command=self._add_dylib).pack()
+        ttk.Button(btns, text="移除", width=10, command=self._remove_dylib).pack(pady=4)
+        ttk.Button(btns, text="清空", width=10, command=self._clear_dylib).pack()
+
+        ttk.Label(
+            box, style="Muted.TLabel", justify="left",
+            text="dylib 会被放进 App 的 Frameworks/，并写入主可执行文件的 LC_LOAD_DYLIB；列表顺序即加载顺序。",
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+        extra = self._group(page, "Info.plist 附加配置（可选）", 1)
+        self._entry(extra, 0, "后台模式", self.v_background_mode,
+                    "逗号分隔，追加到 UIBackgroundModes，如 fetch,processing")
         ttk.Checkbutton(
-            bottom, text="允许明文 HTTP（NSAllowsArbitraryLoads，热更服务器常用）",
+            extra, text="允许明文 HTTP（NSAllowsArbitraryLoads，热更服务器常用）",
             variable=self.v_allow_arbitrary_loads,
-        ).pack(side="left")
-        ttk.Button(bottom, text="查看已注入的 dylib", command=self._list_injected).pack(side="left", padx=10)
-        return box
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
+
+        bar = ttk.Frame(extra)
+        bar.grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Button(bar, text="查看已注入的 dylib", command=self._list_injected).pack(side="left")
+        ttk.Label(bar, text="  核对产物里实际注入了哪些库，不改动任何文件", style="Muted.TLabel").pack(side="left")
+
+        tips = self._group(page, "说明", 2)
+        ttk.Label(
+            tips, style="Muted.TLabel", justify="left",
+            text=(
+                "· 注入后原签名失效，必须重新签名才能安装（签名参数在「签名」页）。\n"
+                "· 想先看看会改什么，用底部的「预览（dry-run）」。\n"
+                "· 内置的后台保活 / 文件导入导出 / 悬浮窗只在命令行提供：\n"
+                "    python -m ipatool inject <包> --keep-alive --files"
+            ),
+        ).grid(row=0, column=0, columnspan=3, sticky="w")
 
     # ---- 签名 --------------------------------------------------------- #
     def _build_sign_tab(self) -> None:
@@ -470,7 +469,7 @@ class IpatoolGui:
             state="readonly", width=14,
         ).grid(row=0, column=1, sticky="w", pady=3)
         ttk.Label(
-            box, foreground="#666666",
+            box, style="Muted.TLabel",
             text="auto：macOS 用 codesign，否则用 zsign；none 只重打包不签名",
         ).grid(row=0, column=2, sticky="w", padx=(10, 0), pady=3)
 
@@ -482,7 +481,7 @@ class IpatoolGui:
         self._entry(box, 2, "证书文件", self.v_p12, "p12 / pfx（证书签名）", browse=lambda: self._pick_file(self.v_p12, [("证书", "*.p12 *.pfx"), ("所有文件", "*.*")]))
         ttk.Label(box, text="证书密码").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=3)
         ttk.Entry(box, textvariable=self.v_p12_password, show="*", width=30).grid(row=3, column=1, sticky="w", pady=3)
-        ttk.Label(box, text="也可留空，用环境变量 IPATOOL_P12_PASSWORD", foreground="#666666").grid(
+        ttk.Label(box, text="也可留空，用环境变量 IPATOOL_P12_PASSWORD", style="Muted.TLabel").grid(
             row=3, column=2, columnspan=2, sticky="w", padx=(10, 0), pady=3,
         )
 
@@ -499,7 +498,7 @@ class IpatoolGui:
     # ------------------------------------------------------------------ #
     def _build_bottom(self) -> None:
         area = ttk.Frame(self.root)
-        area.grid(row=2, column=0, sticky="nsew", padx=10, pady=(6, 10))
+        area.grid(row=4, column=0, sticky="nsew", padx=12, pady=(6, 12))
         area.columnconfigure(0, weight=1)
         area.rowconfigure(1, weight=1)
 
@@ -507,23 +506,30 @@ class IpatoolGui:
         bar.grid(row=0, column=0, sticky="ew")
         b_info = ttk.Button(bar, text="读取信息", command=self._load_info)
         b_dry = ttk.Button(bar, text="预览（dry-run）", command=lambda: self._run_current(dry_run=True))
-        b_go = ttk.Button(bar, text="开始执行", command=lambda: self._run_current(dry_run=False))
+        b_go = ttk.Button(bar, text="开始执行", style="Accent.TButton",
+                          command=lambda: self._run_current(dry_run=False))
         for btn in (b_info, b_dry, b_go):
-            btn.pack(side="left", padx=(0, 6))
+            btn.pack(side="left", padx=(0, 8))
         self.action_buttons = [b_info, b_dry, b_go]
         ttk.Button(bar, text="清空日志", command=lambda: self._set_text(self.log, "")).pack(side="left")
-        ttk.Label(bar, textvariable=self.v_status, foreground="#00695c").pack(side="right")
+        self.lbl_status = ttk.Label(bar, textvariable=self.v_status, foreground=OK)
+        self.lbl_status.pack(side="right")
 
         log_box = ttk.LabelFrame(area, text=" 输出 ", padding=(6, 4))
         log_box.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
         log_box.columnconfigure(0, weight=1)
         log_box.rowconfigure(0, weight=1)
-        self.log = tk.Text(log_box, height=12, wrap="word", state="disabled", font=("Consolas", 9))
+        self.log = tk.Text(
+            log_box, height=12, wrap="word", state="disabled", font=("Consolas", 9),
+            background=CARD, foreground=TEXT, relief="solid", borderwidth=1,
+            highlightthickness=1, highlightcolor=BORDER, highlightbackground=BORDER,
+            insertbackground=TEXT,
+        )
         self.log.grid(row=0, column=0, sticky="nsew")
         bar_y = ttk.Scrollbar(log_box, orient="vertical", command=self.log.yview)
         bar_y.grid(row=0, column=1, sticky="ns")
         self.log.configure(yscrollcommand=bar_y.set)
-        self.log.tag_configure("err", foreground="#b00020")
+        self.log.tag_configure("err", foreground=DANGER)
 
     # ------------------------------------------------------------------ #
     # 布局小助手
@@ -544,7 +550,7 @@ class IpatoolGui:
             ttk.Button(box, text="浏览…", width=8, command=browse).grid(row=row, column=col, padx=(6, 0), pady=3)
             col += 1
         if hint:
-            ttk.Label(box, text=hint, foreground="#666666").grid(row=row, column=col, sticky="w", padx=(8, 0), pady=3)
+            ttk.Label(box, text=hint, style="Muted.TLabel").grid(row=row, column=col, sticky="w", padx=(8, 0), pady=3)
 
     def _combo(self, box, row, label, var, values):
         ttk.Label(box, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=3)
@@ -556,22 +562,6 @@ class IpatoolGui:
         path = filedialog.askopenfilename(title="选择文件", filetypes=filetypes or [("所有文件", "*.*")])
         if path:
             var.set(path)
-
-    def _pick_ka_dylib(self) -> None:
-        self._pick_file(self.v_ka_dylib, [("动态库", "*.dylib"), ("所有文件", "*.*")])
-
-    def _pick_files_dylib(self) -> None:
-        self._pick_file(self.v_files_dylib, [("动态库", "*.dylib"), ("所有文件", "*.*")])
-
-    def _pick_panel_dylib(self) -> None:
-        self._pick_file(self.v_panel_dylib, [("动态库", "*.dylib"), ("所有文件", "*.*")])
-
-    def _sync_panel(self, panel_clicked: bool) -> None:
-        # --panel 与 --no-panel 互斥，后点亮的那个赢
-        if panel_clicked:
-            self.v_no_panel.set(False)
-        else:
-            self.v_panel.set(False)
 
     def _add_dylib(self) -> None:
         paths = filedialog.askopenfilenames(title="选择要注入的 dylib", filetypes=[("动态库", "*.dylib"), ("所有文件", "*.*")])
@@ -585,9 +575,18 @@ class IpatoolGui:
             self.list_dylibs.delete(index)
             del self.custom_dylibs[index]
 
+    def _clear_dylib(self) -> None:
+        self.list_dylibs.delete(0, "end")
+        self.custom_dylibs.clear()
+
     # ------------------------------------------------------------------ #
     # 日志
     # ------------------------------------------------------------------ #
+    def _set_status(self, text: str, kind: str = "ok") -> None:
+        """状态文字 + 颜色：ok 绿 / run 蓝 / err 红。"""
+        self.v_status.set(text)
+        self.lbl_status.configure(foreground={"ok": OK, "run": ACCENT, "err": DANGER}.get(kind, OK))
+
     def _append(self, text: str, tag: str | None = None) -> None:
         if not text:
             return
@@ -630,7 +629,7 @@ class IpatoolGui:
         self.busy = True
         for btn in self.action_buttons:
             btn.configure(state="disabled")
-        self.v_status.set("运行中…")
+        self._set_status("运行中…", "run")
         self._append(f"\n$ {_format_argv(argv)}\n")
         threading.Thread(target=self._work, args=(argv, task), daemon=True).start()
 
@@ -660,11 +659,11 @@ class IpatoolGui:
         for btn in self.action_buttons:
             btn.configure(state="normal")
         if code == 0:
-            self.v_status.set("完成")
+            self._set_status("完成")
             if task in ("inject", "modify"):
                 messagebox.showinfo("完成", "处理完成，输出文件已生成。")
             return
-        self.v_status.set(f"失败（退出码 {code}）")
+        self._set_status(f"失败（退出码 {code}）", "err")
         self._append(f"任务失败，退出码 {code}\n", "err")
         if task not in CAPTURE_TASKS:
             messagebox.showerror("执行失败", f"任务未能完成，退出码 {code}。\n详情见下方日志。")
@@ -778,35 +777,6 @@ class IpatoolGui:
             messagebox.showwarning("缺少输入", "请先选择要处理的 IPA 文件或已解包目录。")
             return None
         argv = ["inject", src]
-
-        if self.v_keep_alive.get():
-            argv.append("--keep-alive")
-            _add(argv, "--keep-alive-dylib", self.v_ka_dylib.get())
-            _add(argv, "--keep-alive-start-on", _opt(self.v_ka_start_on))
-            _add(argv, "--keep-alive-audio-file", self.v_ka_audio_file.get())
-            _add(argv, "--keep-alive-renew-lead-time", self.v_ka_renew_lead_time.get())
-            _add(argv, "--keep-alive-refresh-interval", self.v_ka_refresh_interval.get())
-            _flag(argv, "--keep-alive-no-audio", self.v_ka_no_audio.get())
-            _flag(argv, "--keep-alive-no-task-renew", self.v_ka_no_task_renew.get())
-            _flag(argv, "--keep-alive-location", self.v_ka_location.get())
-            _flag(argv, "--keep-alive-location-indicator", self.v_ka_location_indicator.get())
-            _flag(argv, "--keep-alive-fetch", self.v_ka_fetch.get())
-            _flag(argv, "--keep-alive-processing", self.v_ka_processing.get())
-
-        if self.v_files.get():
-            argv.append("--files")
-            _add(argv, "--files-dylib", self.v_files_dylib.get())
-            _add(argv, "--files-root", self.v_files_root.get())
-            _add(argv, "--files-import-dir", self.v_files_import_dir.get())
-            _flag(argv, "--no-files-sharing", self.v_no_files_sharing.get())
-
-        if self.v_no_panel.get():
-            argv.append("--no-panel")
-        elif self.v_panel.get():
-            argv.append("--panel")
-        _add(argv, "--panel-dylib", self.v_panel_dylib.get())
-        _add(argv, "--panel-title", self.v_panel_title.get())
-
         for path in self.custom_dylibs:
             argv += ["--dylib", path]
 
@@ -816,13 +786,11 @@ class IpatoolGui:
 
         argv += self._common_args()
 
-        if not self.custom_dylibs and not any(
-            (self.v_keep_alive.get(), self.v_files.get(),
-             self.v_panel.get(), self.v_background_mode.get().strip(), self.v_allow_arbitrary_loads.get())
-        ):
+        if not self.custom_dylibs and not self.v_background_mode.get().strip() \
+                and not self.v_allow_arbitrary_loads.get():
             messagebox.showwarning(
                 "没有要注入的东西",
-                "请勾选后台保活 / 文件导入导出 / 悬浮窗，或添加自定义 dylib。",
+                "请至少添加一个 dylib；只想改 Info.plist 的话，填后台模式或勾上「允许明文 HTTP」。",
             )
             return None
         return argv
@@ -856,7 +824,7 @@ class IpatoolGui:
             self._load_info()
             return
         if index == 3:  # 签名页：只放配置，没有可执行的动作
-            messagebox.showinfo("提示", "签名参数是「改 ID / 名称」和「注入功能」两个页签共用的，请切到对应页签执行。")
+            messagebox.showinfo("提示", "签名参数是「改 ID / 名称」和「注入 dylib」两个页签共用的，请切到对应页签执行。")
             return
         task = "modify" if index == 1 else "inject"
         argv = self._modify_argv() if index == 1 else self._inject_argv()
