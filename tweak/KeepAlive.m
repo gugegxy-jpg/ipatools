@@ -304,6 +304,7 @@ static BOOL IPATPIPWriteVideoFile(NSString *path, UIImage *image) {
 @property (nonatomic, assign) BOOL preparing;   // 正在生成占位视频
 @property (nonatomic, assign) BOOL active;      // 正在画中画
 @property (nonatomic, assign) BOOL starting;
+@property (nonatomic, assign) BOOL enlarged;    // 画面已经放大到整屏试过
 @property (nonatomic, assign) BOOL gaveUp;      // 已确认用不了（系统/包不支持），不再重试
 @property (nonatomic, assign) NSInteger prepareAttempts;
 /// 不可用的具体原因，面板上直接显示，省得猜
@@ -538,6 +539,11 @@ static BOOL IPATPIPWriteVideoFile(NSString *path, UIImage *image) {
         });
         return;
     }
+    // 还是不行就把画面放大到整屏再试：系统对「多小的画面算有内容」没个准数，
+    // 有些 App 里 160x90 仍被当成没有可播放的画面。反正 alpha 0.02、不吃触摸，
+    // 铺满也看不出来
+    if (attempt == 25 && !self.enlarged) [self enlargeHostView];
+
     // 系统什么时候允许进画中画由它自己定（要等画面渲染出来 / 音频会话就位），
     // 原来只等 1.2 秒，占位视频刚起播时经常来不及，就被判成「不可用」了。
     // 放宽到 5 秒：这段时间静音音频一直在播，不会断保活
@@ -553,6 +559,22 @@ static BOOL IPATPIPWriteVideoFile(NSString *path, UIImage *image) {
                    dispatch_get_main_queue(), ^{
         [weakSelf attemptStart:attempt + 1];
     });
+}
+
+/// 把宿主视图和 playerLayer 放大到整个窗口（alpha 0.02，看不出来也吃不到触摸）。
+/// 系统判断「有没有可播放的画面」时会看这层画面，太小会被当成没有内容
+- (void)enlargeHostView {
+    if (self.enlarged || !self.hostView) return;
+    UIWindow *window = self.hostView.window ?: IPATAppKeyWindowExcluding(nil);
+    if (!window) return;
+    self.enlarged = YES;
+    CGRect frame = window.bounds;
+    if (frame.size.width < 1.0 || frame.size.height < 1.0) return;
+    self.hostView.frame = frame;
+    self.playerLayer.frame = frame;
+    [self.hostView setNeedsLayout];
+    [self.hostView layoutIfNeeded];
+    IPATKALog(@"画中画画面放大到整屏再试（%.0fx%.0f）", frame.size.width, frame.size.height);
 }
 
 /// 起不来的时候把关键状态一次打全，省得反复猜：系统支持与否、播放状态、画面尺寸、
