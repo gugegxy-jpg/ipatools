@@ -750,12 +750,14 @@ static BOOL IPATFbZipCollectEntry(NSString *path, NSString *name,
 
     [entries addObject:@{@"path": [NSNull null], @"name": [name stringByAppendingString:@"/"],
                          @"size": @0, @"dir": @YES}];
+    NSUInteger found = 0;
     NSDirectoryEnumerator<NSURL *> *en =
         [fm enumeratorAtURL:[NSURL fileURLWithPath:path]
          includingPropertiesForKeys:@[NSURLIsDirectoryKey, NSURLFileSizeKey]
                             options:0
                        errorHandler:^BOOL(NSURL *url, NSError *e) { return YES; }];
     for (NSURL *item in en) {
+        found++;
         NSString *rel = [item.path substringFromIndex:MIN(path.length, item.path.length)];
         rel = [rel stringByReplacingOccurrencesOfString:@"/" withString:@"" options:0 range:NSMakeRange(0, 1)];
         NSString *entryName = [name stringByAppendingPathComponent:rel];
@@ -770,6 +772,19 @@ static BOOL IPATFbZipCollectEntry(NSString *path, NSString *name,
             [entries addObject:@{@"path": item.path, @"name": entryName,
                                  @"size": @(size), @"dir": @NO}];
             *totalBytes += size;
+        }
+    }
+    // 兜底：极少数情况下深枚举会静默返回空，换目录列表再收一遍
+    if (found == 0) {
+        IPATFbLog(@"目录深枚举为空，用 contentsOfDirectory 兜底：%@", path);
+        NSArray<NSURL *> *children =
+            [fm contentsOfDirectoryAtURL:[NSURL fileURLWithPath:path]
+              includingPropertiesForKeys:@[NSURLIsDirectoryKey]
+                                 options:0
+                                   error:NULL];
+        for (NSURL *item in children) {
+            NSString *entryName = [name stringByAppendingPathComponent:item.lastPathComponent];
+            if (!IPATFbZipCollectEntry(item.path, entryName, entries, totalBytes, error)) return NO;
         }
     }
     return YES;
@@ -1040,6 +1055,7 @@ fail:
     [self postStatus:[NSString stringWithFormat:@"正在打包 %ld 项为 zip…", (long)valid.count]];
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        IPATFbLog(@"开始导出 %ld 项：%@", (long)valid.count, valid);
         // 先收集条目（顺带统计总体积），再打包
         NSMutableArray<NSDictionary *> *entries = [NSMutableArray array];
         uint64_t totalBytes = 0;
@@ -1048,6 +1064,20 @@ fail:
         for (NSString *path in valid) {
             NSString *name = path.lastPathComponent;
             if (!IPATFbZipCollectEntry(path, name, entries, &totalBytes, &error)) { ok = NO; break; }
+        }
+        NSInteger collectedFiles = 0, collectedDirs = 0;
+        for (NSDictionary *e in entries) {
+            if ([e[@"dir"] boolValue]) collectedDirs++; else collectedFiles++;
+        }
+        IPATFbLog(@"收集完成：文件 %ld、目录 %ld，共 %.2f GB",
+                  (long)collectedFiles, (long)collectedDirs, totalBytes / 1073741824.0);
+        // 收集不到任何文件就不出包：免得生成一个空 zip，让人以为导入坏了
+        if (ok && collectedFiles == 0) {
+            ok = NO;
+            error = [NSError errorWithDomain:@"IPAToolFiles" code:10
+                                 userInfo:@{NSLocalizedDescriptionKey:
+                                            @"没有收集到任何文件（目录可能已被游戏清空或正在重写，"
+                                            "等热更结束再试，或改选具体文件）"}];
         }
         if (ok) {
             ok = IPATFbZipWrite(entries, totalBytes, zipPath,

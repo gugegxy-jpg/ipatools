@@ -20,3 +20,8 @@ venv/
 *.key
 
 .DS_Store
+
+# 本地验证用临时产物
+sim_*/
+simrun*.txt
+.tmp-*
