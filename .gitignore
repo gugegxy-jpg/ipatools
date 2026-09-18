@@ -25,3 +25,6 @@ venv/
 sim_*/
 simrun*.txt
 .tmp-*
+
+# 从手机上导出来的日志
+*.log
