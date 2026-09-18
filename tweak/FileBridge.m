@@ -893,6 +893,11 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
 }
 
 - (void)start {
+    // 三个功能合编在同一个 dylib 里，不检查的话没选文件功能也会挂上悬浮窗入口
+    if (!IPATFbEnabled()) {
+        IPATFbLog(@"文件功能未启用（IPAToolFiles.Enabled = NO）");
+        return;
+    }
     NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
     [center addObserver:self
                selector:@selector(handlePanelChange:)

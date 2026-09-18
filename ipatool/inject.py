@@ -10,8 +10,12 @@ dylib 注入：把动态库放进 App 的 Frameworks/ 并给主可执行文件�
     （UIFileSharingEnabled / LSSupportsOpeningDocumentsInPlace）
   - 用来把游戏热更资源导出到「文件」App，或从「文件」App 导回沙盒
 
-上面这些配置都会附带注入 ControlPanel.dylib（App 内的悬浮窗），
-用它在 App 里实时开关这些功能；用 --no-panel 可以不带。
+上面这些功能都合编在同一个 IPATool.dylib 里（内含悬浮窗），注入一次即可，
+用哪个功能由对应的 Info.plist 配置字典决定（没用到的会写成 Enabled=NO）；
+用 --no-panel 可以不带悬浮窗。
+
+需要单独出包时（比如改了某个功能只想重编它）可以用 --keep-alive-dylib /
+--files-dylib / --panel-dylib 指定单独的 dylib，那时退回一功能一库的注入方式。
 """
 from __future__ import annotations
 
@@ -45,11 +49,18 @@ FILES_INFO_KEY = "IPAToolFiles"
 FILES_NAME = "FileBridge"
 FILES_DEFAULT_IMPORT_DIR = "Documents"
 
+# 三个内置功能默认合编成一个 IPATool.dylib：只注入一次，
+# 开哪些功能由 Info.plist 里 IPAToolKeepAlive / IPAToolControl / IPAToolFiles 的 Enabled 决定。
+# 单功能 dylib 仍然支持（显式给了某个功能的 dylib 路径时就用老的分离注入）。
+MERGED_DYLIB_NAME = "IPATool.dylib"
+MERGED_NAME = "IPATool"
+
 # 注入的内置 tweak：名字 -> (dylib 文件名, 环境变量)
 TWEAKS = {
     "KeepAlive": (KEEP_ALIVE_DYLIB_NAME, "IPATOOL_KEEPALIVE_DYLIB"),
     PANEL_NAME: (CONTROL_PANEL_DYLIB_NAME, "IPATOOL_CONTROL_DYLIB"),
     FILES_NAME: (FILES_DYLIB_NAME, "IPATOOL_FILES_DYLIB"),
+    MERGED_NAME: (MERGED_DYLIB_NAME, "IPATOOL_DYLIB"),
 }
 
 
@@ -146,6 +157,11 @@ def locate_files_dylib(explicit: str | None = None, auto_build: bool = True, log
     return locate_tweak_dylib(FILES_NAME, explicit=explicit, auto_build=auto_build, log=log)
 
 
+def locate_merged_dylib(explicit: str | None = None, auto_build: bool = True, log=print) -> str:
+    """定位合编了三个功能的 IPATool.dylib。"""
+    return locate_tweak_dylib(MERGED_NAME, explicit=explicit, auto_build=auto_build, log=log)
+
+
 # --------------------------------------------------------------------------- #
 # 主可执行文件
 # --------------------------------------------------------------------------- #
@@ -204,6 +220,7 @@ def inject_dylib(
 
 def build_keep_alive_options(
     silent_audio: bool | None = None,
+    enabled: bool | None = None,
     start_on: str | None = None,
     task_renew: bool | None = None,
     renew_lead_time: float | None = None,
@@ -216,6 +233,8 @@ def build_keep_alive_options(
 ) -> dict:
     """只写入显式指定的项，其余交给 dylib 里的默认值。"""
     options: dict = {}
+    if enabled is not None:
+        options["Enabled"] = enabled
     if silent_audio is not None:
         options["SilentAudio"] = silent_audio
     if start_on:

@@ -469,28 +469,44 @@ def cmd_inject(args) -> int:
         print(f"Bundle ID   : {app.identifier}")
 
         planned: list[tuple[str, str]] = []  # (dylib 路径, 注入名)
-        if keep_alive_enabled:
-            ka_dylib = inject_mod.locate_keep_alive_dylib(
-                explicit=args.keep_alive_dylib,
+        # 三个功能合编在同一个 IPATool.dylib 里：用到任意一个就只注入这一个 dylib，
+        # 没用到的功能在 Info.plist 里显式关掉。只有显式给了某个功能的 dylib 路径时，
+        # 才退回老的「一个功能一个 dylib」注入方式
+        merged = bool(
+            (keep_alive_enabled or files_enabled or panel_enabled)
+            and not (args.keep_alive_dylib or args.files_dylib or args.panel_dylib)
+        )
+        if merged:
+            tool_dylib = inject_mod.locate_merged_dylib(
                 log=lambda m: print(f"  {m}"),
             )
-            planned.append((ka_dylib, inject_mod.KEEP_ALIVE_DYLIB_NAME))
-            print(f"保活 tweak  : {ka_dylib}")
-        if files_enabled:
-            files_dylib = inject_mod.locate_files_dylib(
-                explicit=args.files_dylib,
-                log=lambda m: print(f"  {m}"),
-            )
-            planned.append((files_dylib, inject_mod.FILES_DYLIB_NAME))
-            print(f"文件导入导出: {files_dylib}")
-        if panel_enabled:
-            panel_dylib = inject_mod.locate_control_panel_dylib(
-                explicit=args.panel_dylib,
-                log=lambda m: print(f"  {m}"),
-            )
-            planned.append((panel_dylib, inject_mod.CONTROL_PANEL_DYLIB_NAME))
-            print(f"悬浮窗      : {panel_dylib}")
-            print("              （App 内会出现可拖动的悬浮按钮，点开即可开关上面这些功能）")
+            planned.append((tool_dylib, inject_mod.MERGED_DYLIB_NAME))
+            print(f"内置 tweak  : {tool_dylib}")
+            print("              （保活 / 悬浮窗 / 文件导入导出合编在一个 dylib 里，"
+                  "没用到的功能在 Info.plist 里关掉）")
+        else:
+            if keep_alive_enabled:
+                ka_dylib = inject_mod.locate_keep_alive_dylib(
+                    explicit=args.keep_alive_dylib,
+                    log=lambda m: print(f"  {m}"),
+                )
+                planned.append((ka_dylib, inject_mod.KEEP_ALIVE_DYLIB_NAME))
+                print(f"保活 tweak  : {ka_dylib}")
+            if files_enabled:
+                files_dylib = inject_mod.locate_files_dylib(
+                    explicit=args.files_dylib,
+                    log=lambda m: print(f"  {m}"),
+                )
+                planned.append((files_dylib, inject_mod.FILES_DYLIB_NAME))
+                print(f"文件导入导出: {files_dylib}")
+            if panel_enabled:
+                panel_dylib = inject_mod.locate_control_panel_dylib(
+                    explicit=args.panel_dylib,
+                    log=lambda m: print(f"  {m}"),
+                )
+                planned.append((panel_dylib, inject_mod.CONTROL_PANEL_DYLIB_NAME))
+                print(f"悬浮窗      : {panel_dylib}")
+                print("              （App 内会出现可拖动的悬浮按钮，点开即可开关上面这些功能）")
         for path in args.dylib or []:
             planned.append((path, os.path.basename(path)))
 
@@ -534,6 +550,10 @@ def cmd_inject(args) -> int:
             )
             if not silent_audio:
                 warnings.append("已关闭静音音频，保活只能靠后台任务续期，通常只能多撑几十秒")
+        elif merged:
+            # 合编 dylib 里保活也会加载，不显式关掉它就会自己开始播静音音频
+            settings.append((inject_mod.KEEP_ALIVE_INFO_KEY,
+                             inject_mod.build_keep_alive_options(enabled=False), "后台保活配置"))
 
         if panel_enabled:
             panel_options = inject_mod.build_panel_options(
@@ -541,6 +561,9 @@ def cmd_inject(args) -> int:
                 enabled=True if args.panel else None,
             )
             settings.append((inject_mod.CONTROL_PANEL_INFO_KEY, panel_options, "悬浮窗"))
+        elif merged:
+            settings.append((inject_mod.CONTROL_PANEL_INFO_KEY,
+                             inject_mod.build_panel_options(enabled=False), "悬浮窗"))
 
         if files_enabled:
             files_options = inject_mod.build_files_options(
@@ -551,6 +574,9 @@ def cmd_inject(args) -> int:
             settings.append((inject_mod.FILES_INFO_KEY, files_options, "文件导入导出"))
             if not panel_enabled:
                 warnings.append("没有注入悬浮窗，文件导入导出在 App 里没有入口，建议配合 --panel 使用")
+        elif merged:
+            settings.append((inject_mod.FILES_INFO_KEY,
+                             inject_mod.build_files_options(enabled=False), "文件导入导出"))
 
         if plist_touched:
             plist_changes, plist_warnings = inject_mod.configure_plist(

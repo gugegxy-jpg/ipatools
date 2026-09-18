@@ -5,8 +5,9 @@
 //  设计要点：
 //    1. 自己建一个高层级 UIWindow（canBecomeKeyWindow = NO）：
 //       不抢 App 的 keyWindow，空白区域的触摸直接穿透给 App，不影响正常操作；面板展开时会临时铺一层透明层接住「点空白处收起」，收起后即撤掉。
-//    2. 与各功能 dylib 只用「通知 + NSUserDefaults」通信（见 IPATControlShared.h）：
-//       面板可以单独注入，也允许只注入其中一个功能，谁先加载都行。
+//    2. 与各功能只用「通知 + NSUserDefaults」通信（见 IPATControlShared.h）：
+//       三个功能默认合编在同一个 IPATool.dylib 里，通信方式不变；
+//       面板可以单独注入，也允许只开其中一个功能，谁先加载都行。
 //    3. 各功能把自己支持的开关注册给面板，面板按注册结果动态生成界面，
 //       所以以后加新功能不用改这个文件。
 //    4. 注册里除了开关(switch)、分段(segment)，还支持动作行(action)：

@@ -3,14 +3,19 @@
 # 编译注入用的 dylib（后台保活 / 悬浮控制面板 / 文件导入导出）。需要 macOS + Xcode 命令行工具：
 #   xcode-select --install
 #
-#   ./tweak/build.sh                               编译全部（三个目标）
-#   IPATOOL_TARGETS=KeepAlive ./tweak/build.sh     只编译指定目标
+#   ./tweak/build.sh                               默认只出 IPATool.dylib（三个功能合编在一起）
+#   IPATOOL_TARGETS="KeepAlive FileBridge" ./tweak/build.sh   只编译指定目标（单独出包）
+#
+# 三个功能默认合编成一个 IPATool.dylib：注入一次就够，开哪些功能由 Info.plist 里
+# 对应的 IPAToolKeepAlive / IPAToolControl / IPAToolFiles 的 Enabled 决定。
+# 合编是安全的：三份源码的顶层函数全是 static，类名前缀各不相同，
+# 各自的 constructor 也是 static，链接时不会撞符号。
 #
 # 可通过环境变量调整：
 #   IPATOOL_MIN_IOS   最低系统版本，默认 14.0
 #   IPATOOL_ARCHS     架构列表，默认 "arm64"（可写 "arm64 arm64e"）
 #   IPATOOL_OUT_DIR   产物目录，默认 tweak/build
-#   IPATOOL_TARGETS   目标列表，默认 "KeepAlive ControlPanel FileBridge"
+#   IPATOOL_TARGETS   目标列表，默认 "IPATool"（合并目标）；也可写单个功能名
 #
 set -euo pipefail
 
@@ -18,7 +23,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT_DIR="${IPATOOL_OUT_DIR:-$HERE/build}"
 MIN_IOS="${IPATOOL_MIN_IOS:-14.0}"
 ARCHS="${IPATOOL_ARCHS:-arm64}"
-TARGETS="${IPATOOL_TARGETS:-KeepAlive ControlPanel FileBridge}"
+TARGETS="${IPATOOL_TARGETS:-IPATool}"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "错误：编译 iOS dylib 需要 macOS + Xcode 命令行工具（当前系统：$(uname -s)）" >&2
@@ -37,25 +42,52 @@ for arch in $ARCHS; do
   ARCH_FLAGS+=(-arch "$arch")
 done
 
+# 目标 -> 源文件列表（合并目标 IPATool 把三份源码编进同一个 dylib）
+sources_for_target() {
+  case "$1" in
+    IPATool)
+      printf '%s\n' "$HERE/KeepAlive.m" "$HERE/ControlPanel.m" "$HERE/FileBridge.m"
+      ;;
+    *)
+      printf '%s\n' "$HERE/$1.m"
+      ;;
+  esac
+}
+
+# 源文件 -> 还需要额外链接的框架（合并目标取各源文件依赖的并集）
+frameworks_for_source() {
+  case "$(basename "$1" .m)" in
+    KeepAlive)   printf '%s\n' -framework CoreLocation -weak_framework BackgroundTasks ;;
+    # UniformTypeIdentifiers 是 iOS 14 才有的框架，用 weak 链接兼容更低的部署目标
+    FileBridge)  printf '%s\n' -weak_framework UniformTypeIdentifiers -lz ;;
+  esac
+}
+
 build_target() {
   local name="$1"
-  local src="$HERE/$name.m"
   local out="$OUT_DIR/$name.dylib"
-  local extra=()
+  local line flag
+  local -a srcs=()
+  local -a extra=()
 
-  if [[ ! -f "$src" ]]; then
-    echo "跳过 $name：找不到 $src" >&2
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    if [[ ! -f "$line" ]]; then
+      echo "跳过 $name：找不到 $line" >&2
+      return 1
+    fi
+    srcs+=("$line")
+    while IFS= read -r flag; do
+      if [[ -n "$flag" ]]; then extra+=("$flag"); fi
+    done < <(frameworks_for_source "$line")
+  done < <(sources_for_target "$name")
+
+  if [[ ${#srcs[@]} -eq 0 ]]; then
+    echo "跳过 $name：没有源文件" >&2
     return 1
   fi
 
-  case "$name" in
-    KeepAlive)     extra=(-framework CoreLocation -weak_framework BackgroundTasks) ;;
-    ControlPanel)  extra=() ;;
-    # UniformTypeIdentifiers 是 iOS 14 才有的框架，用 weak 链接兼容更低的部署目标
-    FileBridge)    extra=(-weak_framework UniformTypeIdentifiers -lz) ;;
-  esac
-
-  echo "编译 $name: min-iOS=$MIN_IOS archs=$ARCHS"
+  echo "编译 $name: min-iOS=$MIN_IOS archs=$ARCHS 源码=${#srcs[@]} 个"
 
   # 注意两点：
   # 1) 新版 iOS SDK 里 UIKit 不再间接导出 CoreGraphics 的 C 符号，用到
@@ -72,7 +104,7 @@ build_target() {
     -framework QuartzCore \
     ${extra[@]+"${extra[@]}"} \
     -install_name "@executable_path/Frameworks/$name.dylib" \
-    -o "$out" "$src"; then
+    -o "$out" "${srcs[@]}"; then
     echo "编译失败: $name - 详见上方 clang 输出" >&2
     return 1
   fi

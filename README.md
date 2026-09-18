@@ -208,7 +208,7 @@ python -m ipatool inject game.ipa --keep-alive --keep-alive-audio-file quiet.m4a
 > - `--keep-alive-location` 耗电、需定位权限，且不符合 App Store 审核条款，只建议自用或内部分发。
 > - 真机排查看控制台里 `[ipatool-keepalive]` 前缀的日志。
 
-### 应用内悬浮控制面板（`ControlPanel.dylib`）
+### 应用内悬浮控制面板（悬浮窗）
 
 注入 `--keep-alive` 或 `--files` 时会**顺带注入一个悬浮窗**：App 里出现一个可拖动的小胶囊按钮，点开就是控制面板，能实时开关上面这些功能，不用改包重启。
 
@@ -259,7 +259,7 @@ python -m ipatool inject game.ipa --files -o out.ipa                     # 文�
 
 ### 文件导入导出（`--files`）
 
-游戏热更资源（补丁、配置、存档）一般躺在 App 沙盒里，PC 上不好直接取。注入 `FileBridge.dylib` 后，可以在 App 内的悬浮面板里**浏览沙盒、导出到系统「文件」App，或从「文件」App 导回来**，不用连电脑。
+游戏热更资源（补丁、配置、存档）一般躺在 App 沙盒里，PC 上不好直接取。注入文件功能后，可以在 App 内的悬浮面板里**浏览沙盒、导出到系统「文件」App，或从「文件」App 导回来**，不用连电脑。
 
 ```bash
 python -m ipatool inject game.ipa --files -o out.ipa                      # 注入文件导入导出（默认带悬浮窗）
@@ -324,14 +324,22 @@ python -m ipatool inject game.ipa --files --no-files-sharing -o out.ipa   # 不�
 
 ### 编译内置 tweak
 
+三个内置功能（保活 / 悬浮窗 / 文件导入导出）的源码是分开的，但**默认合编成一个 `IPATool.dylib`**：
+注入一次就够，开哪些功能由 `Info.plist` 里 `IPAToolKeepAlive` / `IPAToolControl` / `IPAToolFiles`
+的 `Enabled` 决定（`ipatool inject` 会把没用到的功能自动写成 `Enabled=NO`）。
+三者之间只用「通知 + NSUserDefaults」通信（见 `tweak/IPATControlShared.h`），
+顶层函数全是 `static`、类名前缀各不相同，所以合编不会撞符号。
+
 ```bash
-./tweak/build.sh                                       # 产物：tweak/build/{KeepAlive,ControlPanel,FileBridge}.dylib
-IPATOOL_TARGETS=KeepAlive ./tweak/build.sh             # 只编译保活
-IPATOOL_TARGETS=ControlPanel ./tweak/build.sh          # 只编译悬浮窗
-IPATOOL_TARGETS=FileBridge ./tweak/build.sh            # 只编译文件导入导出
+./tweak/build.sh                                       # 产物：tweak/build/IPATool.dylib
+IPATOOL_TARGETS=KeepAlive ./tweak/build.sh             # 只编译保活（单独出一个 dylib）
+IPATOOL_TARGETS="KeepAlive FileBridge" ./tweak/build.sh  # 一次编译多个目标
 IPATOOL_ARCHS="arm64 arm64e" ./tweak/build.sh
 IPATOOL_MIN_IOS=15.0 ./tweak/build.sh
 ```
+
+想让某个功能用自己编译的单独 dylib，注入时显式给路径即可，
+那时会退回「一个功能一个 dylib」的老方式（`--keep-alive-dylib` / `--files-dylib` / `--panel-dylib`）。
 
 > ⚠️ 这些 tweak 的源码是按 Apple 公开 API 写的，但我无法在这里编译/真机验证（需要 macOS + Xcode + 真实设备）。
 >
@@ -362,5 +370,5 @@ tweak/
   ControlPanel.m        应用内悬浮控制面板（悬浮按钮 + 开关小窗口）
   FileBridge.m          沙盒文件浏览 / 导出到「文件」App / 从「文件」App 导入
   IPATControlShared.h   面板与各功能 dylib 之间的约定（通知名 / 配置键）
-  build.sh              编译脚本（需要 macOS + Xcode，可编译单个目标）
+  build.sh              编译脚本（需要 macOS + Xcode，默认把三个功能合编成一个 IPATool.dylib）
 ```
