@@ -28,7 +28,11 @@
 /// build.sh 会把 tweak/AppIcon20x20@2x.png 转成 C 字节数组编译进 dylib
 extern UIImage *IPAToolIconImage(void);
 
-#define IPATCpLog(fmt, ...) NSLog(@"[ipatool-panel] " fmt, ##__VA_ARGS__)
+#define IPATCpLog(fmt, ...) do { \
+    NSString *__ipat_line = [NSString stringWithFormat:(fmt), ##__VA_ARGS__]; \
+    NSLog(@"[ipatool-panel] %@", __ipat_line); \
+    IPATAppendLogLine(__ipat_line); \
+} while (0)
 
 #pragma mark - 布局常量
 

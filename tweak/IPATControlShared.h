@@ -18,6 +18,52 @@
 #define IPATOOL_CONTROL_SHARED_H
 
 #include <math.h>
+#import <Foundation/Foundation.h>
+
+#pragma mark - 日志
+
+/// 除了 NSLog，再往 App 沙盒里写一份（Documents/ipatool.log）。
+/// 没有 Mac / Xcode 时没法看系统日志，落盘之后可以直接在面板里
+///「文件 → 找到 ipatool.log → 导出」把日志拿出来。
+/// 写失败就当没这回事，绝不能因为记日志把 App 搞出问题。
+static void IPATAppendLogLine(NSString *line) {
+    static NSString *logPath;
+    static NSDateFormatter *formatter;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSArray<NSString *> *dirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                                                                       NSUserDomainMask, YES);
+        logPath = [[dirs firstObject] stringByAppendingPathComponent:@"ipatool.log"];
+        formatter = [[NSDateFormatter alloc] init];
+        formatter.dateFormat = @"MM-dd HH:mm:ss";
+        formatter.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    });
+    if (logPath.length == 0 || !formatter) return;
+
+    NSFileManager *manager = [NSFileManager defaultManager];
+    // 别让日志无限长：超过 512KB 就从头再来
+    NSDictionary *attrs = [manager attributesOfItemAtPath:logPath error:nil];
+    if (attrs && [attrs[NSFileSize] unsignedLongLongValue] > 512 * 1024) {
+        [manager removeItemAtPath:logPath error:nil];
+    }
+    NSString *text = [NSString stringWithFormat:@"%@ %@\n",
+                      [formatter stringFromDate:[NSDate date]], line];
+    NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
+    if (!data) return;
+    if (![manager fileExistsAtPath:logPath]) {
+        [data writeToFile:logPath atomically:YES];
+        return;
+    }
+    NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:logPath];
+    if (!handle) return;
+    @try {
+        [handle seekToEndOfFile];
+        [handle writeData:data];
+    } @catch (NSException *exception) {
+        // 忽略
+    }
+    [handle closeFile];
+}
 
 #pragma mark - 通知名
 

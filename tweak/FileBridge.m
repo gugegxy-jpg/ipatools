@@ -38,7 +38,11 @@
 #include <zlib.h>
 #import "IPATControlShared.h"
 
-#define IPATFbLog(fmt, ...) NSLog(@"[ipatool-files] " fmt, ##__VA_ARGS__)
+#define IPATFbLog(fmt, ...) do { \
+    NSString *__ipat_line = [NSString stringWithFormat:(fmt), ##__VA_ARGS__]; \
+    NSLog(@"[ipatool-files] %@", __ipat_line); \
+    IPATAppendLogLine(__ipat_line); \
+} while (0)
 
 /// 动作行的标识（只是本 dylib 内部的字符串，不写 NSUserDefaults）
 static NSString *const IPATFbActionBrowse = @"files.browse";

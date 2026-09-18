@@ -109,7 +109,11 @@ static NSString *IPATKAString(NSString *key) {
 }
 
 #define IPATKALog(fmt, ...) \
-    do { if (IPATKABool(@"Log", YES)) NSLog(@"[ipatool-keepalive] " fmt, ##__VA_ARGS__); } while (0)
+    do { if (IPATKABool(@"Log", YES)) { \
+        NSString *__ipat_line = [NSString stringWithFormat:(fmt), ##__VA_ARGS__]; \
+        NSLog(@"[ipatool-keepalive] %@", __ipat_line); \
+        IPATAppendLogLine(__ipat_line); \
+    } } while (0)
 
 static NSString *const IPATKARefreshTaskID = @"com.ipatool.keepalive.refresh";
 static NSString *const IPATKAProcessingTaskID = @"com.ipatool.keepalive.processing";
