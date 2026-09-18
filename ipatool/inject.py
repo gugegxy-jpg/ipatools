@@ -197,6 +197,9 @@ def inject_dylib(
     executable = find_main_executable(app)
 
     logs: list[str] = []
+    # 同名 dylib 已存在就是「覆盖注入」：文件会被换成新的，加载命令不用再动，
+    # 日志要说清是覆盖，别让人以为没注入
+    replaced = os.path.isfile(dest)
     if not dry_run:
         os.makedirs(frameworks, exist_ok=True)
         if os.path.abspath(dylib_path) != os.path.abspath(dest):
@@ -205,7 +208,14 @@ def inject_dylib(
                 shutil.copymode(dylib_path, dest)
             except OSError:
                 pass
-        logs.append(f"dylib 已放入 {os.path.relpath(dest, os.path.dirname(app.path))}")
+    rel = os.path.relpath(dest, os.path.dirname(app.path))
+    if dry_run:
+        logs.append(f"{'将覆盖' if replaced else '将放入'} {rel}"
+                    + ("（该位置已有同名 dylib，会被换成新版本）" if replaced else ""))
+    elif replaced:
+        logs.append(f"dylib 已覆盖（旧文件换成新版本）：{rel}")
+    else:
+        logs.append(f"dylib 已放入 {rel}")
 
     try:
         added, lines = macho.add_dylib(executable, load_path, dry_run=dry_run)
@@ -214,7 +224,8 @@ def inject_dylib(
 
     logs.extend(lines)
     if not added:
-        logs.append(f"{os.path.basename(executable)} 中已存在 {load_path}，未重复添加")
+        logs.append(f"{os.path.basename(executable)} 里已有指向 {load_path} 的加载命令，"
+                    "不需要重复添加——这次只是把同一个位置的 dylib 文件换成了新版本")
     return logs
 
 

@@ -313,7 +313,8 @@ def add_dylib(path: str, dylib_path: str, dry_run: bool = False) -> tuple[bool, 
 
     for index, sl in enumerate(slices):
         if any(d == dylib_path for d in sl.dylibs):
-            logs.append(f"{os.path.basename(path)} [{sl.arch}]: 已存在 {dylib_path}，跳过")
+            logs.append(f"{os.path.basename(path)} [{sl.arch}]: 已有 {dylib_path}，"
+                        "加载命令不重复添加（同一个库加载两次会出问题）")
             continue
 
         cmd_bytes = _dylib_command_bytes(dylib_path, sl.is64, sl.endian)
