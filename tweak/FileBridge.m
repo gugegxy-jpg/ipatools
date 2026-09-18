@@ -173,8 +173,10 @@ static UIViewController *IPATFbTopViewController(void) {
 
 @implementation IPATFbWindow
 
-/// 不抢焦点：键盘输入之类的还是归 App 自己的窗口
-- (BOOL)canBecomeKeyWindow { return NO; }
+/// 必须能当 key window：系统的文档选择器（「文件」App 界面）是远程视图，
+/// 跑在另一个进程里，只有挂在 key window 上才收得到触摸——否则界面出来了
+/// 却完全点不动。平时不抢焦点，只在弹系统界面时才 makeKeyAndVisible
+- (BOOL)canBecomeKeyWindow { return YES; }
 
 @end
 
@@ -226,6 +228,51 @@ static UIWindow *IPATFbAlertWindow(void) {
     return window;
 }
 
+/// App 自己的 key window（排除我们的弹窗窗口）
+static UIWindow *IPATFbAppKeyWindow(void) {
+    UIWindow *alertWindow = IPATFbAlertWindow();
+    NSArray<UIWindow *> *windows = nil;
+    if (@available(iOS 13.0, *)) {
+        NSMutableArray<UIWindow *> *collected = [NSMutableArray array];
+        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+            [collected addObjectsFromArray:((UIWindowScene *)scene).windows];
+        }
+        windows = collected;
+    }
+    if (windows.count == 0) {
+        windows = [UIApplication sharedApplication].windows;
+    }
+    for (UIWindow *candidate in windows) {
+        if (candidate.isKeyWindow && candidate != alertWindow) return candidate;
+    }
+    return nil;
+}
+
+/// 弹系统界面前记下焦点在谁身上，收起后还回去（不然游戏的键盘输入会失灵）
+static UIWindow *IPATFbPreviousKeyWindow = nil;
+
+static void IPATFbTakeKeyWindow(void) {
+    UIWindow *window = IPATFbAlertWindow();
+    if (!window) return;
+    UIWindow *previous = IPATFbAppKeyWindow();
+    if (previous) IPATFbPreviousKeyWindow = previous;
+    if (!window.isKeyWindow) [window makeKeyAndVisible];
+}
+
+static void IPATFbGiveBackKeyWindow(void) {
+    UIWindow *previous = IPATFbPreviousKeyWindow;
+    IPATFbPreviousKeyWindow = nil;
+    if (previous && !previous.isKeyWindow) {
+        [previous makeKeyAndVisible];
+        return;
+    }
+    if (!previous) {
+        UIWindow *app = IPATFbAppKeyWindow();
+        if (app && !app.isKeyWindow) [app makeKeyAndVisible];
+    }
+}
+
 /// 弹窗收起之后把悬浮窗放回来（导入/导出期间它是藏着的）。
 /// UIAlertController 的按钮没有统一的「关闭」回调，只能盯着它的窗口
 static void IPATFbWatchDismiss(UIViewController *controller) {
@@ -235,7 +282,14 @@ static void IPATFbWatchDismiss(UIViewController *controller) {
             [NSThread sleepForTimeInterval:0.5];
             UIViewController *current = weakController;
             if (!current || current.view.window == nil || current.isBeingDismissed) {
-                dispatch_async(dispatch_get_main_queue(), ^{ IPATFbSetOverlayVisible(YES); });
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    IPATFbSetOverlayVisible(YES);
+                    // 还有别的弹窗在窗口上就先别还焦点
+                    UIWindow *window = IPATFbAlertWindow();
+                    if (!window || !window.rootViewController.presentedViewController) {
+                        IPATFbGiveBackKeyWindow();
+                    }
+                });
                 return;
             }
         }
@@ -991,6 +1045,11 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
         return;
     }
     void (^go)(void) = ^{
+        // 系统文档选择器（「文件」App）是远程视图，宿主窗口必须是 key window，
+        // 不然界面出来了却点不动，所以弹它之前先把焦点抢过来
+        if ([controller isKindOfClass:[UIDocumentPickerViewController class]]) {
+            IPATFbTakeKeyWindow();
+        }
         [host presentViewController:controller animated:YES completion:nil];
         IPATFbWatchDismiss(controller);
     };
