@@ -130,6 +130,19 @@ static UIWindowScene *IPATCpActiveWindowScene(void) {
 
 @end
 
+/// 根控制器：允许转到任意方向。不给全方向的话，横屏游戏里这个窗口
+/// 会一直按竖屏渲染，悬浮按钮和面板都是「躺」着的
+@interface IPATCpRootController : UIViewController
+@end
+
+@implementation IPATCpRootController
+
+- (BOOL)shouldAutorotate { return YES; }
+
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskAll; }
+
+@end
+
 #pragma mark - 控制面板
 
 @interface IPATCpController : NSObject
@@ -186,7 +199,13 @@ static UIWindowScene *IPATCpActiveWindowScene(void) {
         [center addObserver:self
                    selector:@selector(handleVisibility:)
                        name:IPATControlVisibilityNotification
-                     object:nil];
+                   object:nil];
+        // 屏幕一转就把悬浮窗跟着转过去（横屏游戏里默认窗口是竖的）
+        [[UIDevice currentDevice] beginGeneratingDeviceOrientationNotifications];
+        [center addObserver:self
+                   selector:@selector(handleOrientationChange)
+                       name:UIDeviceOrientationDidChangeNotification
+                   object:nil];
     }
     return self;
 }
@@ -247,12 +266,14 @@ static UIWindowScene *IPATCpActiveWindowScene(void) {
     window.opaque = NO;
     window.hidden = YES;
 
-    UIViewController *root = [[UIViewController alloc] init];
+    IPATCpRootController *root = [[IPATCpRootController alloc] init];
     IPATCpPassThroughView *host = [[IPATCpPassThroughView alloc] initWithFrame:window.bounds];
     host.backgroundColor = [UIColor clearColor];
     host.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     root.view = host;
     window.rootViewController = root;
+    // 对齐到游戏主窗口的方向/尺寸，不然横屏游戏里悬浮窗是竖的
+    IPATAlignWindowToInterface(window, IPATAppKeyWindowExcluding(window));
 
     self.window = window;
     self.hostView = host;
@@ -869,6 +890,14 @@ static UIWindowScene *IPATCpActiveWindowScene(void) {
     if (label) label.text = detail;
 }
 
+/// 屏幕方向变了：窗口跟着转过去，按钮别跑到屏幕外面
+- (void)handleOrientationChange {
+    if (!self.window) return;
+    IPATAlignWindowToInterface(self.window, IPATAppKeyWindowExcluding(self.window));
+    [self clampButton];
+    [self layoutPanel];
+}
+
 - (void)handleDidBecomeActive {
     // App 可能重建过窗口（比如 scene 重连），窗口没了或挂不到 scene 上就整个重建
     BOOL orphaned = NO;
@@ -886,6 +915,7 @@ static UIWindowScene *IPATCpActiveWindowScene(void) {
         self.dismissOverlay = nil;
         [self ensureWindowWithAttempts:8];
     }
+    IPATAlignWindowToInterface(self.window, IPATAppKeyWindowExcluding(self.window));
 }
 
 @end

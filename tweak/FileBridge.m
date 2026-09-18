@@ -188,11 +188,42 @@ static UIViewController *IPATFbTopViewController(void) {
 @implementation IPATFbWindowRootView
 
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    // 窗口上已经没有弹窗了就一律穿透：文档选择器这类远程视图退场后，
+    // 它的容器视图不一定会被系统收走，剩下的全屏透明视图就是一层看不见的
+    // 遮罩，会把游戏的触摸全吃掉（表现：界面关掉了但游戏点不动）
+    UIViewController *root = self.window.rootViewController;
+    if (!root.presentedViewController) return nil;
     UIView *hit = [super hitTest:point withEvent:event];
     return hit == self ? nil : hit;
 }
 
 @end
+
+/// 根控制器：允许转到任意方向。不给全方向的话，横屏游戏里系统会把
+/// 我们这个窗口按竖屏渲染——弹出来的界面就是「躺」着的
+@interface IPATFbWindowRootController : UIViewController
+@end
+
+@implementation IPATFbWindowRootController
+
+- (BOOL)shouldAutorotate { return YES; }
+
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskAll; }
+
+@end
+
+/// 窗口的根控制器（透明、点击穿透）。窗口上留下收不走的残留视图时整个换掉重建
+static UIViewController *IPATFbMakeWindowRoot(CGRect frame) {
+    UIViewController *root = [[IPATFbWindowRootController alloc] init];
+    IPATFbWindowRootView *view = [[IPATFbWindowRootView alloc] initWithFrame:frame];
+    view.backgroundColor = [UIColor clearColor];
+    view.opaque = NO;
+    view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    root.view = view;
+    return root;
+}
+
+static void IPATFbSyncWindowGeometry(void);
 
 static UIWindow *IPATFbAlertWindow(void) {
     static UIWindow *window;
@@ -212,15 +243,18 @@ static UIWindow *IPATFbAlertWindow(void) {
                 w.windowLevel = UIWindowLevelAlert + 200;   // 比悬浮窗（+100）还高
                 w.backgroundColor = [UIColor clearColor];
                 w.opaque = NO;
-                UIViewController *root = [[UIViewController alloc] init];
-                IPATFbWindowRootView *view = [[IPATFbWindowRootView alloc] initWithFrame:w.bounds];
-                view.backgroundColor = [UIColor clearColor];
-                view.opaque = NO;
-                view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-                root.view = view;
-                w.rootViewController = root;
+                w.rootViewController = IPATFbMakeWindowRoot(w.bounds);
                 w.hidden = NO;
                 window = w;
+                // 屏幕方向一变就跟着转，不然横屏游戏里这个窗口一直是竖的
+                [[UIDevice currentDevice] beginGeneratingDeviceOrientationNotifications];
+                [[NSNotificationCenter defaultCenter]
+                    addObserverForName:UIDeviceOrientationDidChangeNotification
+                                object:nil
+                                 queue:[NSOperationQueue mainQueue]
+                            usingBlock:^(NSNotification *note) {
+                    IPATFbSyncWindowGeometry();
+                }];
             }
         }
         if (!window) IPATFbLog(@"拿不到 windowScene，弹窗退回挂在 App 自己的控制器上");
@@ -273,10 +307,70 @@ static void IPATFbGiveBackKeyWindow(void) {
     }
 }
 
+/// 把弹窗窗口对齐到游戏当前的方向/尺寸。
+/// 这个窗口是我们自己开的，不跟着游戏转屏：横屏游戏里它一直按竖屏渲染，
+/// 弹出来的界面是「躺」着的；更麻烦的是系统文档选择器（远程视图）方向对不上
+/// 时收不到触摸——界面明明在屏幕上，就是点不动。
+static void IPATFbSyncWindowGeometry(void) {
+    UIWindow *window = IPATFbAlertWindow();
+    if (!window) return;
+    // 抢过焦点之后游戏窗口就不是 key 了，所以还要能退回「可见的 App 窗口」
+    UIWindow *app = IPATFbAppKeyWindow() ?: IPATAppKeyWindowExcluding(window);
+    IPATAlignWindowToInterface(window, app);
+}
+
+/// 弹窗退干净之后把焦点还给 App，顺手清掉窗口上的残留。
+/// 文档选择器是远程视图，退场后它的容器视图不一定会被系统收走，剩下的
+/// 全屏透明视图就是一层看不见的遮罩，会盖在游戏上面让游戏完全点不动。
+/// （窗口本身保持显示：文档选择器要在已经挂好的窗口上才稳定，退场后靠
+///  IPATFbWindowRootView 的 hitTest 穿透保证不吃触摸）
+static void IPATFbCollapseAlertWindowIfIdle(void) {
+    UIWindow *window = IPATFbAlertWindow();
+    if (!window) return;
+    UIViewController *root = window.rootViewController;
+    if (!root) return;
+    if (root.presentedViewController) return;              // 还有弹窗（或正在退场）
+    if (root.view.subviews.count > 0) {
+        // 弹窗没了却还有子视图：远程视图/转场容器没收干净，连根一起换掉
+        IPATFbLog(@"窗口上有收不走的残留视图，重建根控制器");
+        window.rootViewController = IPATFbMakeWindowRoot(window.bounds);
+    }
+    IPATFbGiveBackKeyWindow();
+}
+
+static BOOL IPATFbWatchingAlertWindow = NO;
+static NSInteger IPATFbWatchTicks = 0;
+
+static void IPATFbWatchAlertWindowStep(void);
+
+/// 盯着专用窗口，空了就收起来
+static void IPATFbWatchAlertWindow(void) {
+    if (IPATFbWatchingAlertWindow) return;
+    IPATFbWatchingAlertWindow = YES;
+    IPATFbWatchTicks = 0;
+    // 给 present 动画留时间，不然刚弹出来就被判定成「空窗口」收掉了
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ IPATFbWatchAlertWindowStep(); });
+}
+
+static void IPATFbWatchAlertWindowStep(void) {
+    IPATFbCollapseAlertWindowIfIdle();
+    UIWindow *window = IPATFbAlertWindow();
+    BOOL idle = !window || !window.rootViewController.presentedViewController;
+    if (idle || ++IPATFbWatchTicks > 600) {   // 最多盯 5 分钟
+        IPATFbWatchingAlertWindow = NO;
+        IPATFbWatchTicks = 0;
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ IPATFbWatchAlertWindowStep(); });
+}
+
 /// 弹窗收起之后把悬浮窗放回来（导入/导出期间它是藏着的）。
 /// UIAlertController 的按钮没有统一的「关闭」回调，只能盯着它的窗口
 static void IPATFbWatchDismiss(UIViewController *controller) {
     __weak UIViewController *weakController = controller;
+    IPATFbWatchAlertWindow();   // 顺带盯着窗口，等它空了收起来
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
         for (NSInteger i = 0; i < 600; i++) {   // 最多盯 5 分钟
             [NSThread sleepForTimeInterval:0.5];
@@ -284,11 +378,9 @@ static void IPATFbWatchDismiss(UIViewController *controller) {
             if (!current || current.view.window == nil || current.isBeingDismissed) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     IPATFbSetOverlayVisible(YES);
-                    // 还有别的弹窗在窗口上就先别还焦点
-                    UIWindow *window = IPATFbAlertWindow();
-                    if (!window || !window.rootViewController.presentedViewController) {
-                        IPATFbGiveBackKeyWindow();
-                    }
+                    // 收尾（还焦点、收窗口）交给 IPATFbWatchAlertWindow 统一处理，
+                    // 这里可能还有后续弹窗要接着弹
+                    IPATFbWatchAlertWindow();
                 });
                 return;
             }
@@ -1042,6 +1134,10 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
 /// 弹窗统一从这里出：挂在专用窗口上（没有就退回 App 自己的顶层控制器）
 - (void)presentNow:(UIViewController *)controller {
     UIWindow *window = IPATFbAlertWindow();
+    if (window) {
+        IPATFbSyncWindowGeometry();   // 弹之前先把窗口对齐到游戏的方向（横屏游戏里默认是竖的）
+        if (window.hidden) window.hidden = NO;
+    }
     UIViewController *host = window ? window.rootViewController : IPATFbTopViewController();
     while (host.presentedViewController) host = host.presentedViewController;   // 挂在最上层那个上面
     if (!host) {
@@ -2347,6 +2443,7 @@ done:
         return;
     }
     if (self.purpose == IPATFbPickerExport) {
+        IPATFbSetOverlayVisible(YES);   // 「文件」App 收起来了，悬浮窗放回来
         [self postStatus:[NSString stringWithFormat:@"已导出 zip（%ld 项）", (long)self.exportItemCount]];
         IPATFbLog(@"导出完成：zip（%ld 项）", (long)self.exportItemCount);
         // 系统已把 zip 拷到用户选的位置，临时文件清掉（就算还没拷完，

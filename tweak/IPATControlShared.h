@@ -95,4 +95,86 @@
 
 #define IPATKeyButtonFrame @"IPAToolPanelButtonFrame"  // 悬浮按钮位置，NSStringFromCGRect
 
+#pragma mark - 自建窗口的几何/方向
+// 我们自己开的窗口（悬浮窗、弹窗窗口）不归游戏管，默认会按竖屏渲染：
+// 横屏游戏里弹出来的界面就「躺」着显示，而且系统文档选择器（远程视图）
+// 的方向/坐标对不上时会直接点不动。所以每次用之前都要把窗口对齐到
+// 游戏主窗口的实际方向。
+
+/// App 自己的主窗口（exclude 传我们自己的窗口）
+static inline UIWindow *IPATAppKeyWindowExcluding(UIWindow *exclude) {
+    NSArray<UIWindow *> *windows = nil;
+    if (@available(iOS 13.0, *)) {
+        NSMutableArray<UIWindow *> *collected = [NSMutableArray array];
+        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+            [collected addObjectsFromArray:((UIWindowScene *)scene).windows];
+        }
+        windows = collected;
+    }
+    if (windows.count == 0) {
+        windows = [UIApplication sharedApplication].windows;
+    }
+    UIWindow *visible = nil;
+    for (UIWindow *candidate in windows) {
+        if (candidate == exclude) continue;
+        if (candidate.isKeyWindow) return candidate;
+        if (!visible && !candidate.hidden && candidate.windowLevel < UIWindowLevelAlert) {
+            visible = candidate;
+        }
+    }
+    return visible;
+}
+
+/// 当前界面方向（拿不到就当竖屏）
+static inline UIInterfaceOrientation IPATInterfaceOrientation(void) {
+    UIInterfaceOrientation orientation = UIInterfaceOrientationUnknown;
+    if (@available(iOS 16.0, *)) {
+        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+            UIWindowScene *windowScene = (UIWindowScene *)scene;
+            if (windowScene.activationState != UISceneActivationStateForegroundActive) continue;
+            orientation = windowScene.interfaceOrientation;
+            break;
+        }
+    }
+    if (orientation == UIInterfaceOrientationUnknown) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        orientation = [UIApplication sharedApplication].statusBarOrientation;
+#pragma clang diagnostic pop
+    }
+    return orientation == UIInterfaceOrientationUnknown ? UIInterfaceOrientationPortrait : orientation;
+}
+
+/// 把窗口对齐到主窗口的几何：主窗口转过就照抄它的 transform/bounds，
+/// 没转就按界面方向把尺寸换成横的
+static inline void IPATAlignWindowToInterface(UIWindow *window, UIWindow *appWindow) {
+    if (!window) return;
+    window.transform = CGAffineTransformIdentity;
+    UIView *appRoot = appWindow ? appWindow.rootViewController.view : nil;
+    if (appWindow && !CGAffineTransformIsIdentity(appWindow.transform)) {
+        // 游戏把整个窗口转过来了：照抄，方向必然一致
+        window.bounds = appWindow.bounds;
+        window.center = appWindow.center;
+        window.transform = appWindow.transform;
+    } else if (appRoot && !CGAffineTransformIsIdentity(appRoot.transform)) {
+        // 游戏是在根视图上转的（窗口本身没转），那就抄根视图的旋转
+        window.bounds = appWindow.bounds;
+        window.center = appWindow.center;
+        window.transform = appRoot.transform;
+    } else {
+        CGRect frame = appWindow ? appWindow.frame : [UIScreen mainScreen].bounds;
+        UIInterfaceOrientation orientation = IPATInterfaceOrientation();
+        BOOL wantLandscape = (orientation == UIInterfaceOrientationLandscapeLeft ||
+                              orientation == UIInterfaceOrientationLandscapeRight);
+        BOOL isLandscape = frame.size.width > frame.size.height;
+        if (wantLandscape != isLandscape) {
+            frame = CGRectMake(0.0, 0.0, frame.size.height, frame.size.width);
+        }
+        window.frame = frame;
+    }
+    window.rootViewController.view.frame = window.bounds;
+}
+
 #endif /* IPATOOL_CONTROL_SHARED_H */
