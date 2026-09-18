@@ -41,29 +41,39 @@ mkdir -p "$OUT_DIR"
 # 运行时通过 [UIImage imageWithData:scale:2.0] 加载，不需要额外资源 bundle
 ICON_PNG="$HERE/AppIcon20x20@2x.png"
 ICON_M="$OUT_DIR/IPAToolIcon.m"
-{
-  echo '#include <Foundation/Foundation.h>'
-  echo '#include <UIKit/UIKit.h>'
-  if [[ -f "$ICON_PNG" ]]; then
-    echo '// Icon bytes from AppIcon20x20@2x.png'
-    xxd -i "$ICON_PNG"
-    echo ''
-    echo 'NSData *IPAToolIconImageData(void) {'
-    echo '    return [NSData dataWithBytesNoCopy:(void *)AppIcon20x20_2x_png length:AppIcon20x20_2x_png_len freeWhenDone:NO];'
-    echo '}'
-  else
-    echo 'static const unsigned char kNoIcon[] = {0};'
-    echo ''
-    echo 'NSData *IPAToolIconImageData(void) {'
-    echo '    return nil;'
-    echo '}'
-  fi
-  echo ''
-  echo 'UIImage *IPAToolIconImage(void) {'
-  echo '    NSData *data = IPAToolIconImageData();'
-  echo '    return data ? [UIImage imageWithData:data scale:2.0] : nil;'
-  echo '}'
-} > "$ICON_M"
+python3 - "$ICON_PNG" "$ICON_M" <<'PY'
+import sys, pathlib
+png_path = pathlib.Path(sys.argv[1])
+out_path = pathlib.Path(sys.argv[2])
+if png_path.is_file():
+    data = png_path.read_bytes()
+    rows = [f"    0x{b:02x}," for b in data]
+    if rows:
+        rows[-1] = rows[-1].rstrip(",")
+    body = "\n".join(rows) if rows else ""
+    icon_data = (
+        "static const unsigned char kIPAToolIconBytes[] = {\n"
+        + body + "\n"
+        + "};\n"
+    )
+else:
+    icon_data = "static const unsigned char kIPAToolIconBytes[] = {0};\n"
+out_path.write_text(
+    "#include <Foundation/Foundation.h>\n"
+    "#include <UIKit/UIKit.h>\n"
+    "\n"
+    + icon_data
+    + "\n"
+    "NSData *IPAToolIconImageData(void) {\n"
+    "    return [NSData dataWithBytesNoCopy:(void *)kIPAToolIconBytes length:sizeof(kIPAToolIconBytes) freeWhenDone:NO];\n"
+    "}\n"
+    "\n"
+    "UIImage *IPAToolIconImage(void) {\n"
+    "    NSData *data = IPAToolIconImageData();\n"
+    "    return data ? [UIImage imageWithData:data scale:2.0] : nil;\n"
+    "}\n"
+)
+PY
 
 ARCH_FLAGS=()
 for arch in $ARCHS; do
