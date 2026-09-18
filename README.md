@@ -237,6 +237,8 @@ python -m ipatool inject game.ipa --files -o out.ipa                     # 文�
 | 面板项 | 对应配置 | 立即生效 |
 | --- | --- | --- |
 | 后台保活（总开关） | `IPAToolKeepAlive.Enabled` | 是 |
+| ├ 画中画保活 | `IPAToolKeepAlive.PictureInPicture` | 是（切后台自动开、回前台自动关） |
+| └ 静音音频保活 | `IPAToolKeepAlive.SilentAudio` | 是（画中画在跑时自动停，关掉则完全不播） |
 | 文件导入导出（常开） | `IPAToolFiles.Enabled` | 否（注入即用，面板没有开关；要关只能改 Info.plist） |
 | ├ 浏览并导出文件（动作行） | — | 打开沙盒文件浏览器，导出自动打包 zip |
 | └ 导入文件（动作行） | `IPAToolFiles.ImportDir`（默认落地目录） | 挑好落地目录后，在「文件」App 里选文件 / zip（可多选，zip 自动解压） |
@@ -245,7 +247,7 @@ python -m ipatool inject game.ipa --files -o out.ipa                     # 文�
 
 | 隐藏项 | 参数 / 配置键 | 为什么不在面板里 |
 | --- | --- | --- |
-| 静音音频 / 任务续期 | `--keep-alive-no-audio` / `SilentAudio`、`--keep-alive-no-task-renew` / `RenewBackgroundTask` | 默认全开，面板只留一个总开关 |
+| 后台任务续期 | `--keep-alive-no-task-renew` / `RenewBackgroundTask` | 默认开，画中画和静音音频都没跑时的兜底，一般不用动 |
 | 后台定位 | `--keep-alive-location` / `Location` | 要用户授「始终」权限、耗电，且不符合 App Store 审核 |
 | 定时唤醒 | `--keep-alive-fetch` / `Fetch` | 开启要重启 App（launch handler 只能在启动阶段注册），面板上点了也没用 |
 | 导入默认落地目录 | `--files-import-dir` / `ImportDir` | 导入时现挑目录更直观，面板不再预设 |

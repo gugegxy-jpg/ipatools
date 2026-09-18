@@ -136,6 +136,7 @@ static void IPATAppendLogLine(NSString *line) {
 
 #define IPATKeyKAEnabled @"IPAToolPanelKeepAliveEnabled"
 #define IPATKeyKAPiP @"IPAToolPanelKeepAlivePiP"            // 画中画保活（切后台自动开画中画）
+#define IPATKeyKASilentAudio @"IPAToolPanelKeepAliveSilentAudio"  // 静音音频保活（画中画起不来时兜底）
 #define IPATKeyKAFetch @"IPAToolPanelKeepAliveFetch"        // 仅 plist：开启要重启 App，面板上点了没用
 #define IPATKeyKALocation @"IPAToolPanelKeepAliveLocation"  // 仅 plist：要授权、耗电、过不了审
 

@@ -38,7 +38,8 @@
 //    Log(bool)                  默认 YES，打印 [ipatool-keepalive] 日志
 //
 //  运行时开关：
-//    带了悬浮窗时 App 里会出现可拖动的悬浮按钮，点开即可实时开关保活（面板就一个总开关），
+//    带了悬浮窗时 App 里会出现可拖动的悬浮按钮，点开即可实时开关保活
+//    （面板上是「总开关 + 画中画 + 静音音频」三个开关），
 //    面板写入的值存在 NSUserDefaults 里，优先级高于上面的 Info.plist 初始值。
 //    注意：定时唤醒的 launch handler 只能在启动阶段注册，所以「定时唤醒」开关
 //    打开后要下次启动才真正生效（关闭是立刻生效的），面板上会显示当前状态。
@@ -78,11 +79,12 @@ static NSString *IPATKAPanelKey(NSString *plistKey) {
     static NSDictionary *map;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        // 只有「后台保活」这一个开关在面板上，子项（静音音频 / 任务续期）只认 Info.plist：
-        // 免得以前在面板上改过一次留下旧值，开关拿掉之后反而改不回来
+        // 面板上能改的：总开关 + 画中画 + 静音音频。
+        // 剩下的（任务续期 / 定时唤醒 / 定位）只认 Info.plist，避免面板上误改改不回来
         map = @{
             @"Enabled": IPATKeyKAEnabled,
             @"PictureInPicture": IPATKeyKAPiP,
+            @"SilentAudio": IPATKeyKASilentAudio,
             @"Fetch": IPATKeyKAFetch,
             @"Location": IPATKeyKALocation,
         };
@@ -749,20 +751,27 @@ failedToStartPictureInPictureWithError:(NSError *)error {
         IPATRegDetail: @"切后台后进程不被挂起",
         IPATRegMasterKey: IPATKeyKAEnabled,
         IPATRegEnabled: @(IPATKABool(@"Enabled", YES)),
-        // 面板上多一个「画中画」开关：打开后切后台自动进画中画、回前台自动退出，
-        // 画中画能用时静音音频自动让位（它俩是同一件事的两种手段）
+        // 面板上两个手段各自的开关：画中画优先，静音音频当兜底。
+        // 两个都开着时画中画一跑起来，静音音频会自动停掉（同一件事不叠加）
         IPATRegRows: @[
             @{
                 IPATRowKey: IPATKeyKAPiP,
                 IPATRowTitle: @"画中画保活",
                 IPATRowKind: IPATRowKindSwitch,
                 IPATRowValue: @(IPATKABool(@"PictureInPicture", YES)),
-                IPATRowNote: @"切后台自动开画中画、回前台自动关；起不来时自动退回静音音频",
+                IPATRowNote: @"切后台自动开画中画、回前台自动关；起不来时靠下面的静音音频兜底",
+            },
+            @{
+                IPATRowKey: IPATKeyKASilentAudio,
+                IPATRowTitle: @"静音音频保活",
+                IPATRowKind: IPATRowKindSwitch,
+                IPATRowValue: @(IPATKABool(@"SilentAudio", YES)),
+                IPATRowNote: @"循环播放全 0 音频让系统不挂起；画中画在跑时自动停，关掉则完全不播",
             },
         ],
-        // 面板只留一个总开关：子项（静音音频 / 后台任务续期）默认全开，
+        // 剩下的子项（后台任务续期）默认开，
         // 定位要授权还费电、定时唤醒改了要重启 App，这两项留给 Info.plist
-        //（--keep-alive-no-audio / --keep-alive-no-task-renew / --keep-alive-location / --keep-alive-fetch）
+        //（--keep-alive-no-task-renew / --keep-alive-location / --keep-alive-fetch）
     };
     [[NSNotificationCenter defaultCenter] postNotificationName:IPATControlRegisterNotification
                                                         object:nil
