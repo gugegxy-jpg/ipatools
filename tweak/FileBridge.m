@@ -727,7 +727,9 @@ static void IPATFbZipDosTimestamp(uint16_t *dosTime, uint16_t *dosDate) {
     *dosDate = (uint16_t)((((c.year - 1980) & 0x7F) << 9) | ((c.month & 0xF) << 5) | (c.day & 0x1F));
 }
 
-/// 收集一个导出项（文件或整个目录）的条目列表；name 是 zip 内的相对路径
+/// 收集一个导出项（文件或整个目录）的条目列表；name 是 zip 内的相对路径。
+/// 刻意用和沙盒浏览器同一套列目录方式（contentsOfDirectoryAtPath + fileExists），
+/// 保证「浏览器里看得到，包里就一定有」——深枚举在部分目录上会静默返回空
 static BOOL IPATFbZipCollectEntry(NSString *path, NSString *name,
                                   NSMutableArray<NSDictionary *> *entries,
                                   uint64_t *totalBytes, NSError **error) {
@@ -752,42 +754,17 @@ static BOOL IPATFbZipCollectEntry(NSString *path, NSString *name,
 
     [entries addObject:@{@"path": [NSNull null], @"name": [name stringByAppendingString:@"/"],
                          @"size": @0, @"dir": @YES}];
-    NSUInteger found = 0;
-    NSDirectoryEnumerator<NSURL *> *en =
-        [fm enumeratorAtURL:[NSURL fileURLWithPath:path]
-         includingPropertiesForKeys:@[NSURLIsDirectoryKey, NSURLFileSizeKey]
-                            options:0
-                       errorHandler:^BOOL(NSURL *url, NSError *e) { return YES; }];
-    for (NSURL *item in en) {
-        found++;
-        NSString *rel = [item.path substringFromIndex:MIN(path.length, item.path.length)];
-        rel = [rel stringByReplacingOccurrencesOfString:@"/" withString:@"" options:0 range:NSMakeRange(0, 1)];
-        NSString *entryName = [name stringByAppendingPathComponent:rel];
-        NSNumber *isDirNum = nil;
-        [item getResourceValue:&isDirNum forKey:NSURLIsDirectoryKey error:NULL];
-        if ([isDirNum boolValue]) {
-            [entries addObject:@{@"path": [NSNull null], @"name": [entryName stringByAppendingString:@"/"],
-                                 @"size": @0, @"dir": @YES}];
-        } else {
-            uint64_t size = [[fm attributesOfItemAtPath:item.path error:NULL][NSFileSize]
-                             unsignedLongLongValue];
-            [entries addObject:@{@"path": item.path, @"name": entryName,
-                                 @"size": @(size), @"dir": @NO}];
-            *totalBytes += size;
+    NSArray<NSString *> *names = [fm contentsOfDirectoryAtPath:path error:error] ?: @[];
+    if (*error && [*error code]) return NO;
+    for (NSString *child in [names sortedArrayUsingSelector:@selector(localizedStandardCompare:)]) {
+        NSString *childPath = [path stringByAppendingPathComponent:child];
+        BOOL childIsDir = NO;
+        if (![fm fileExistsAtPath:childPath isDirectory:&childIsDir]) {
+            IPATFbLog(@"收集时跳过已消失的项：%@", childPath);
+            continue;
         }
-    }
-    // 兜底：极少数情况下深枚举会静默返回空，换目录列表再收一遍
-    if (found == 0) {
-        IPATFbLog(@"目录深枚举为空，用 contentsOfDirectory 兜底：%@", path);
-        NSArray<NSURL *> *children =
-            [fm contentsOfDirectoryAtURL:[NSURL fileURLWithPath:path]
-              includingPropertiesForKeys:@[NSURLIsDirectoryKey]
-                                 options:0
-                                   error:NULL];
-        for (NSURL *item in children) {
-            NSString *entryName = [name stringByAppendingPathComponent:item.lastPathComponent];
-            if (!IPATFbZipCollectEntry(item.path, entryName, entries, totalBytes, error)) return NO;
-        }
+        NSString *entryName = [name stringByAppendingPathComponent:child];
+        if (!IPATFbZipCollectEntry(childPath, entryName, entries, totalBytes, error)) return NO;
     }
     return YES;
 }
