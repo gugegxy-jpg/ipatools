@@ -83,6 +83,13 @@ static NSString *IPATFbSandboxPath(NSString *relative) {
     return path;
 }
 
+/// child 是否就是 root 或位于 root 之下（判断能不能从起始目录往上回到浏览根）
+static BOOL IPATFbIsWithin(NSString *child, NSString *root) {
+    if (child.length == 0 || root.length == 0) return NO;
+    if ([child isEqualToString:root]) return YES;
+    return [child hasPrefix:[root stringByAppendingString:@"/"]];
+}
+
 static NSString *IPATFbImportRelative(void) {
     id stored = IPATFbStored(IPATKeyFilesImportDir);
     id value = [stored isKindOfClass:[NSString class]] ? stored : IPATFbConfig()[@"ImportDir"];
@@ -264,14 +271,55 @@ static NSString *IPATFbDisplayPath(NSString *path) {
         [self setupHeaderActions];
     }
 
-    // 根目录没有返回按钮，自己给一个关闭入口（子目录由导航栏自动提供返回）
-    if ([self.directory isEqualToString:self.rootDirectory]) {
+    // 栈底那一页没有系统返回按钮，自己给一个关闭入口（子目录由导航栏自动提供返回）
+    if (self.navigationController.viewControllers.firstObject == self ||
+        [self.directory isEqualToString:self.rootDirectory]) {
         self.navigationItem.leftBarButtonItem =
             [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemClose
                                                           target:self
                                                           action:@selector(handleClose)];
     }
+    [self setupUpLevelHeaderIfNeeded];
     [self reloadEntries];
+}
+
+/// 上一级：只在浏览根之内给。起始页停在默认导入目录（Documents）时，
+/// 靠它才能回到沙盒根去挑 Library / tmp 这些同级目录；也挡住了越出配置范围
+- (NSString *)upLevelDirectory {
+    NSString *root = self.rootDirectory;
+    if (root.length == 0 || [self.directory isEqualToString:root]) return nil;
+    NSString *parent = [self.directory stringByDeletingLastPathComponent];
+    if (parent.length == 0 || [parent isEqualToString:self.directory]) return nil;
+    if (!IPATFbIsWithin(root, parent)) return nil;
+    return parent;
+}
+
+- (void)setupUpLevelHeaderIfNeeded {
+    NSString *parent = [self.upLevelDirectory copy];
+    if (!parent) return;
+
+    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 320.0, 38.0)];
+    UIButton *up = [UIButton buttonWithType:UIButtonTypeSystem];
+    up.frame = CGRectMake(12.0, 0, 296.0, 38.0);
+    up.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    up.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+    up.titleLabel.font = [UIFont systemFontOfSize:14.0];
+    [up setTitle:[NSString stringWithFormat:@"↑ 上一级（%@）", IPATFbDisplayPath(parent)]
+        forState:UIControlStateNormal];
+    [up addTarget:self action:@selector(handleGoUp) forControlEvents:UIControlEventTouchUpInside];
+    [header addSubview:up];
+    self.tableView.tableHeaderView = header;
+}
+
+- (void)handleGoUp {
+    NSString *parent = [self.upLevelDirectory copy];
+    if (!parent) return;
+    IPATFbBrowserController *up =
+        [[IPATFbBrowserController alloc] initWithDirectory:parent root:self.rootDirectory mode:self.mode];
+    up.onDismiss = self.onDismiss;
+    up.onExport = self.onExport;
+    up.onPickDirectory = self.onPickDirectory;
+    [self.navigationController pushViewController:up animated:YES];
 }
 
 /// 导出模式顶部加两个快捷操作，省得一个个勾
@@ -336,12 +384,27 @@ static NSString *IPATFbDisplayPath(NSString *path) {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSArray<NSString *> *names = [fm contentsOfDirectoryAtPath:self.directory error:NULL] ?: @[];
     NSMutableArray<NSDictionary *> *items = [NSMutableArray array];
+    NSString *realDir = self.directory.stringByResolvingSymlinksInPath;
     for (NSString *name in [names sortedArrayUsingSelector:@selector(localizedStandardCompare:)]) {
         if ([name hasPrefix:@"."]) continue;  // 跳过隐藏项，沙盒里大多是系统文件
         NSString *path = [self.directory stringByAppendingPathComponent:name];
         BOOL isDir = NO;
         if (![fm fileExistsAtPath:path isDirectory:&isDir]) continue;
-        [items addObject:@{@"name": name, @"path": path, @"dir": @(isDir)}];
+        NSMutableDictionary *item = [NSMutableDictionary dictionaryWithDictionary:
+                                     @{@"name": name, @"path": path, @"dir": @(isDir)}];
+        // 符号链接单独标出来：浏览器跟随链接，链接指回上层时点进去还是同一堆东西，
+        // 看着像「无限个下一级文件夹」，其实只有一个（tmp 里常见）
+        BOOL isLink = [[fm attributesOfItemAtPath:path error:NULL][NSFileType]
+                       isEqualToString:NSFileTypeSymbolicLink];
+        if (isLink) {
+            item[@"link"] = @YES;
+            NSString *real = path.stringByResolvingSymlinksInPath;
+            if ([real isEqualToString:realDir] ||
+                [realDir hasPrefix:[real stringByAppendingString:@"/"]]) {
+                item[@"loop"] = @YES;
+            }
+        }
+        [items addObject:item];
     }
     self.entries = items;
     [self.tableView reloadData];
@@ -402,9 +465,14 @@ static NSString *IPATFbDisplayPath(NSString *path) {
     BOOL isDir = [entry[@"dir"] boolValue];
     NSString *path = entry[@"path"];
 
-    cell.textLabel.text = entry[@"name"];
+    BOOL isLink = [entry[@"link"] boolValue];
+    cell.textLabel.text = isLink ? [NSString stringWithFormat:@"%@ ↪", entry[@"name"]]
+                                 : entry[@"name"];
     cell.textLabel.font = [UIFont systemFontOfSize:15.0];
-    cell.detailTextLabel.text = isDir ? @"文件夹" : [self sizeDescriptionForPath:path];
+    NSString *kind = isDir ? @"文件夹" : [self sizeDescriptionForPath:path];
+    if ([entry[@"loop"] boolValue]) kind = @"符号链接 → 回到上层，点进去还是这里";
+    else if (isLink) kind = isDir ? @"符号链接 → 文件夹" : @"符号链接";
+    cell.detailTextLabel.text = kind;
     cell.accessoryView = nil;
     cell.accessoryType = UITableViewCellAccessoryNone;
 
@@ -643,14 +711,17 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
         [self postStatus:@"功能已关闭"];
         return;
     }
-    // 挑落地目录时直接从默认导入目录开始，省得每次从沙盒根一层层点进去
+    // 挑落地目录时从默认导入目录起步，省得每次从沙盒根一层层点进去；
+    // 但可浏览的最上层仍然是 BrowseRoot（默认沙盒根），这样还能往上挑
+    // Documents 同级的 Library / tmp 之类的目录
     NSString *root = IPATFbBrowseRoot();
+    NSString *start = root;
     if (mode != IPATFbBrowserModeExport) {
         NSString *import = IPATFbImportDirectory();
         BOOL importIsDir = NO;
         if ([[NSFileManager defaultManager] fileExistsAtPath:import isDirectory:&importIsDir]
-            && importIsDir) {
-            root = import;
+            && importIsDir && IPATFbIsWithin(import, root)) {
+            start = import;
         }
     }
     BOOL isDir = NO;
@@ -658,9 +729,12 @@ typedef NS_ENUM(NSInteger, IPATFbPickerPurpose) {
         [self postStatus:@"浏览根目录不存在"];
         return;
     }
+    if (![[NSFileManager defaultManager] fileExistsAtPath:start isDirectory:&isDir] || !isDir) {
+        start = root;
+    }
 
     IPATFbBrowserController *browser =
-        [[IPATFbBrowserController alloc] initWithDirectory:root root:root mode:mode];
+        [[IPATFbBrowserController alloc] initWithDirectory:start root:root mode:mode];
     __weak typeof(self) weakSelf = self;
     __weak IPATFbBrowserController *weakBrowser = browser;
     browser.onDismiss = ^{
@@ -727,23 +801,36 @@ static void IPATFbZipDosTimestamp(uint16_t *dosTime, uint16_t *dosDate) {
     *dosDate = (uint16_t)((((c.year - 1980) & 0x7F) << 9) | ((c.month & 0xF) << 5) | (c.day & 0x1F));
 }
 
+/// 目录的唯一标识（设备号 + inode）。判断「是不是同一个目录」时用它最靠谱：
+/// 不受 /var 与 /private/var 这类写法差异影响，也能认出指回自己的循环链接。
+static NSString *IPATFbNodeKey(NSDictionary *attr) {
+    NSNumber *ino = attr[NSFileSystemFileNumber];
+    if (!ino) return nil;
+    return [NSString stringWithFormat:@"%@:%@", attr[NSFileSystemNumber] ?: @0, ino];
+}
+
 /// 收集一个导出项（文件或整个目录）的条目列表；name 是 zip 内的相对路径。
 /// 刻意用和沙盒浏览器同一套列目录方式（contentsOfDirectoryAtPath + fileExists），
 /// 保证「浏览器里看得到，包里就一定有」——深枚举在部分目录上会静默返回空。
 /// 几个防呆：
 ///  - excludeDir / excludeFile：导出包所在的目录和包本身不进包。之前包直接写
 ///    在 tmp 根下，导出 tmp 时上一次的 zip 会被当成普通文件一起打进新包，
-///    体积一轮轮翻倍（几 MB 的目录导出半天就是这么来的）；
+///    体积一轮轮翻倍（几 MB 的目录导出半天就是这么来的）；目录按 inode 比对，
+///    免得路径写法不一样（/var 与 /private/var）时漏掉；
 ///  - 符号链接不进包：跟着递归会绕回父目录，直接死循环；
+///  - dirChain：同一条路径上出现过同一个目录就停手。tmp 里那种「下一层还是 tmp」
+///    的循环目录，靠它拦住，不然会一路递归到 64 层，包里全是空目录；
 ///  - depth / limit：层级过深或条目极多时及时停手，别让打包变成假死。
 static BOOL IPATFbZipCollectEntry(NSString *path, NSString *name,
                                   NSMutableArray<NSDictionary *> *entries,
                                   uint64_t *totalBytes,
                                   NSString *excludeDir,
+                                  NSString *excludeDirKey,
                                   NSString *excludeFile,
                                   NSInteger depth,
                                   NSInteger *counter,
                                   NSInteger limit,
+                                  NSMutableSet<NSString *> *dirChain,
                                   void (^tick)(NSInteger count),
                                   NSError **error) {
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -781,17 +868,33 @@ static BOOL IPATFbZipCollectEntry(NSString *path, NSString *name,
     if (tick && (*counter % 500) == 0) tick(*counter);
 
     if ([fileType isEqualToString:NSFileTypeDirectory]) {
+        NSString *key = IPATFbNodeKey(attr);
+        if (key.length && excludeDirKey.length && [key isEqualToString:excludeDirKey]) {
+            IPATFbLog(@"收集时跳过导出临时目录：%@", path);
+            return YES;
+        }
+        if (key.length && [dirChain containsObject:key]) {
+            IPATFbLog(@"收集时跳过循环目录（下一层还是它自己）：%@", path);
+            return YES;
+        }
+        if (key.length) [dirChain addObject:key];
+
         [entries addObject:@{@"path": [NSNull null], @"name": [name stringByAppendingString:@"/"],
                              @"size": @0, @"dir": @YES}];
         NSArray<NSString *> *names = [fm contentsOfDirectoryAtPath:path error:NULL] ?: @[];
+        BOOL ok = YES;
         for (NSString *child in [names sortedArrayUsingSelector:@selector(localizedStandardCompare:)]) {
             NSString *childPath = [path stringByAppendingPathComponent:child];
             NSString *entryName = [name stringByAppendingPathComponent:child];
             if (!IPATFbZipCollectEntry(childPath, entryName, entries, totalBytes,
-                                       excludeDir, excludeFile, depth + 1, counter, limit,
-                                       tick, error)) return NO;
+                                       excludeDir, excludeDirKey, excludeFile, depth + 1,
+                                       counter, limit, dirChain, tick, error)) {
+                ok = NO;
+                break;
+            }
         }
-        return YES;
+        if (key.length) [dirChain removeObject:key];
+        return ok;
     }
 
     uint64_t size = [attr[NSFileSize] unsignedLongLongValue];
@@ -1097,10 +1200,13 @@ fail:
                 weakAlert.message = [NSString stringWithFormat:@"扫描中：%ld 项…", (long)count];
             });
         };
+        NSString *workDirKey = IPATFbNodeKey([fm attributesOfItemAtPath:workDir error:NULL] ?: @{});
         for (NSString *path in valid) {
             NSString *name = path.lastPathComponent;
+            NSMutableSet<NSString *> *dirChain = [NSMutableSet set];   // 每个顶层项各自一条链
             if (!IPATFbZipCollectEntry(path, name, entries, &totalBytes,
-                                       workDir, zipPath, 0, &counter, 300000, tick, &error)) {
+                                       workDir, workDirKey, zipPath, 0, &counter, 300000,
+                                       dirChain, tick, &error)) {
                 ok = NO;
                 break;
             }
@@ -1114,11 +1220,14 @@ fail:
         // 收集不到任何文件就不出包：免得生成一个空 zip，让人以为导入坏了
         if (ok && collectedFiles == 0) {
             ok = NO;
+            NSString *reason = collectedDirs > 0
+                ? [NSString stringWithFormat:
+                   @"里面只有 %ld 个空目录，没有可打包的文件"
+                   @"（比如 tmp 那种一层层点下去还是 tmp 的循环链接，已自动跳过）",
+                   (long)collectedDirs]
+                : @"没有收集到任何内容（可能已被游戏清空或正在重写）";
             error = [NSError errorWithDomain:@"IPAToolFiles" code:10
-                                 userInfo:@{NSLocalizedDescriptionKey:
-                                            [NSString stringWithFormat:
-                                             @"没有收集到任何文件（%ld 个子目录里都没有文件，"
-                                             "可能已被游戏清空或正在重写）", (long)collectedDirs]}];
+                                 userInfo:@{NSLocalizedDescriptionKey: reason}];
         }
         if (ok) {
             dispatch_async(dispatch_get_main_queue(), ^{
