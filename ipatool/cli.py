@@ -71,7 +71,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     pj = sub.add_parser(
         "inject",
-        help="注入 dylib（内置 --keep-alive 后台保活、--files 文件导入导出）",
+        help="注入 dylib（内置 --files 文件导入导出）",
         description="把 dylib 放进 App 的 Frameworks/ 并写入 LC_LOAD_DYLIB；注入后必须重新签名才能安装",
     )
     pj.add_argument("input", help="IPA 文件路径，或已解包且含 Payload 的目录")
@@ -84,36 +84,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="写 NSAllowsArbitraryLoads=YES 关掉 ATS 限制（热更服务器用明文 HTTP 时需要）",
     )
 
-    ka = pj.add_argument_group(
-        "后台保活",
-        "让 App 切到后台后继续运行（适合游戏后台热更/下载），默认靠静音音频，最稳定",
-    )
-    ka.add_argument("--keep-alive", action="store_true", help="注入内置保活 tweak")
-    ka.add_argument("--keep-alive-dylib", metavar="PATH", help="保活 tweak 的 dylib 路径，默认自动查找（macOS 上会自动编译）")
-    ka.add_argument(
-        "--keep-alive-start-on",
-        choices=["launch", "background"],
-        help="静音保活音频何时开始播放，默认 launch（更稳）；background 更省电但可能来不及",
-    )
-    ka.add_argument("--keep-alive-no-audio", action="store_true", help="不播放静音音频（只靠后台任务续期，保活时间很短）")
-    ka.add_argument("--keep-alive-no-pip", action="store_true", help="关掉画中画保活（只用静音音频；默认开启：切后台自动进画中画、回前台自动退出）")
-    ka.add_argument("--keep-alive-audio-file", metavar="PATH", help="改用指定音频文件循环播放（如近乎无声的底噪）")
-    ka.add_argument("--keep-alive-no-task-renew", action="store_true", help="不再续期 beginBackgroundTask（默认续期）")
-    ka.add_argument("--keep-alive-renew-lead-time", type=float, metavar="SEC", help="提前多少秒续期后台任务，默认 10")
-    ka.add_argument(
-        "--keep-alive-location",
-        action="store_true",
-        help="额外用后台定位保活（耗电，需用户授权，App Store 会拒，仅自用包）",
-    )
-    ka.add_argument("--keep-alive-location-indicator", action="store_true", help="显示定位蓝条（默认隐藏）")
-    ka.add_argument("--keep-alive-fetch", action="store_true", help="注册 BGAppRefreshTask，让系统定期把进程唤醒")
-    ka.add_argument("--keep-alive-processing", action="store_true", help="注册 BGProcessingTask（长任务，通常要充电/空闲）")
-    ka.add_argument("--keep-alive-refresh-interval", type=int, metavar="SEC", help="定时唤醒的最短间隔，默认 900")
-
     panel = pj.add_argument_group(
         "悬浮窗",
-        "在 App 里显示一个可拖动的悬浮按钮，点开后实时开关后台保活 / 文件导入导出"
-        "（默认跟着 --keep-alive/--files 一起注入）",
+        "在 App 里显示一个可拖动的悬浮按钮，点开后操作文件导入导出"
+        "（默认跟着 --files 一起注入）",
     )
     panel.add_argument("--panel", action="store_true", help="强制注入悬浮窗")
     panel.add_argument("--no-panel", action="store_true", help="不注入悬浮窗（只改配置、不加界面）")
@@ -421,21 +395,6 @@ def cmd_inject(args) -> int:
                 print(f"  - {d}")
             return 0
 
-        ka_tuning = any((
-            args.keep_alive_dylib,
-            args.keep_alive_start_on,
-            args.keep_alive_no_audio,
-            args.keep_alive_no_pip,
-            args.keep_alive_audio_file,
-            args.keep_alive_no_task_renew,
-            args.keep_alive_renew_lead_time is not None,
-            args.keep_alive_location,
-            args.keep_alive_location_indicator,
-            args.keep_alive_fetch,
-            args.keep_alive_processing,
-            args.keep_alive_refresh_interval is not None,
-        ))
-        keep_alive_enabled = bool(args.keep_alive or ka_tuning)
         files_tuning = any((
             args.files_dylib,
             args.files_root,
@@ -444,20 +403,17 @@ def cmd_inject(args) -> int:
         files_enabled = bool(args.files or files_tuning) and not args.no_files
         # 悬浮窗默认跟着内置功能一起注入；--no-panel 关掉它
         panel_tuning = bool(args.panel or args.panel_dylib or args.panel_title)
-        panel_enabled = bool(
-            keep_alive_enabled or files_enabled or panel_tuning
-        ) and not args.no_panel
+        panel_enabled = bool(files_enabled or panel_tuning) and not args.no_panel
         plist_touched = bool(
-            keep_alive_enabled
-            or files_enabled
+            files_enabled
             or panel_enabled
             or args.background_mode
             or args.allow_arbitrary_loads
         )
         if not args.dylib and not plist_touched:
             print(
-                "错误：请用 --dylib 指定要注入的库，或用 --keep-alive（后台保活）"
-                "/ --files（文件导入导出）注入内置 tweak，或用 --panel 只注入悬浮窗",
+                "错误：请用 --dylib 指定要注入的库，或用 --files（文件导入导出）"
+                "注入内置 tweak，或用 --panel 只注入悬浮窗",
                 file=sys.stderr,
             )
             return 2
@@ -471,12 +427,12 @@ def cmd_inject(args) -> int:
         print(f"Bundle ID   : {app.identifier}")
 
         planned: list[tuple[str, str]] = []  # (dylib 路径, 注入名)
-        # 三个功能合编在同一个 IPATool.dylib 里：用到任意一个就只注入这一个 dylib，
+        # 两个功能合编在同一个 IPATool.dylib 里：用到任意一个就只注入这一个 dylib，
         # 没用到的功能在 Info.plist 里显式关掉。只有显式给了某个功能的 dylib 路径时，
         # 才退回老的「一个功能一个 dylib」注入方式
         merged = bool(
-            (keep_alive_enabled or files_enabled or panel_enabled)
-            and not (args.keep_alive_dylib or args.files_dylib or args.panel_dylib)
+            (files_enabled or panel_enabled)
+            and not (args.files_dylib or args.panel_dylib)
         )
         if merged:
             tool_dylib = inject_mod.locate_merged_dylib(
@@ -484,16 +440,9 @@ def cmd_inject(args) -> int:
             )
             planned.append((tool_dylib, inject_mod.MERGED_DYLIB_NAME))
             print(f"内置 tweak  : {tool_dylib}")
-            print("              （保活 / 悬浮窗 / 文件导入导出合编在一个 dylib 里，"
+            print("              （悬浮窗 / 文件导入导出合编在一个 dylib 里，"
                   "没用到的功能在 Info.plist 里关掉）")
         else:
-            if keep_alive_enabled:
-                ka_dylib = inject_mod.locate_keep_alive_dylib(
-                    explicit=args.keep_alive_dylib,
-                    log=lambda m: print(f"  {m}"),
-                )
-                planned.append((ka_dylib, inject_mod.KEEP_ALIVE_DYLIB_NAME))
-                print(f"保活 tweak  : {ka_dylib}")
             if files_enabled:
                 files_dylib = inject_mod.locate_files_dylib(
                     explicit=args.files_dylib,
@@ -520,44 +469,6 @@ def cmd_inject(args) -> int:
         warnings: list[str] = []
         settings: list[tuple[str, dict, str]] = []
         modes: list[str] = list(args.background_mode or [])
-
-        if keep_alive_enabled:
-            silent_audio = not args.keep_alive_no_audio
-            audio_name = None
-            if args.keep_alive_audio_file:
-                audio_changes, audio_warnings = inject_mod.place_keep_alive_audio(
-                    app, args.keep_alive_audio_file, dry_run=args.dry_run,
-                )
-                changes += audio_changes
-                warnings += audio_warnings
-                audio_name = inject_mod.keep_alive_audio_name(args.keep_alive_audio_file)
-            ka_options = inject_mod.build_keep_alive_options(
-                pip=False if args.keep_alive_no_pip else None,
-                silent_audio=False if args.keep_alive_no_audio else None,
-                start_on=args.keep_alive_start_on,
-                task_renew=False if args.keep_alive_no_task_renew else None,
-                renew_lead_time=args.keep_alive_renew_lead_time,
-                audio_file=audio_name,
-                location=True if args.keep_alive_location else None,
-                location_indicator=True if args.keep_alive_location_indicator else None,
-                fetch=True if args.keep_alive_fetch else None,
-                processing=True if args.keep_alive_processing else None,
-                refresh_interval=args.keep_alive_refresh_interval,
-            )
-            settings.append((inject_mod.KEEP_ALIVE_INFO_KEY, ka_options, "后台保活配置"))
-            modes += inject_mod.keep_alive_background_modes(
-                pip=not args.keep_alive_no_pip,
-                silent_audio=silent_audio,
-                location=args.keep_alive_location,
-                fetch=args.keep_alive_fetch,
-                processing=args.keep_alive_processing,
-            )
-            if not silent_audio:
-                warnings.append("已关闭静音音频，保活只能靠后台任务续期，通常只能多撑几十秒")
-        elif merged:
-            # 合编 dylib 里保活也会加载，不显式关掉它就会自己开始播静音音频
-            settings.append((inject_mod.KEEP_ALIVE_INFO_KEY,
-                             inject_mod.build_keep_alive_options(enabled=False), "后台保活配置"))
 
         if panel_enabled:
             panel_options = inject_mod.build_panel_options(
@@ -587,11 +498,6 @@ def cmd_inject(args) -> int:
                 app,
                 background_modes=modes,
                 settings=settings,
-                location=args.keep_alive_location,
-                scheduler_ids=inject_mod.keep_alive_scheduler_ids(
-                    fetch=args.keep_alive_fetch, processing=args.keep_alive_processing,
-                ),
-                strip_exit_on_suspend=keep_alive_enabled,
                 ats_arbitrary_loads=args.allow_arbitrary_loads,
                 file_sharing=files_enabled and not args.no_files_sharing,
                 dry_run=args.dry_run,

@@ -1,8 +1,7 @@
 //
 //  ipatool 注入验证 Demo
 //
-//  在真机上核对三个 tweak 是否真的生效：
-//    KeepAlive     -> 后台心跳 > 0 即说明进程没被挂起
+//  在真机上核对注入的 tweak 是否真的生效：
 //    FileBridge    -> Documents 目录可见、可写入、可从「文件」App 导入
 //    ControlPanel  -> 屏幕右侧的悬浮胶囊按钮，点一下展开面板
 //
@@ -10,7 +9,6 @@
 //  宿主只要有一个可见窗口和 rootViewController 即可。
 //
 #import <UIKit/UIKit.h>
-#import <AVFoundation/AVFoundation.h>
 #import <mach-o/dyld.h>
 
 #pragma clang diagnostic push
@@ -20,7 +18,7 @@ static UITextView *gText = nil;
 static NSMutableArray<NSString *> *gEvents = nil;
 static NSDate *gBgStart = nil;
 static int gTick = 0;            // 心跳总数
-static int gBgTick = 0;          // 处于后台时的心跳数，> 0 说明保活生效
+static int gBgTick = 0;          // 处于后台时的心跳数（切后台一般会被系统挂起）
 static int gBgCount = 0;         // 进入后台次数
 static NSTimeInterval gLastBg = 0;
 static NSTimeInterval gTotalBg = 0;
@@ -98,17 +96,14 @@ static void Refresh(void) {
 
     [t appendFormat:@"【1】已加载的注入 dylib\n  %@\n\n", LoadedTweaks()];
 
-    [t appendFormat:@"【2】注入写入的配置\n  IPAToolKeepAlive: %@\n", info[@"IPAToolKeepAlive"] ?: @"（无）"];
-    [t appendFormat:@"  IPAToolFiles : %@\n", info[@"IPAToolFiles"] ?: @"（无）"];
+    [t appendFormat:@"【2】注入写入的配置\n  IPAToolFiles : %@\n", info[@"IPAToolFiles"] ?: @"（无）"];
     [t appendFormat:@"  IPAToolControl: %@\n", info[@"IPAToolControl"] ?: @"（无）"];
     [t appendFormat:@"  UIBackgroundModes: %@\n\n", bg];
 
     [t appendString:@"【3】运行状态\n"];
     [t appendFormat:@"  当前状态      : %@\n", AppStateName()];
     [t appendFormat:@"  心跳          : 前台 %d 次 / 后台 %d 次\n", gTick - gBgTick, gBgTick];
-    [t appendFormat:@"  ★后台心跳 > 0  = 进程没被挂起，保活生效\n"];
-    [t appendFormat:@"  进入后台次数  : %d 次，累计后台 %.0f 秒（上次 %.0f 秒）\n", gBgCount, gTotalBg, gLastBg];
-    [t appendFormat:@"  音频会话      : %@\n\n", [AVAudioSession sharedInstance].category];
+    [t appendFormat:@"  进入后台次数  : %d 次，累计后台 %.0f 秒（上次 %.0f 秒）\n\n", gBgCount, gTotalBg, gLastBg];
 
     [t appendFormat:@"【4】Documents（「文件」App 与面板导入都落这里）\n%@\n", ListDocs()];
 

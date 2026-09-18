@@ -1,6 +1,6 @@
 //
 //  ControlPanel.m
-//  ipatool 注入用 dylib：应用内悬浮窗 + 小面板，实时开关「后台保活」「文件导入导出」。
+//  ipatool 注入用 dylib：应用内悬浮窗 + 小面板，操作「文件导入导出」。
 //
 //  设计要点：
 //    1. 自己建一个高层级 UIWindow（canBecomeKeyWindow = NO）：
@@ -505,7 +505,7 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
     self.button.frame = CGRectMake(x, y, size.width, size.height);
 }
 
-/// 这个功能算不算「开着」：有总开关就看总开关；没有总开关（比如后台保活）就看下面
+/// 这个功能算不算「开着」：有总开关就看总开关；没有总开关就看下面
 /// 有没有任意一个子开关开着 —— 子开关全关就等于把功能整个关掉。
 /// 一行开关都没有（只有动作行，比如文件导入导出）的算常开
 - (BOOL)isFeatureOn:(NSString *)featureId {
@@ -731,7 +731,7 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
         empty.numberOfLines = 2;
         empty.font = [UIFont systemFontOfSize:12.0];
         empty.textColor = [UIColor colorWithWhite:1.0 alpha:0.6];
-        empty.text = @"没有检测到可控制的功能。\n请确认注入了后台保活 / 文件导入导出组件。";
+        empty.text = @"没有检测到可控制的功能。\n请确认注入了文件导入导出组件。";
         [self.contentView addSubview:empty];
         y += 52;
     } else {
@@ -758,7 +758,7 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
 
 /// 顺序固定一下，免得每次加载顺序不同导致界面跳来跳去
 - (NSArray<NSString *> *)sortedFeatureIds {
-    NSArray *order = @[IPATFeatureKeepAlive, IPATFeatureFiles];
+    NSArray *order = @[IPATFeatureFiles];
     NSMutableArray<NSString *> *ids = [NSMutableArray array];
     for (NSString *featureId in order) {
         if (self.features[featureId]) [ids addObject:featureId];
@@ -984,7 +984,7 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
     }
     NSDictionary *userInfo = @{
         IPATChgId: featureId,
-        // 没有总开关的功能（后台保活）传子开关的汇总结果，别拿 nil 当 key 去查 NSUserDefaults
+        // 没有总开关的功能传子开关的汇总结果，别拿 nil 当 key 去查 NSUserDefaults
         IPATChgEnabled: @([self isFeatureOn:featureId]),
         IPATChgValues: values,
     };

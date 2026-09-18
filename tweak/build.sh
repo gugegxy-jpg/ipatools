@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
-# 编译注入用的 dylib（后台保活 / 悬浮控制面板 / 文件导入导出）。需要 macOS + Xcode 命令行工具：
+# 编译注入用的 dylib（悬浮控制面板 / 文件导入导出）。需要 macOS + Xcode 命令行工具：
 #   xcode-select --install
 #
-#   ./tweak/build.sh                               默认只出 IPATool.dylib（三个功能合编在一起）
-#   IPATOOL_TARGETS="KeepAlive FileBridge" ./tweak/build.sh   只编译指定目标（单独出包）
+#   ./tweak/build.sh                               默认只出 IPATool.dylib（两个功能合编在一起）
+#   IPATOOL_TARGETS="ControlPanel FileBridge" ./tweak/build.sh   只编译指定目标（单独出包）
 #
-# 三个功能默认合编成一个 IPATool.dylib：注入一次就够，开哪些功能由 Info.plist 里
-# 对应的 IPAToolKeepAlive / IPAToolControl / IPAToolFiles 的 Enabled 决定。
+# 两个功能默认合编成一个 IPATool.dylib：注入一次就够，开哪些功能由 Info.plist 里
+# 对应的 IPAToolControl / IPAToolFiles 的 Enabled 决定。
 # 合编是安全的：三份源码的顶层函数全是 static，类名前缀各不相同，
 # 各自的 constructor 也是 static，链接时不会撞符号。
 #
@@ -84,7 +84,7 @@ done
 sources_for_target() {
   case "$1" in
     IPATool)
-      printf '%s\n' "$HERE/KeepAlive.m" "$HERE/ControlPanel.m" "$HERE/FileBridge.m" "$OUT_DIR/IPAToolIcon.m"
+      printf '%s\n' "$HERE/ControlPanel.m" "$HERE/FileBridge.m" "$OUT_DIR/IPAToolIcon.m"
       ;;
     *)
       if [[ "$1" == "ControlPanel" ]]; then
@@ -99,7 +99,6 @@ sources_for_target() {
 # 源文件 -> 还需要额外链接的框架（合并目标取各源文件依赖的并集）
 frameworks_for_source() {
   case "$(basename "$1" .m)" in
-    KeepAlive)   printf '%s\n' -framework CoreLocation -weak_framework BackgroundTasks ;;
     # UniformTypeIdentifiers 是 iOS 14 才有的框架，用 weak 链接兼容更低的部署目标
     FileBridge)  printf '%s\n' -weak_framework UniformTypeIdentifiers -lz ;;
   esac
@@ -142,8 +141,7 @@ build_target() {
     -mios-version-min="$MIN_IOS" \
     -isysroot "$SDK" \
     -framework Foundation -framework UIKit -framework CoreGraphics \
-    -framework AVFoundation -framework CoreMedia -framework CoreVideo \
-    -framework AVKit -framework QuartzCore \
+    -framework QuartzCore \
     ${extra[@]+"${extra[@]}"} \
     -install_name "@executable_path/Frameworks/$name.dylib" \
     -o "$out" "${srcs[@]}"; then

@@ -32,7 +32,6 @@ echo "编译 ${EXE} (arm64 / min iOS 14.0)"
   -Wl,-headerpad_max_install_names \
   -framework Foundation \
   -framework UIKit \
-  -framework AVFoundation \
   -o "$BUNDLE/$EXE" \
   Demo.m
 

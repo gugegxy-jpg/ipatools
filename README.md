@@ -16,7 +16,6 @@
 - 递归替换 plist 中所有引用旧 Bundle ID 的字符串
 - 同步修改 `*.lproj/InfoPlist.strings` 中的本地化显示名（可用 `--no-localized` 关闭）
 - **注入 dylib**（`inject`）：放进 `Frameworks/` 并给主可执行文件追加 `LC_LOAD_DYLIB`，支持 fat 二进制、幂等
-- **切后台继续运行**：`inject --keep-alive` 注入保活 tweak（静音音频 + 后台任务续期，可选后台定位/系统定时唤醒），适合游戏切后台继续热更、下载
 - **文件导入导出**：`inject --files` 注入文件桥，在悬浮面板里浏览 App 沙盒，把热更资源（补丁/配置/存档）导出到系统「文件」App，或从「文件」App 导入回沙盒
 - **应用内悬浮控制面板**：上面这些功能会顺带注入一个悬浮窗，点开即可在 App 里实时开关 / 操作它们（`--no-panel` 可关掉）
 - 重打包时尽量保留 Mach-O 可执行权限
@@ -87,7 +86,7 @@ python -m ipatool.gui
 - 顶部选输入（`.ipa` 或已解包且含 `Payload` 的目录）和输出路径；选完输入会自动解析一次信息。
 - 「签名」页的「读取系统证书」会列出可用身份并填进下拉框，和 `certs` 一样。
 - 「预览（dry-run）」= 在当前页签的参数上追加 `--dry-run`，先看会改什么；「开始执行」才真正落盘。
-- 「注入 dylib」页只提供 dylib 注入（`--dylib`）和 Info.plist 附加配置；内置的后台保活 / 文件导入导出 / 悬浮窗请用命令行：`python -m ipatool inject <包> --keep-alive --files`。
+- 「注入 dylib」页只提供 dylib 注入（`--dylib`）和 Info.plist 附加配置；内置的文件导入导出 / 悬浮窗请用命令行：`python -m ipatool inject <包> --files`。
 - 日志区实时滚动命令输出（等价于把拼出来的命令行贴进终端），证书密码在回显里打码。
 - 任务跑在后台线程，界面不会卡死；同一时刻只允许一个任务。
 - 界面不重复实现业务逻辑：它只是把控件上的值拼成一份 argv 再交给 `cli.main()`，所以提示、警告、退出码和命令行完全一致。
@@ -141,96 +140,9 @@ python -m ipatool inject app.ipa --dylib MyTweak.dylib --dry-run
 - **幂等**：同一路径已存在时跳过，重复注入不会叠加。
 - **必须重签**：改了主可执行文件后原签名必然失效，`--sign none` 出来的包只能越狱设备用，工具会明确警告。
 
-
-### 切后台继续运行（`--keep-alive`）
-
-给 App 注入保活组件：切到后台后进程不被挂起，网络下载 / 热更继续跑。
-
-```bash
-# 默认方式：静音音频保活（最稳）
-python -m ipatool inject game.ipa --keep-alive \
-  --p12 cert.p12 --p12-password 123456 \
-  --provision app.mobileprovision -o out.ipa
-
-# 再加系统定时唤醒，并允许明文 HTTP（热更服务器很常见）
-python -m ipatool inject game.ipa --keep-alive --keep-alive-fetch \
-  --allow-arbitrary-loads \
-  --identity "Apple Development: xxx (TEAMID)" -o out.ipa
-
-# 用近乎无声的底噪代替纯静音
-python -m ipatool inject game.ipa --keep-alive --keep-alive-audio-file quiet.m4a -o out.ipa
-
-```
-
-| 参数 | 说明 |
-| --- | --- |
-| `--keep-alive` | 注入保活 tweak，自动补 `UIBackgroundModes: audio`，并移除 `UIApplicationExitsOnSuspend` |
-| `--keep-alive-dylib` | 保活 dylib 路径，默认找 `tweak/build/`（macOS 上找不到会自动编译） |
-| `--keep-alive-start-on` | 静音音频何时开始：`launch`（默认，最稳）/ `background`（省电，但可能来不及） |
-| `--keep-alive-no-audio` | 不播静音音频，只靠后台任务续期（通常只能多撑几十秒） |
-| `--keep-alive-audio-file` | 改用指定音频文件循环播放（放到 App 包内并写入 `AudioFile`） |
-| `--keep-alive-no-task-renew` | 不再续期 `beginBackgroundTask` |
-| `--keep-alive-renew-lead-time` | 提前多少秒续期后台任务，默认 10 |
-| `--keep-alive-location` | 追加 `location` 后台模式并写定位权限说明（耗电、要授权、App Store 会拒） |
-| `--keep-alive-location-indicator` | 显示定位蓝色指示条（默认隐藏） |
-| `--keep-alive-fetch` / `--keep-alive-processing` | 注册 `BGAppRefreshTask` / `BGProcessingTask`，并补 `BGTaskSchedulerPermittedIdentifiers` |
-| `--keep-alive-refresh-interval` | 定时唤醒的最短间隔，默认 900 秒 |
-| `--background-mode` | 额外追加到 `UIBackgroundModes` 的值，如 `processing` |
-| `--dylib` | 注入任意 dylib，可重复指定 |
-| `--allow-arbitrary-loads` | 写 `NSAllowsArbitraryLoads=YES`，热更走明文 HTTP 时需要 |
-
-保活原理（`tweak/KeepAlive.m`），按可靠性排序：
-
-0. **画中画**（默认开）：切后台自动进系统画中画、回前台自动退出。App「正在为画中画提供画面」时系统不会挂起进程，这是目前最不容易被掐断的一档；能用画中画时静音音频会自动让位（两者做的是同一件事，不叠加），起不来时自动退回静音音频。画面是运行时生成的循环占位视频（iOS 不允许把 App 实时画面直接送进画中画）。
-1. **静音音频**（默认开）：以 `.playback` 类别循环播放一段全 0 采样的音频。iOS 只要认为 App 在播放音频，就不会把进程挂起 —— 这是最可靠的一招，也是「后台热更」能成立的关键。
-2. **后台任务续期**（默认开）：不断 `beginBackgroundTaskWithName:`，在音频被电话/其它 App 抢断时兜底。
-3. **后台定位**（可选）：`CLLocationManager` 开后台定位，需要用户授「始终」权限。
-4. **定时唤醒**（可选）：`BGTaskScheduler` 定期把进程唤醒并续注册下一个任务。
-
-#### 画中画起不来怎么排查
-
-面板上会直接写原因（`画中画不可用（…）`），按原因对号入座：
-
-| 面板显示的原因 | 含义 | 怎么修 |
-| --- | --- | --- |
-| 缺后台模式 audio | 包里 `UIBackgroundModes` 没有 `audio`，`AVPictureInPictureController.isPictureInPictureSupported` 直接返回 NO | 用 `python -m ipatool inject <包> --keep-alive`（会自动补 audio）重新注入；用 `python -m ipatool info <包>` 确认 |
-| 会话非 playback | 有 audio 模式，但音频会话不是 playback（App 自己改过） | 一般几秒内会自动顶回来；一直这样说明 App 在持续改写会话，只能靠静音音频那条链路 |
-| 未拿到 App 窗口 | dylib 加载时 App 窗口还没建出来，宿主视图挂不上 | 已自动重试：窗口出现 / App 变活跃时会再准备一次，不用管 |
-| 占位视频生成失败 | 写 `Caches/ipatool-pip.mp4` 失败（磁盘/编码器） | 清一下 App 数据重装；仍是则只能用静音音频 |
-| 画面未渲染 / 系统拒绝启动 | 控制器建好了但 `isPictureInPicturePossible=NO` | 检查系统「设置 → 通用 → 画中画 → 自动开启画中画」是否打开（iPad 上还要看「多任务」相关开关） |
-
-另外几条常见误解：
-
-- **和证书类型无关**：画中画不需要额外 entitlement，开发证书 / 企业证书 / 自签都一样能起，起不来几乎都是 `UIBackgroundModes: audio` 或系统设置的问题。
-- **GUI 的「注入 dylib」页不会注入保活**：保活（含画中画）必须用命令行 `--keep-alive`，GUI 只负责注入你自己的 dylib 和 Info.plist 附加项。
-- 真机排查看控制台里 `[ipatool-keepalive]` 前缀的日志（或 App 沙盒 `Documents/ipatool.log`），启动时会打一行「保活环境」：`iOS 版本 / UIBackgroundModes / 当前音频会话`。
-
-配置写在 `Info.plist` 的 `IPAToolKeepAlive` 字典里，上面的参数就是往里写键，也可以事后自己改：
-
-```xml
-<key>IPAToolKeepAlive</key>
-<dict>
-  <key>SilentAudio</key><true/>
-  <key>StartAtLaunch</key><true/>
-  <key>RenewBackgroundTask</key><true/>
-  <key>RenewLeadTime</key><real>10</real>
-  <key>Location</key><false/>
-  <key>Fetch</key><false/>
-  <key>Processing</key><false/>
-  <key>RefreshInterval</key><integer>900</integer>
-  <key>Log</key><true/>
-</dict>
-```
-
-> ⚠️ **边界要说清楚**
-> - 注入只能保证「进程不被挂起」，**不能改变 App 自己的暂停逻辑**。很多游戏/引擎会在 `applicationDidEnterBackground` 里主动暂停热更与下载，这种情况注入改不了，需要游戏侧配合（如 Unity 的 `Application.runInBackground`）。
-> - 保活是尽力而为：低电量模式、系统内存回收、用户上滑杀进程都会终止它。
-> - `--keep-alive-location` 耗电、需定位权限，且不符合 App Store 审核条款，只建议自用或内部分发。
-> - 真机排查看控制台里 `[ipatool-keepalive]` 前缀的日志。
-
 ### 应用内悬浮控制面板（悬浮窗）
 
-注入 `--keep-alive` 或 `--files` 时会**顺带注入一个悬浮窗**：App 里出现一个可拖动的小胶囊按钮，点开就是控制面板，能实时开关上面这些功能，不用改包重启。
+注入 `--files` 时会**顺带注入一个悬浮窗**：App 里出现一个可拖动的小胶囊按钮，点开就是控制面板，能实时开关上面这些功能，不用改包重启。
 
 - 按钮默认显示 `IPAT`（`--panel-title` 可改）；有功能开着是绿色，全关是灰色
 - 按钮可拖到任意位置，位置会被记住；面板贴着按钮弹出
@@ -239,15 +151,14 @@ python -m ipatool inject game.ipa --keep-alive --keep-alive-audio-file quiet.m4a
 - 不要界面就用 `--no-panel`
 
 ```bash
-python -m ipatool inject game.ipa --keep-alive -o out.ipa                # 默认带悬浮窗
-python -m ipatool inject game.ipa --keep-alive --no-panel -o out.ipa      # 只要功能，不要界面
-python -m ipatool inject game.ipa --panel --panel-title 调试 -o out.ipa  # 只要悬浮窗
 python -m ipatool inject game.ipa --files -o out.ipa                     # 文件导入导出（带悬浮窗）
+python -m ipatool inject game.ipa --files --no-panel -o out.ipa          # 只要功能，不要界面
+python -m ipatool inject game.ipa --panel --panel-title 调试 -o out.ipa  # 只要悬浮窗
 ```
 
 | 参数 | 说明 |
 | --- | --- |
-| `--panel` | 强制注入悬浮窗（不配 `--keep-alive/--files` 也能单独用，会显示“没有可控制的功能”） |
+| `--panel` | 强制注入悬浮窗（不配 `--files` 也能单独用，会显示“没有可控制的功能”） |
 | `--no-panel` | 不注入悬浮窗 |
 | `--panel-dylib` | 悬浮窗 dylib 路径，默认找 `tweak/build/`（macOS 上找不到会自动编译） |
 | `--panel-title` | 悬浮按钮上的文字，默认 `IPAT` |
@@ -256,9 +167,6 @@ python -m ipatool inject game.ipa --files -o out.ipa                     # 文�
 
 | 面板项 | 对应配置 | 立即生效 |
 | --- | --- | --- |
-| 后台保活（无总开关，默认开） | — | 下面是两个手段，都关掉 = 关保活 |
-| ├ 画中画保活 | `IPAToolKeepAlive.PictureInPicture` | 是（切后台自动开、回前台自动关） |
-| └ 静音音频保活 | `IPAToolKeepAlive.SilentAudio` | 是（画中画在跑时自动停，关掉则完全不播） |
 | 文件导入导出（常开） | `IPAToolFiles.Enabled` | 否（注入即用，面板没有开关；要关只能改 Info.plist） |
 | ├ 浏览并导出文件（动作行） | — | 打开沙盒文件浏览器，导出自动打包 zip |
 | └ 导入文件（动作行） | `IPAToolFiles.ImportDir`（默认落地目录） | 挑好落地目录后，在「文件」App 里选文件 / zip（可多选，zip 自动解压） |
@@ -267,9 +175,6 @@ python -m ipatool inject game.ipa --files -o out.ipa                     # 文�
 
 | 隐藏项 | 参数 / 配置键 | 为什么不在面板里 |
 | --- | --- | --- |
-| 后台任务续期 | `--keep-alive-no-task-renew` / `RenewBackgroundTask` | 默认开，画中画和静音音频都没跑时的兜底，一般不用动 |
-| 后台定位 | `--keep-alive-location` / `Location` | 要用户授「始终」权限、耗电，且不符合 App Store 审核 |
-| 定时唤醒 | `--keep-alive-fetch` / `Fetch` | 开启要重启 App（launch handler 只能在启动阶段注册），面板上点了也没用 |
 | 导入默认落地目录 | `--files-import-dir` / `ImportDir` | 导入时现挑目录更直观，面板不再预设 |
 
 面板写入的值存在 `NSUserDefaults`（键名前缀 `IPAToolPanel`），**优先级高于 Info.plist 里的初始值**：命令行参数只决定"用户还没在面板里改过时"的默认状态。想回到命令行给的默认值，就删掉 App 的偏好设置或卸载重装。
@@ -316,7 +221,7 @@ python -m ipatool inject game.ipa --files --no-files-sharing -o out.ipa   # 不�
      落地目录里被覆盖的旧内容（旧内容删掉前一直占着）。2.5G 的包覆盖同名热更目录，
      实际要 8～10G 空闲才稳；解压前会预检，不够会直接报「沙盒空间不足」（含具体 GB 数）。
    - **别切后台 / 别锁屏**：导入跑在 App 进程里，进程被挂起或回收就前功尽弃，
-     进度框消失、重开游戏资源没变就是这个。要长时间挂着就一起注入 `--keep-alive`。
+     进度框消失、重开游戏资源没变就是这个。
    - **解压中途也会看剩余空间**：剩不到 0.5G 会主动中止并说清原因，不会等到写失败
      （以前的表现是进度停在某个数字后提示消失，分不清是空间不够还是包坏了）。
    - **失败一定弹窗**：不再只写状态行（面板折叠时看不见，看起来就像"没提示了"）。
@@ -359,22 +264,22 @@ python -m ipatool inject game.ipa --files --no-files-sharing -o out.ipa   # 不�
 
 ### 编译内置 tweak
 
-三个内置功能（保活 / 悬浮窗 / 文件导入导出）的源码是分开的，但**默认合编成一个 `IPATool.dylib`**：
-注入一次就够，开哪些功能由 `Info.plist` 里 `IPAToolKeepAlive` / `IPAToolControl` / `IPAToolFiles`
+两个内置功能（悬浮窗 / 文件导入导出）的源码是分开的，但**默认合编成一个 `IPATool.dylib`**：
+注入一次就够，开哪些功能由 `Info.plist` 里 `IPAToolControl` / `IPAToolFiles`
 的 `Enabled` 决定（`ipatool inject` 会把没用到的功能自动写成 `Enabled=NO`）。
-三者之间只用「通知 + NSUserDefaults」通信（见 `tweak/IPATControlShared.h`），
+两者之间只用「通知 + NSUserDefaults」通信（见 `tweak/IPATControlShared.h`），
 顶层函数全是 `static`、类名前缀各不相同，所以合编不会撞符号。
 
 ```bash
 ./tweak/build.sh                                       # 产物：tweak/build/IPATool.dylib
-IPATOOL_TARGETS=KeepAlive ./tweak/build.sh             # 只编译保活（单独出一个 dylib）
-IPATOOL_TARGETS="KeepAlive FileBridge" ./tweak/build.sh  # 一次编译多个目标
+IPATOOL_TARGETS=FileBridge ./tweak/build.sh            # 只编译文件功能（单独出一个 dylib）
+IPATOOL_TARGETS="ControlPanel FileBridge" ./tweak/build.sh  # 一次编译多个目标
 IPATOOL_ARCHS="arm64 arm64e" ./tweak/build.sh
 IPATOOL_MIN_IOS=15.0 ./tweak/build.sh
 ```
 
 想让某个功能用自己编译的单独 dylib，注入时显式给路径即可，
-那时会退回「一个功能一个 dylib」的老方式（`--keep-alive-dylib` / `--files-dylib` / `--panel-dylib`）。
+那时会退回「一个功能一个 dylib」的老方式（`--files-dylib` / `--panel-dylib`）。
 
 > ⚠️ 这些 tweak 的源码是按 Apple 公开 API 写的，但我无法在这里编译/真机验证（需要 macOS + Xcode + 真实设备）。
 >
@@ -397,11 +302,10 @@ ipatool/
   plistutil.py plist 与 InfoPlist.strings 读写
   bundle.py    bundle 发现与 ID / 名称改写
   macho.py     Mach-O 解析与 LC_LOAD_DYLIB 注入
-  inject.py    dylib 落位、Info.plist 注入配置（后台保活 / 文件导入导出 / 后台模式 / ATS）
+  inject.py    dylib 落位、Info.plist 注入配置（文件导入导出 / 后台模式 / ATS）
   keystore.py  签名身份管理：身份列举 / p12 导入钥匙串 / Windows 证书导出
   signer.py    codesign / zsign 重签名
 tweak/
-  KeepAlive.m           后台保活注入 dylib 源码
   ControlPanel.m        应用内悬浮控制面板（悬浮按钮 + 开关小窗口）
   FileBridge.m          沙盒文件浏览 / 导出到「文件」App / 从「文件」App 导入
   IPATControlShared.h   面板与各功能 dylib 之间的约定（通知名 / 配置键）

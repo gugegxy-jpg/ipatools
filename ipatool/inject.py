@@ -1,11 +1,7 @@
 """
 dylib 注入：把动态库放进 App 的 Frameworks/ 并给主可执行文件加 LC_LOAD_DYLIB。
 
-附带「切后台之后还能继续跑」的配置：
-  - 后台保活（--keep-alive）：UIBackgroundModes 补 audio（可选 location/fetch/processing）
-    + 写入 IPAToolKeepAlive 配置字典 + 定时唤醒任务标识 + 定位权限说明
-
-还有一种和后台保活配套的「文件导入导出」（--files）：
+附带「文件导入导出」（--files）：
   - 写入 IPAToolFiles 配置字典 + 让 App 的 Documents 在系统「文件」App 里可见
     （UIFileSharingEnabled / LSSupportsOpeningDocumentsInPlace）
   - 用来把游戏热更资源导出到「文件」App，或从「文件」App 导回沙盒
@@ -14,8 +10,8 @@ dylib 注入：把动态库放进 App 的 Frameworks/ 并给主可执行文件�
 用哪个功能由对应的 Info.plist 配置字典决定（没用到的会写成 Enabled=NO）；
 用 --no-panel 可以不带悬浮窗。
 
-需要单独出包时（比如改了某个功能只想重编它）可以用 --keep-alive-dylib /
---files-dylib / --panel-dylib 指定单独的 dylib，那时退回一功能一库的注入方式。
+需要单独出包时（比如改了某个功能只想重编它）可以用 --files-dylib /
+--panel-dylib 指定单独的 dylib，那时退回一功能一库的注入方式。
 """
 from __future__ import annotations
 
@@ -28,18 +24,6 @@ from . import ipa as ipa_mod
 from . import macho, plistutil
 from .bundle import Bundle, Change
 
-KEEP_ALIVE_DYLIB_NAME = "KeepAlive.dylib"
-KEEP_ALIVE_INFO_KEY = "IPAToolKeepAlive"
-KEEP_ALIVE_REQUIRED_BACKGROUND_MODE = "audio"
-KEEP_ALIVE_AUDIO_STEM = "ipatool_keepalive_audio"
-BG_REFRESH_TASK_ID = "com.ipatool.keepalive.refresh"
-BG_PROCESSING_TASK_ID = "com.ipatool.keepalive.processing"
-LOCATION_USAGE_KEYS = (
-    "NSLocationWhenInUseUsageDescription",
-    "NSLocationAlwaysAndWhenInUseUsageDescription",
-)
-LOCATION_USAGE_TEXT = "App 需要在后台继续更新资源"
-
 CONTROL_PANEL_DYLIB_NAME = "ControlPanel.dylib"
 CONTROL_PANEL_INFO_KEY = "IPAToolControl"
 PANEL_NAME = "ControlPanel"
@@ -49,15 +33,14 @@ FILES_INFO_KEY = "IPAToolFiles"
 FILES_NAME = "FileBridge"
 FILES_DEFAULT_IMPORT_DIR = "Documents"
 
-# 三个内置功能默认合编成一个 IPATool.dylib：只注入一次，
-# 开哪些功能由 Info.plist 里 IPAToolKeepAlive / IPAToolControl / IPAToolFiles 的 Enabled 决定。
+# 两个内置功能默认合编成一个 IPATool.dylib：只注入一次，
+# 开哪些功能由 Info.plist 里 IPAToolControl / IPAToolFiles 的 Enabled 决定。
 # 单功能 dylib 仍然支持（显式给了某个功能的 dylib 路径时就用老的分离注入）。
 MERGED_DYLIB_NAME = "IPATool.dylib"
 MERGED_NAME = "IPATool"
 
 # 注入的内置 tweak：名字 -> (dylib 文件名, 环境变量)
 TWEAKS = {
-    "KeepAlive": (KEEP_ALIVE_DYLIB_NAME, "IPATOOL_KEEPALIVE_DYLIB"),
     PANEL_NAME: (CONTROL_PANEL_DYLIB_NAME, "IPATOOL_CONTROL_DYLIB"),
     FILES_NAME: (FILES_DYLIB_NAME, "IPATOOL_FILES_DYLIB"),
     MERGED_NAME: (MERGED_DYLIB_NAME, "IPATOOL_DYLIB"),
@@ -145,10 +128,6 @@ def locate_tweak_dylib(
     )
 
 
-def locate_keep_alive_dylib(explicit: str | None = None, auto_build: bool = True, log=print) -> str:
-    return locate_tweak_dylib("KeepAlive", explicit=explicit, auto_build=auto_build, log=log)
-
-
 def locate_control_panel_dylib(explicit: str | None = None, auto_build: bool = True, log=print) -> str:
     return locate_tweak_dylib(PANEL_NAME, explicit=explicit, auto_build=auto_build, log=log)
 
@@ -158,7 +137,7 @@ def locate_files_dylib(explicit: str | None = None, auto_build: bool = True, log
 
 
 def locate_merged_dylib(explicit: str | None = None, auto_build: bool = True, log=print) -> str:
-    """定位合编了三个功能的 IPATool.dylib。"""
+    """定位合编了两个功能的 IPATool.dylib。"""
     return locate_tweak_dylib(MERGED_NAME, explicit=explicit, auto_build=auto_build, log=log)
 
 
@@ -229,82 +208,6 @@ def inject_dylib(
     return logs
 
 
-def build_keep_alive_options(
-    silent_audio: bool | None = None,
-    enabled: bool | None = None,
-    pip: bool | None = None,
-    start_on: str | None = None,
-    task_renew: bool | None = None,
-    renew_lead_time: float | None = None,
-    audio_file: str | None = None,
-    location: bool | None = None,
-    location_indicator: bool | None = None,
-    fetch: bool | None = None,
-    processing: bool | None = None,
-    refresh_interval: int | None = None,
-) -> dict:
-    """只写入显式指定的项，其余交给 dylib 里的默认值。"""
-    options: dict = {}
-    if enabled is not None:
-        options["Enabled"] = enabled
-    if pip is not None:
-        options["PictureInPicture"] = pip
-    if silent_audio is not None:
-        options["SilentAudio"] = silent_audio
-    if start_on:
-        options["StartAtLaunch"] = start_on == "launch"
-    if task_renew is not None:
-        options["RenewBackgroundTask"] = task_renew
-    if renew_lead_time:
-        options["RenewLeadTime"] = float(renew_lead_time)
-    if audio_file:
-        options["AudioFile"] = audio_file
-    if location is not None:
-        options["Location"] = location
-    if location_indicator is not None:
-        options["LocationIndicator"] = location_indicator
-    if fetch is not None:
-        options["Fetch"] = fetch
-    if processing is not None:
-        options["Processing"] = processing
-    if refresh_interval:
-        options["RefreshInterval"] = int(refresh_interval)
-    return options
-
-
-def keep_alive_background_modes(
-    silent_audio: bool = True,
-    location: bool = False,
-    fetch: bool = False,
-    processing: bool = False,
-    pip: bool = True,
-) -> list[str]:
-    modes: list[str] = []
-    # 静音音频和画中画都要求 UIBackgroundModes 里有 audio
-    if silent_audio or pip:
-        modes.append(KEEP_ALIVE_REQUIRED_BACKGROUND_MODE)
-    if location:
-        modes.append("location")
-    if fetch:
-        modes.append("fetch")
-    if processing:
-        modes.append("processing")
-    return modes
-
-
-def keep_alive_scheduler_ids(fetch: bool = False, processing: bool = False) -> list[str]:
-    ids: list[str] = []
-    if fetch:
-        ids.append(BG_REFRESH_TASK_ID)
-    if processing:
-        ids.append(BG_PROCESSING_TASK_ID)
-    return ids
-
-
-def keep_alive_audio_name(audio_path: str) -> str:
-    return KEEP_ALIVE_AUDIO_STEM + os.path.splitext(audio_path)[1].lower()
-
-
 # --------------------------------------------------------------------------- #
 # 悬浮控制面板配置
 # --------------------------------------------------------------------------- #
@@ -350,9 +253,6 @@ def configure_plist(
     app: Bundle,
     background_modes: list[str] | None = None,
     settings: list[tuple[str, dict, str]] | None = None,
-    location: bool = False,
-    scheduler_ids: list[str] | None = None,
-    strip_exit_on_suspend: bool = False,
     ats_arbitrary_loads: bool = False,
     file_sharing: bool = False,
     dry_run: bool = False,
@@ -362,9 +262,6 @@ def configure_plist(
 
       - background_modes：追加到 UIBackgroundModes
       - settings：[(Info.plist 键, 配置字典, 说明)]，与已有字典合并
-      - location：补定位权限说明（缺这两项时 allowsBackgroundLocationUpdates 不生效）
-      - scheduler_ids：补 BGTaskSchedulerPermittedIdentifiers（BGTaskScheduler 要求提前声明）
-      - strip_exit_on_suspend：移除 UIApplicationExitsOnSuspend（切后台即退出，会让保活失效）
       - ats_arbitrary_loads：NSAllowsArbitraryLoads=YES（热更服务器常用明文 HTTP）
       - file_sharing：让 App 的 Documents 出现在系统「文件」App 里（导出/导入热更资源要用）
     """
@@ -376,7 +273,7 @@ def configure_plist(
     changes: list[Change] = []
     warnings: list[str] = []
 
-    # 1) 后台模式（保活要 audio，这里去重）
+    # 1) 后台模式（去重）
     modes = data.get("UIBackgroundModes")
     modes = list(modes) if isinstance(modes, list) else []
     wanted: list[str] = []
@@ -402,35 +299,7 @@ def configure_plist(
             Change(app.rel, key, None, ", ".join(f"{k}={_fmt(v)}" for k, v in merged.items()), note=note)
         )
 
-    # 3) 定位权限说明
-    if location:
-        for key in LOCATION_USAGE_KEYS:
-            if not data.get(key):
-                data[key] = LOCATION_USAGE_TEXT
-                changes.append(Change(app.rel, key, None, LOCATION_USAGE_TEXT, note="定位权限说明"))
-
-    # 4) 定时唤醒任务标识
-    if scheduler_ids:
-        declared = data.get("BGTaskSchedulerPermittedIdentifiers")
-        declared = list(declared) if isinstance(declared, list) else []
-        missing = [i for i in scheduler_ids if i not in declared]
-        if missing:
-            declared.extend(missing)
-            data["BGTaskSchedulerPermittedIdentifiers"] = declared
-            changes.append(
-                Change(app.rel, "BGTaskSchedulerPermittedIdentifiers", None, ", ".join(declared),
-                       note="定时唤醒")
-            )
-
-    # 5) 切后台即退出会直接让保活失效
-    if strip_exit_on_suspend:
-        for key in ("UIApplicationExitsOnSuspend", "UIApplicationExitOnSuspend"):
-            value = data.get(key)
-            if value:
-                data.pop(key)
-                changes.append(Change(app.rel, key, _fmt(value), "已移除", note="切后台即退出，会阻止保活"))
-
-    # 6) ATS：热更服务器常用明文 HTTP
+    # 3) ATS：热更服务器常用明文 HTTP
     if ats_arbitrary_loads:
         ats = data.get("NSAppTransportSecurity")
         ats = dict(ats) if isinstance(ats, dict) else {}
@@ -439,7 +308,7 @@ def configure_plist(
             data["NSAppTransportSecurity"] = ats
             changes.append(Change(app.rel, "NSAllowsArbitraryLoads", None, "YES", note="允许明文 HTTP"))
 
-    # 7) 让 Documents 出现在「文件」App 的「我的 iPhone」里，方便导出/导入热更资源
+    # 4) 让 Documents 出现在「文件」App 的「我的 iPhone」里，方便导出/导入热更资源
     if file_sharing:
         for key, note in (
             ("UIFileSharingEnabled", "「文件」App 可浏览 Documents"),
@@ -452,31 +321,6 @@ def configure_plist(
     if data != original and not dry_run:
         plistutil.dump_plist(app.plist_path, data)
     return changes, warnings
-
-
-def place_bundle_file(
-    app: Bundle,
-    src: str,
-    dest_name: str,
-    note: str,
-    dry_run: bool = False,
-) -> list[Change]:
-    """把素材文件放进 App 包根目录（Info.plist 里只写文件名即可被 mainBundle 找到）。"""
-    if not os.path.isfile(src):
-        raise InjectError(f"找不到文件: {src}")
-    dest = os.path.join(app.path, dest_name)
-    if not dry_run:
-        shutil.copyfile(src, dest)
-        try:
-            shutil.copymode(src, dest)
-        except OSError:
-            pass
-    return [Change(app.rel, dest_name, None, "已放入包内", note=note)]
-
-
-def place_keep_alive_audio(app: Bundle, audio: str, dry_run: bool = False) -> tuple[list[Change], list[str]]:
-    changes = place_bundle_file(app, audio, keep_alive_audio_name(audio), "保活音频", dry_run=dry_run)
-    return changes, []
 
 
 def list_injected(app: Bundle) -> list[str]:
