@@ -2255,8 +2255,8 @@ done:
                                                          @"杀掉游戏冷启动才会按新内容重新加载。",
                                                          where, over]
                                          preferredStyle:UIAlertControllerStyleAlert];
-        [done addAction:[UIAlertAction actionWithTitle:@"知道了"
-                                                 style:UIAlertActionStyleCancel handler:nil]];
+        // 只留「退出游戏」：导入完就是要冷启动按新资源加载，不给「知道了」的退路，
+        // 免得留在旧进程里继续跑，白导一趟（不点就一直停在这个框上）
         [done addAction:[UIAlertAction actionWithTitle:@"退出游戏"
                                                  style:UIAlertActionStyleDestructive
                                                handler:^(UIAlertAction *action) {
