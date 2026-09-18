@@ -170,7 +170,7 @@ static inline void IPATAlignWindowToInterface(UIWindow *window, UIWindow *appWin
         // 只跟「整 90°/180°」的旋转，而且只取角度、不带缩放
         CGFloat angle = atan2f((float)candidate.b, (float)candidate.a);
         CGFloat quarters = roundf(angle / (float)M_PI_2);
-        if (fabsf(angle - quarters * (float)M_PI_2) < 0.05f) {
+        if (fabs(angle - quarters * (float)M_PI_2) < 0.05f) {
             rotation = CGAffineTransformMakeRotation(quarters * (CGFloat)M_PI_2);
         }
     }
@@ -189,7 +189,6 @@ static inline void IPATAlignWindowToInterface(UIWindow *window, UIWindow *appWin
         window.transform = rotation;
     } else {
         window.frame = screen;
-    }
     }
     window.rootViewController.view.frame = window.bounds;
 }
