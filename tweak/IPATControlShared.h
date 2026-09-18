@@ -135,6 +135,7 @@ static void IPATAppendLogLine(NSString *line) {
 // 面板只暴露常用项；标注「仅 plist」的没有面板开关，只能用 Info.plist / 命令行参数配置。
 
 #define IPATKeyKAEnabled @"IPAToolPanelKeepAliveEnabled"
+#define IPATKeyKAPiP @"IPAToolPanelKeepAlivePiP"            // 画中画保活（切后台自动开画中画）
 #define IPATKeyKAFetch @"IPAToolPanelKeepAliveFetch"        // 仅 plist：开启要重启 App，面板上点了没用
 #define IPATKeyKALocation @"IPAToolPanelKeepAliveLocation"  // 仅 plist：要授权、耗电、过不了审
 
@@ -221,11 +222,17 @@ static inline UIInterfaceOrientationMask IPATAppOrientationMask(void) {
 /// 拿不到游戏窗口（或它不是全屏的）时才退回按屏幕尺寸算。
 static inline void IPATAlignWindowToInterface(UIWindow *window, UIWindow *appWindow) {
     if (!window) return;
-    window.transform = CGAffineTransformIdentity;
-    window.rootViewController.view.transform = CGAffineTransformIdentity;
 
     CGRect screen = [UIScreen mainScreen].bounds;
     BOOL hasScreen = (screen.size.width > 0 && screen.size.height > 0);
+
+    // 先把「应该变成什么样」算出来，已经是这样就一个字节都别动：
+    // 这个对齐会被反复调用（转屏通知、弹窗盯梢轮询），系统转屏动画还在跑的时候
+    // 反复写 frame/transform 会把界面抖成一团
+    CGRect targetBounds = window.bounds;
+    CGPoint targetCenter = window.center;
+    CGAffineTransform targetTransform = window.transform;
+    BOOL resolved = NO;
 
     if (appWindow) {
         CGRect target = appWindow.bounds;
@@ -233,47 +240,69 @@ static inline void IPATAlignWindowToInterface(UIWindow *window, UIWindow *appWin
         CGFloat screenArea = screen.size.width * screen.size.height;
         // 面积够大就认定它是主窗口，直接绑死（小窗/带缩放的 App 窗口不适用）
         if (area > 0 && (!hasScreen || screenArea <= 0 || area >= screenArea * 0.6)) {
-            window.bounds = target;
-            window.center = appWindow.center;
-            window.transform = appWindow.transform;
-            if (window.rootViewController.view) {
-                window.rootViewController.view.frame = window.bounds;
+            targetBounds = target;
+            targetCenter = appWindow.center;
+            targetTransform = appWindow.transform;
+            resolved = YES;
+        }
+    }
+
+    if (!resolved) {
+        if (!hasScreen) return;
+        CGAffineTransform candidate = CGAffineTransformIdentity;
+        UIView *appRoot = appWindow ? appWindow.rootViewController.view : nil;
+        if (appWindow && !CGAffineTransformIsIdentity(appWindow.transform)) {
+            candidate = appWindow.transform;
+        } else if (appRoot && !CGAffineTransformIsIdentity(appRoot.transform)) {
+            candidate = appRoot.transform;
+        }
+        CGAffineTransform rotation = CGAffineTransformIdentity;
+        if (!CGAffineTransformIsIdentity(candidate)) {
+            // 只跟「整 90°/180°」的旋转，而且只取角度、不带缩放
+            CGFloat angle = atan2f((float)candidate.b, (float)candidate.a);
+            CGFloat quarters = roundf(angle / (float)M_PI_2);
+            if (fabs(angle - quarters * (float)M_PI_2) < 0.05f) {
+                rotation = CGAffineTransformMakeRotation(quarters * (CGFloat)M_PI_2);
             }
-            return;
         }
-    }
-    if (!hasScreen) return;
-
-    CGAffineTransform candidate = CGAffineTransformIdentity;
-    UIView *appRoot = appWindow ? appWindow.rootViewController.view : nil;
-    if (appWindow && !CGAffineTransformIsIdentity(appWindow.transform)) {
-        candidate = appWindow.transform;
-    } else if (appRoot && !CGAffineTransformIsIdentity(appRoot.transform)) {
-        candidate = appRoot.transform;
-    }
-    CGAffineTransform rotation = CGAffineTransformIdentity;
-    if (!CGAffineTransformIsIdentity(candidate)) {
-        // 只跟「整 90°/180°」的旋转，而且只取角度、不带缩放
-        CGFloat angle = atan2f((float)candidate.b, (float)candidate.a);
-        CGFloat quarters = roundf(angle / (float)M_PI_2);
-        if (fabs(angle - quarters * (float)M_PI_2) < 0.05f) {
-            rotation = CGAffineTransformMakeRotation(quarters * (CGFloat)M_PI_2);
+        if (!CGAffineTransformIsIdentity(rotation)) {
+            // 游戏是自己转过窗口的（系统不知道）：照抄角度，尺寸用「转回来」的大小，
+            // 这样转出去之后正好铺满屏幕
+            CGRect unrotated = CGRectApplyAffineTransform(
+                CGRectMake(0, 0, screen.size.width, screen.size.height),
+                CGAffineTransformInvert(rotation));
+            targetBounds = CGRectMake(0, 0, fabs(unrotated.size.width), fabs(unrotated.size.height));
+            targetTransform = rotation;
+        } else {
+            targetBounds = screen;
         }
+        targetCenter = CGPointMake(CGRectGetMidX(screen), CGRectGetMidY(screen));
     }
 
-    if (!CGAffineTransformIsIdentity(rotation)) {
-        // 游戏是自己转过窗口的（系统不知道）：照抄角度，尺寸用「转回来」的大小，
-        // 这样转出去之后正好铺满屏幕
-        CGRect unrotated = CGRectApplyAffineTransform(
-            CGRectMake(0, 0, screen.size.width, screen.size.height),
-            CGAffineTransformInvert(rotation));
-        window.bounds = CGRectMake(0, 0, fabs(unrotated.size.width), fabs(unrotated.size.height));
-        window.center = CGPointMake(CGRectGetMidX(screen), CGRectGetMidY(screen));
-        window.transform = rotation;
-    } else {
-        window.frame = screen;
+    BOOL sameSize = fabs(targetBounds.size.width - window.bounds.size.width) < 0.5 &&
+                    fabs(targetBounds.size.height - window.bounds.size.height) < 0.5;
+    BOOL sameCenter = fabs(targetCenter.x - window.center.x) < 0.5 &&
+                      fabs(targetCenter.y - window.center.y) < 0.5;
+    BOOL sameTransform = fabs(targetTransform.a - window.transform.a) < 0.001 &&
+                         fabs(targetTransform.b - window.transform.b) < 0.001 &&
+                         fabs(targetTransform.c - window.transform.c) < 0.001 &&
+                         fabs(targetTransform.d - window.transform.d) < 0.001;
+    if (sameSize && sameCenter && sameTransform) {
+        UIView *rootView = window.rootViewController.view;
+        if (rootView && !CGRectEqualToRect(rootView.frame, window.bounds)) {
+            rootView.frame = window.bounds;
+        }
+        return;
     }
-    window.rootViewController.view.frame = window.bounds;
+
+    window.transform = CGAffineTransformIdentity;
+    window.rootViewController.view.transform = CGAffineTransformIdentity;
+    window.bounds = targetBounds;
+    window.center = targetCenter;
+    window.transform = targetTransform;
+    if (window.rootViewController.view) {
+        window.rootViewController.view.frame = window.bounds;
+    }
 }
 
 #endif /* IPATOOL_CONTROL_SHARED_H */

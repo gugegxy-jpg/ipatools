@@ -96,6 +96,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="静音保活音频何时开始播放，默认 launch（更稳）；background 更省电但可能来不及",
     )
     ka.add_argument("--keep-alive-no-audio", action="store_true", help="不播放静音音频（只靠后台任务续期，保活时间很短）")
+    ka.add_argument("--keep-alive-no-pip", action="store_true", help="关掉画中画保活（只用静音音频；默认开启：切后台自动进画中画、回前台自动退出）")
     ka.add_argument("--keep-alive-audio-file", metavar="PATH", help="改用指定音频文件循环播放（如近乎无声的底噪）")
     ka.add_argument("--keep-alive-no-task-renew", action="store_true", help="不再续期 beginBackgroundTask（默认续期）")
     ka.add_argument("--keep-alive-renew-lead-time", type=float, metavar="SEC", help="提前多少秒续期后台任务，默认 10")
@@ -424,6 +425,7 @@ def cmd_inject(args) -> int:
             args.keep_alive_dylib,
             args.keep_alive_start_on,
             args.keep_alive_no_audio,
+            args.keep_alive_no_pip,
             args.keep_alive_audio_file,
             args.keep_alive_no_task_renew,
             args.keep_alive_renew_lead_time is not None,
@@ -530,6 +532,7 @@ def cmd_inject(args) -> int:
                 warnings += audio_warnings
                 audio_name = inject_mod.keep_alive_audio_name(args.keep_alive_audio_file)
             ka_options = inject_mod.build_keep_alive_options(
+                pip=False if args.keep_alive_no_pip else None,
                 silent_audio=False if args.keep_alive_no_audio else None,
                 start_on=args.keep_alive_start_on,
                 task_renew=False if args.keep_alive_no_task_renew else None,
@@ -543,6 +546,7 @@ def cmd_inject(args) -> int:
             )
             settings.append((inject_mod.KEEP_ALIVE_INFO_KEY, ka_options, "后台保活配置"))
             modes += inject_mod.keep_alive_background_modes(
+                pip=not args.keep_alive_no_pip,
                 silent_audio=silent_audio,
                 location=args.keep_alive_location,
                 fetch=args.keep_alive_fetch,

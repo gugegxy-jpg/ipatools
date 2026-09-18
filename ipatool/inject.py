@@ -221,6 +221,7 @@ def inject_dylib(
 def build_keep_alive_options(
     silent_audio: bool | None = None,
     enabled: bool | None = None,
+    pip: bool | None = None,
     start_on: str | None = None,
     task_renew: bool | None = None,
     renew_lead_time: float | None = None,
@@ -235,6 +236,8 @@ def build_keep_alive_options(
     options: dict = {}
     if enabled is not None:
         options["Enabled"] = enabled
+    if pip is not None:
+        options["PictureInPicture"] = pip
     if silent_audio is not None:
         options["SilentAudio"] = silent_audio
     if start_on:
@@ -263,9 +266,11 @@ def keep_alive_background_modes(
     location: bool = False,
     fetch: bool = False,
     processing: bool = False,
+    pip: bool = True,
 ) -> list[str]:
     modes: list[str] = []
-    if silent_audio:
+    # 静音音频和画中画都要求 UIBackgroundModes 里有 audio
+    if silent_audio or pip:
         modes.append(KEEP_ALIVE_REQUIRED_BACKGROUND_MODE)
     if location:
         modes.append("location")

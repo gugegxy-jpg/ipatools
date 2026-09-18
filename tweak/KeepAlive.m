@@ -8,6 +8,11 @@
 //    3. 重新签名（未签名/描述文件不匹配的包装不上）
 //
 //  保活手段（按可靠性从高到低，前两项默认开启）：
+//    0) 画中画（默认开启）：切后台自动进系统画中画、回前台自动退出。
+//       App 在为画中画提供画面时系统不会挂起进程，这是目前最不容易被系统掐断的方式。
+//       能用画中画时静音音频会自动让位（两个手段做的是同一件事，不叠加）。
+//       画中画起不来（App 不支持 / 被系统拒）时自动退回静音音频。
+//       画面内容是运行时生成的循环占位视频：iOS 不允许把 App 实时画面直接送进画中画。
 //    1) 静音音频：以 .playback 类别循环播放一段全 0 采样的音频。
 //       iOS 只要认为 App 在播放音频，就不会把进程挂起 —— 这是最稳定的保活方式。
 //    2) 后台任务续期：不断 beginBackgroundTask，作为音频被抢断（电话/其它 App）时的兜底。
@@ -17,6 +22,8 @@
 //
 //  可通过 Info.plist 的 IPAToolKeepAlive 字典调整行为：
 //    Enabled(bool)              默认 YES
+//    PictureInPicture(bool)     默认 YES，画中画保活：切后台自动开画中画、回前台自动关，
+//                               可用时静音音频自动让位；不支持/起不来时自动退回静音音频
 //    SilentAudio(bool)          默认 YES，静音音频保活
 //    StartAtLaunch(bool)        默认 YES；NO 表示等切到后台再开始播（更省电，但不如 YES 稳）
 //    AudioFile(string)          改用 App 包内的音频文件循环播放（如近乎无声的底噪，更"像"在播放）
@@ -44,6 +51,10 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
+#import <AVKit/AVKit.h>
+#import <CoreMedia/CoreMedia.h>
+#import <CoreVideo/CoreVideo.h>
+#import <QuartzCore/QuartzCore.h>
 #import <CoreLocation/CoreLocation.h>
 #import <BackgroundTasks/BackgroundTasks.h>
 #import <objc/runtime.h>
@@ -71,6 +82,7 @@ static NSString *IPATKAPanelKey(NSString *plistKey) {
         // 免得以前在面板上改过一次留下旧值，开关拿掉之后反而改不回来
         map = @{
             @"Enabled": IPATKeyKAEnabled,
+            @"PictureInPicture": IPATKeyKAPiP,
             @"Fetch": IPATKeyKAFetch,
             @"Location": IPATKeyKALocation,
         };
@@ -150,6 +162,365 @@ static NSData *IPATKASilentWAV(double seconds, uint32_t sampleRate) {
     return data;
 }
 
+#pragma mark - 画中画保活
+//
+//  用系统画中画（AVPictureInPictureController）代替静音音频保活：切后台自动开画中画，
+//  回前台自动关。App「正在为画中画提供画面」时系统不会把进程挂起，热更下载也就不断。
+//
+//  两个前提（--keep-alive 注入时都已满足）：
+//    1. Info.plist 的 UIBackgroundModes 含 audio
+//    2. 音频会话是 playback 类别（上面 IPATKAInstallCategoryGuard 已经护住了）
+//  不满足时 AVPictureInPictureController.isPictureInPictureSupported 会返回 NO，
+//  这时一律回退到静音音频保活，绝不让「换保活方式」把原来的能力弄丢。
+//
+//  ⚠️ 画面内容是占位画面，不是游戏实时画面：iOS 不允许把 App 的实时画面直接塞进
+//     画中画（ReplayKit 采集出来的帧只能喂给 AVSampleBufferDisplayLayer，
+//     走 iOS 15+ 的 sampleBuffer 内容源，代价是常驻采集、耗电、游戏掉帧）。
+//     保活只需要「系统在替我们渲染一层画面」，所以这里放一段运行时生成的循环
+//     占位视频（深色底 + 一行字，2 秒一循环），解码开销可以忽略。
+
+static NSString *IPATPIPVideoPath(void) {
+    NSArray<NSString *> *dirs = NSSearchPathForDirectoriesInDomains(NSCachesDirectory,
+                                                                    NSUserDomainMask, YES);
+    return [[dirs firstObject] stringByAppendingPathComponent:@"ipatool-pip.mp4"];
+}
+
+/// 占位画面（深色底 + 一行字）。UIKit 的绘制只在主线程用，所以由调用方在主线程生成
+static UIImage *IPATPIPPlaceholderImage(CGSize size) {
+    UIGraphicsBeginImageContextWithOptions(size, YES, 1.0);
+    [[UIColor colorWithRed:0.07 green:0.08 blue:0.10 alpha:1.0] setFill];
+    UIRectFill(CGRectMake(0, 0, size.width, size.height));
+    NSString *text = @"ipatool 后台保活中";
+    NSDictionary *textAttrs = @{NSFontAttributeName: [UIFont boldSystemFontOfSize:24.0],
+                                NSForegroundColorAttributeName: [UIColor colorWithWhite:1.0 alpha:0.9]};
+    CGSize textSize = [text sizeWithAttributes:textAttrs];
+    [text drawAtPoint:CGPointMake((size.width - textSize.width) / 2.0,
+                                  (size.height - textSize.height) / 2.0)
+       withAttributes:textAttrs];
+    UIImage *image = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+    return image;
+}
+
+/// 把占位画面画进 CVPixelBuffer（调用方负责 CFRelease）
+static CVPixelBufferRef IPATPIPMakeFrame(CGSize size, UIImage *image) {
+    NSDictionary *attrs = @{(id)kCVPixelBufferCGImageCompatibilityKey: @YES,
+                            (id)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES};
+    CVPixelBufferRef buffer = NULL;
+    CVReturn status = CVPixelBufferCreate(kCFAllocatorDefault, (size_t)size.width, (size_t)size.height,
+                                          kCVPixelFormatType_32ARGB,
+                                          (__bridge CFDictionaryRef)attrs, &buffer);
+    if (status != kCVReturnSuccess || !buffer) return NULL;
+
+    if (image) {
+        CVPixelBufferLockBaseAddress(buffer, 0);
+        CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+        CGContextRef ctx = CGBitmapContextCreate(CVPixelBufferGetBaseAddress(buffer),
+                                                 (size_t)size.width, (size_t)size.height, 8,
+                                                 CVPixelBufferGetBytesPerRow(buffer), space,
+                                                 kCGBitmapByteOrder32Host | kCGImageAlphaNoneSkipFirst);
+        if (ctx) {
+            // CGBitmapContext 的原点在左下，翻一下再画，不然字是倒的
+            CGContextTranslateCTM(ctx, 0, size.height);
+            CGContextScaleCTM(ctx, 1.0, -1.0);
+            CGContextDrawImage(ctx, CGRectMake(0, 0, size.width, size.height), image.CGImage);
+            CGContextRelease(ctx);
+        }
+        CGColorSpaceRelease(space);
+        CVPixelBufferUnlockBaseAddress(buffer, 0);
+    }
+    return buffer;
+}
+
+/// 写一段 2 秒的循环占位视频（H.264 / mp4）。只在第一次启动时写，之后直接复用
+static BOOL IPATPIPWriteVideoFile(NSString *path, UIImage *image) {
+    [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+    NSURL *url = [NSURL fileURLWithPath:path];
+    NSError *error = nil;
+    AVAssetWriter *writer = [[AVAssetWriter alloc] initWithURL:url fileType:AVFileTypeMPEG4 error:&error];
+    if (error || !writer) return NO;
+
+    CGSize size = CGSizeMake(640.0, 360.0);
+    NSDictionary *settings = @{AVVideoCodecKey: AVVideoCodecTypeH264,
+                               AVVideoWidthKey: @(size.width),
+                               AVVideoHeightKey: @(size.height)};
+    AVAssetWriterInput *input = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo
+                                                                  outputSettings:settings];
+    input.expectsMediaDataInRealTime = NO;
+    NSDictionary *sourceAttrs = @{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32ARGB),
+                                  (id)kCVPixelBufferWidthKey: @(size.width),
+                                  (id)kCVPixelBufferHeightKey: @(size.height)};
+    AVAssetWriterInputPixelBufferAdaptor *adaptor =
+        [AVAssetWriterInputPixelBufferAdaptor assetWriterInputPixelBufferAdaptorWithAssetWriterInput:input
+                                                                        sourcePixelBufferAttributes:sourceAttrs];
+    if (![writer canAddInput:input]) return NO;
+    [writer addInput:input];
+    if (![writer startWriting]) return NO;
+    [writer startSessionAtSourceTime:kCMTimeZero];
+
+    CVPixelBufferRef frame = IPATPIPMakeFrame(size, image);
+    if (!frame) {
+        [writer cancelWriting];
+        return NO;
+    }
+    int32_t fps = 10;
+    NSInteger appended = 0;
+    for (NSInteger i = 0; i < 20; i++) {          // 2 秒
+        if (!input.readyForMoreMediaData) {
+            [NSThread sleepForTimeInterval:0.05];
+        }
+        if ([adaptor appendPixelBuffer:frame withPresentationTime:CMTimeMake((int64_t)i, fps)]) {
+            appended++;
+        }
+    }
+    CVPixelBufferRelease(frame);
+    [input markAsFinished];
+    [writer endSessionAtSourceTime:CMTimeMake((int64_t)MAX(1, appended), fps)];
+
+    // 导出完成是异步回调：这里在后台线程等它（生成只在启动时做一次，卡不到游戏）
+    __block BOOL done = NO;
+    __block BOOL ok = NO;
+    [writer finishWritingWithCompletionHandler:^{
+        ok = (writer.status == AVAssetWriterStatusCompleted);
+        done = YES;
+    }];
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:5.0];
+    while (!done && [deadline timeIntervalSinceNow] > 0) {
+        [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+                                 beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+    }
+    return ok && [[NSFileManager defaultManager] fileExistsAtPath:path];
+}
+
+@interface IPATPIPController : NSObject <AVPictureInPictureControllerDelegate>
+
+@property (nonatomic, strong) AVPlayer *player;
+@property (nonatomic, strong) AVPlayerLayer *playerLayer;
+@property (nonatomic, strong) UIView *hostView;
+@property (nonatomic, strong) AVPictureInPictureController *pip;
+@property (nonatomic, assign) BOOL prepared;    // player / 控制器已建好（或已判死）
+@property (nonatomic, assign) BOOL preparing;   // 正在生成占位视频
+@property (nonatomic, assign) BOOL active;      // 正在画中画
+@property (nonatomic, assign) BOOL starting;
+/// 状态变了（就绪 / 启动 / 停止 / 失败）回调给保活控制器，让它决定要不要补音频
+@property (nonatomic, copy) void (^onStateChange)(void);
+
+@end
+
+@implementation IPATPIPController
+
++ (instancetype)shared {
+    static IPATPIPController *shared;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ shared = [[IPATPIPController alloc] init]; });
+    return shared;
+}
+
+/// player 和控制器都建好了才叫「能顶上」
+- (BOOL)isReady {
+    return (self.prepared && self.pip != nil);
+}
+
+#pragma mark 准备
+
+- (void)prepareIfNeeded {
+    if (self.prepared || self.preparing) return;
+
+    Class cls = NSClassFromString(@"AVPictureInPictureController");
+    if (!cls) {
+        IPATKALog(@"系统没有画中画（AVPictureInPictureController），回退静音音频保活");
+        self.prepared = YES;
+        return;
+    }
+    if (![cls isPictureInPictureSupported]) {
+        // 最常见的原因是包里没有 UIBackgroundModes: audio，或者音频会话不是 playback
+        IPATKALog(@"当前 App 不支持画中画，回退静音音频保活（画中画要求 UIBackgroundModes 含 audio）");
+        self.prepared = YES;
+        return;
+    }
+
+    self.preparing = YES;
+    NSString *path = IPATPIPVideoPath();
+    if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        [self finishPreparingWithPath:path];
+        return;
+    }
+    // 画面在主线程画好（UIKit 绘制），编码放后台队列，别卡住主线程
+    UIImage *placeholder = IPATPIPPlaceholderImage(CGSizeMake(640.0, 360.0));
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        BOOL ok = IPATPIPWriteVideoFile(path, placeholder);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!ok) {
+                self.preparing = NO;
+                self.prepared = YES;
+                IPATKALog(@"画中画占位视频生成失败，回退静音音频保活");
+                if (self.onStateChange) self.onStateChange();
+                return;
+            }
+            [self finishPreparingWithPath:path];
+        });
+    });
+}
+
+- (void)finishPreparingWithPath:(NSString *)path {
+    self.preparing = NO;
+    self.prepared = YES;
+
+    AVPlayerItem *item = [AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:path]];
+    AVPlayer *player = [AVPlayer playerWithPlayerItem:item];
+    player.actionAtItemEnd = AVPlayerActionAtItemEndNone;   // 播完自己 seek 回 0 循环
+    player.muted = YES;
+
+    AVPlayerLayer *layer = [AVPlayerLayer playerLayerWithPlayer:player];
+    layer.videoGravity = AVLayerVideoGravityResizeAspect;
+    layer.frame = CGRectMake(0, 0, 2, 2);
+
+    // 宿主视图：2x2 挂在游戏窗口上。不能用 hidden —— 画中画要求这个 layer 真的在
+    // 屏幕上，所以只把透明度压到几乎看不见（对画面没影响，触摸也穿透不了）
+    UIView *host = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 2, 2)];
+    host.alpha = 0.02;
+    host.userInteractionEnabled = NO;
+    host.backgroundColor = [UIColor clearColor];
+    host.clipsToBounds = YES;
+    [host.layer addSublayer:layer];
+
+    UIWindow *appWindow = IPATAppKeyWindowExcluding(nil);
+    if (!appWindow) {
+        IPATKALog(@"拿不到游戏窗口，画中画的宿主视图挂不上，回退静音音频保活");
+        if (self.onStateChange) self.onStateChange();
+        return;
+    }
+    [appWindow addSubview:host];
+
+    self.player = player;
+    self.playerLayer = layer;
+    self.hostView = host;
+
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(handleItemDidEnd:)
+                                                 name:AVPlayerItemDidPlayToEndTimeNotification
+                                               object:item];
+
+    AVPictureInPictureController *pip = nil;
+    if (@available(iOS 14.0, *)) {
+        AVPictureInPictureControllerContentSource *source =
+            [[AVPictureInPictureControllerContentSource alloc] initWithPlayerLayer:layer];
+        pip = [[AVPictureInPictureController alloc] initWithContentSource:source];
+    } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        pip = [[AVPictureInPictureController alloc] initWithPlayerLayer:layer];
+#pragma clang diagnostic pop
+    }
+    if (!pip) {
+        IPATKALog(@"创建画中画控制器失败，回退静音音频保活");
+        if (self.onStateChange) self.onStateChange();
+        return;
+    }
+    pip.delegate = self;
+    self.pip = pip;
+    [player play];   // 保持播放状态，切后台才能立刻进画中画
+    IPATKALog(@"画中画保活已就绪（占位视频 %@）", path.lastPathComponent);
+    if (self.onStateChange) self.onStateChange();
+}
+
+- (void)handleItemDidEnd:(NSNotification *)note {
+    AVPlayerItem *item = self.player.currentItem;
+    if (!item) return;
+    __weak typeof(self) weakSelf = self;
+    [item seekToTime:kCMTimeZero
+     toleranceBefore:kCMTimeZero
+      toleranceAfter:kCMTimeZero
+   completionHandler:^(BOOL finished) {
+        [weakSelf.player play];
+    }];
+}
+
+#pragma mark 启动 / 停止
+
+/// 切后台时调用：能进画中画就进，进不去由 onStateChange 通知保活侧补音频
+- (void)startIfNeeded {
+    if (self.active || self.starting) return;
+    if (!self.pip) {
+        [self prepareIfNeeded];     // 第一次还没准备好，这次切后台先由音频顶着
+        return;
+    }
+    if (self.hostView && !self.hostView.window) {
+        // 游戏把窗口重建过（切场景 / 换根视图），宿主视图掉了：重新挂回去，
+        // 不然画中画没有内容源，start 会静默失败
+        UIWindow *appWindow = IPATAppKeyWindowExcluding(nil);
+        if (appWindow) [appWindow addSubview:self.hostView];
+    }
+    self.starting = YES;
+    [self.player play];
+    [self attemptStart:0];
+}
+
+- (void)attemptStart:(NSInteger)attempt {
+    __weak typeof(self) weakSelf = self;
+    if (self.active) { self.starting = NO; return; }
+
+    if (self.pip.isPictureInPicturePossible) {
+        IPATKALog(@"启动画中画");
+        [self.pip startPictureInPicture];
+        // 起不来就别干等：让保活侧把静音音频补上
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (weakSelf.active) return;
+            weakSelf.starting = NO;
+            IPATKALog(@"画中画没能启动（系统没让进），回退静音音频保活");
+            if (weakSelf.onStateChange) weakSelf.onStateChange();
+        });
+        return;
+    }
+    if (attempt >= 12) {   // 最多等约 1.2 秒
+        self.starting = NO;
+        IPATKALog(@"画中画当前不可用（isPictureInPicturePossible=NO），回退静音音频保活");
+        if (self.onStateChange) self.onStateChange();
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [weakSelf attemptStart:attempt + 1];
+    });
+}
+
+/// 回前台时调用
+- (void)stopIfActive {
+    self.starting = NO;
+    if (!self.pip) return;
+    if (self.active) [self.pip stopPictureInPicture];
+    [self.player pause];   // 前台不用播，省一点电；切后台时会重新 play
+}
+
+#pragma mark AVPictureInPictureControllerDelegate
+
+- (void)pictureInPictureControllerDidStartPictureInPicture:(AVPictureInPictureController *)controller {
+    self.active = YES;
+    self.starting = NO;
+    IPATKALog(@"画中画已启动：由系统撑着进程，切后台不再挂起");
+    if (self.onStateChange) self.onStateChange();
+}
+
+- (void)pictureInPictureControllerDidStopPictureInPicture:(AVPictureInPictureController *)controller {
+    BOOL wasActive = self.active;
+    self.active = NO;
+    self.starting = NO;
+    IPATKALog(@"画中画已停止");
+    // 还在后台就被关掉了（用户划掉 / 系统收回）：把音频保活补上
+    if (wasActive && self.onStateChange) self.onStateChange();
+}
+
+- (void)pictureInPictureController:(AVPictureInPictureController *)controller
+failedToStartPictureInPictureWithError:(NSError *)error {
+    self.active = NO;
+    self.starting = NO;
+    IPATKALog(@"画中画启动失败: %@", error.localizedDescription ?: @"未知错误");
+    if (self.onStateChange) self.onStateChange();
+}
+
+@end
+
 #pragma mark - 保活控制器
 
 @interface IPATKeepAliveController : NSObject <CLLocationManagerDelegate>
@@ -182,6 +553,10 @@ static NSData *IPATKASilentWAV(double seconds, uint32_t sampleRate) {
         _task = UIBackgroundTaskInvalid;
         NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
         [center addObserver:self
+                   selector:@selector(handleWillResignActive)
+                       name:UIApplicationWillResignActiveNotification
+                     object:nil];
+        [center addObserver:self
                    selector:@selector(handleDidEnterBackground)
                        name:UIApplicationDidEnterBackgroundNotification
                      object:nil];
@@ -189,6 +564,13 @@ static NSData *IPATKASilentWAV(double seconds, uint32_t sampleRate) {
                    selector:@selector(handleWillEnterForeground)
                        name:UIApplicationWillEnterForegroundNotification
                      object:nil];
+        [center addObserver:self
+                   selector:@selector(handleDidBecomeActive)
+                       name:UIApplicationDidBecomeActiveNotification
+                     object:nil];
+        // 画中画状态一变（就绪/启动/被关掉/起不来），重新决定要不要用静音音频兜底
+        __weak typeof(self) weakSelf = self;
+        [IPATPIPController shared].onStateChange = ^{ [weakSelf applyRuntimePolicy]; };
         [center addObserver:self
                    selector:@selector(handleAudioInterruption:)
                        name:AVAudioSessionInterruptionNotification
@@ -224,19 +606,25 @@ static NSData *IPATKASilentWAV(double seconds, uint32_t sampleRate) {
     if (!IPATKABool(@"Enabled", YES)) return;
     if (self.started) return;
     self.started = YES;
-    IPATKALog(@"启用保活：silentAudio=%d renew=%d location=%d fetch=%d processing=%d",
+    IPATKALog(@"启用保活：pip=%d silentAudio=%d renew=%d location=%d fetch=%d processing=%d",
+              IPATKABool(@"PictureInPicture", YES),
               IPATKABool(@"SilentAudio", YES),
               IPATKABool(@"RenewBackgroundTask", YES),
               IPATKABool(@"Location", NO),
               IPATKABool(@"Fetch", NO),
               IPATKABool(@"Processing", NO));
 
-    if (IPATKABool(@"SilentAudio", YES)) {
-        IPATKAInstallCategoryGuard();   // 先把「音频类别」这层护住，再开播
-        [self activateAudioSession];
+    // 先把「音频类别」这层护住：静音音频和画中画都要求会话是 playback 类别
+    IPATKAInstallCategoryGuard();
+    [self activateAudioSession];
+
+    if (IPATKABool(@"PictureInPicture", YES)) {
+        [[IPATPIPController shared] prepareIfNeeded];
+    }
+    if ([self wantsSilentAudio]) {
         [self startSilentAudio];
     }
-    if (IPATKABool(@"RenewBackgroundTask", YES)) {
+    if ([self wantsBackgroundTask]) {
         [self startRenewTimer];
     }
     [self startHeartbeat];
@@ -251,6 +639,7 @@ static NSData *IPATKASilentWAV(double seconds, uint32_t sampleRate) {
 - (void)stop {
     if (!self.started) return;
     self.started = NO;
+    [[IPATPIPController shared] stopIfActive];
     [self stopSilentAudio];
     [self.renewTimer invalidate];
     self.renewTimer = nil;
@@ -274,25 +663,72 @@ static NSData *IPATKASilentWAV(double seconds, uint32_t sampleRate) {
     if (!self.started) [self start];
     if (!self.started) return;
 
-    if (IPATKABool(@"SilentAudio", YES)) {
-        [self activateAudioSession];
-        [self startSilentAudio];
-    } else {
-        [self stopSilentAudio];
-    }
-    if (IPATKABool(@"RenewBackgroundTask", YES)) {
-        [self startRenewTimer];
-    } else {
-        [self.renewTimer invalidate];
-        self.renewTimer = nil;
-        [self endBackgroundTask];
-    }
+    [self applyRuntimePolicy];
     if (IPATKABool(@"Location", NO)) {
         [self startLocation];
     } else {
         [self stopLocation];
     }
     [self applySchedulerState];
+    [self postStatus];
+}
+
+#pragma mark 画中画 / 静音音频 的分工
+
+/// 画中画开关开着、而且真的能用（player + 控制器都就绪）时，由画中画顶替静音音频
+- (BOOL)pipTakesOver {
+    if (!IPATKABool(@"PictureInPicture", YES)) return NO;
+    return [[IPATPIPController shared] isReady];
+}
+
+/// 画中画已经顶上了就别再播静音音频（它本来就是被画中画替代的那个手段）
+- (BOOL)wantsSilentAudio {
+    if (!IPATKABool(@"SilentAudio", YES)) return NO;
+    if (!IPATKABool(@"PictureInPicture", YES)) return YES;
+    IPATPIPController *pip = [IPATPIPController shared];
+    if (pip.active) return NO;        // 画中画正在跑
+    if (!pip.isReady) return YES;     // 不支持 / 还没准备好：音频先顶着
+    // 就绪但没在画中画：前台说明还没切后台（用不上音频）；
+    // 后台说明画中画没能起来，必须靠音频兜底
+    return ([UIApplication sharedApplication].applicationState != UIApplicationStateActive);
+}
+
+- (BOOL)wantsBackgroundTask {
+    if (!IPATKABool(@"RenewBackgroundTask", YES)) return NO;
+    if (!IPATKABool(@"PictureInPicture", YES)) return YES;
+    IPATPIPController *pip = [IPATPIPController shared];
+    if (pip.active) return NO;
+    if (!pip.isReady) return YES;
+    return ([UIApplication sharedApplication].applicationState != UIApplicationStateActive);
+}
+
+/// 把运行状态对齐到当前配置 + 画中画状态（面板改动 / 前后台切换 / 画中画状态变化都走这里）
+- (void)applyRuntimePolicy {
+    if (!IPATKABool(@"Enabled", YES)) {
+        [self stop];
+        [self postStatus];
+        return;
+    }
+    if (!self.started) {
+        [self start];
+        return;
+    }
+    if (IPATKABool(@"PictureInPicture", YES)) {
+        [[IPATPIPController shared] prepareIfNeeded];
+    }
+    if ([self wantsSilentAudio]) {
+        [self activateAudioSession];
+        [self startSilentAudio];
+    } else {
+        [self stopSilentAudio];
+    }
+    if ([self wantsBackgroundTask]) {
+        [self startRenewTimer];
+    } else {
+        [self.renewTimer invalidate];
+        self.renewTimer = nil;
+        [self endBackgroundTask];
+    }
     [self postStatus];
 }
 
@@ -313,6 +749,17 @@ static NSData *IPATKASilentWAV(double seconds, uint32_t sampleRate) {
         IPATRegDetail: @"切后台后进程不被挂起",
         IPATRegMasterKey: IPATKeyKAEnabled,
         IPATRegEnabled: @(IPATKABool(@"Enabled", YES)),
+        // 面板上多一个「画中画」开关：打开后切后台自动进画中画、回前台自动退出，
+        // 画中画能用时静音音频自动让位（它俩是同一件事的两种手段）
+        IPATRegRows: @[
+            @{
+                IPATRowKey: IPATKeyKAPiP,
+                IPATRowTitle: @"画中画保活",
+                IPATRowKind: IPATRowKindSwitch,
+                IPATRowValue: @(IPATKABool(@"PictureInPicture", YES)),
+                IPATRowNote: @"切后台自动开画中画、回前台自动关；起不来时自动退回静音音频",
+            },
+        ],
         // 面板只留一个总开关：子项（静音音频 / 后台任务续期）默认全开，
         // 定位要授权还费电、定时唤醒改了要重启 App，这两项留给 Info.plist
         //（--keep-alive-no-audio / --keep-alive-no-task-renew / --keep-alive-location / --keep-alive-fetch）
@@ -330,7 +777,16 @@ static NSData *IPATKASilentWAV(double seconds, uint32_t sampleRate) {
         detail = @"已关闭";
     } else {
         NSMutableArray<NSString *> *parts = [NSMutableArray array];
-        [parts addObject:(self.player.isPlaying ? @"音频播放中" : @"音频未播放")];
+        IPATPIPController *pip = [IPATPIPController shared];
+        if (IPATKABool(@"PictureInPicture", YES)) {
+            [parts addObject:(pip.active ? @"画中画进行中"
+                              : (pip.isReady ? @"画中画就绪" : @"画中画不可用"))];
+        }
+        if (IPATKABool(@"SilentAudio", YES)) {
+            NSString *audio = self.player.isPlaying ? @"音频播放中"
+                            : ([self wantsSilentAudio] ? @"音频未播放" : @"音频已让位画中画");
+            [parts addObject:audio];
+        }
         if (IPATKABool(@"RenewBackgroundTask", YES)) {
             [parts addObject:[NSString stringWithFormat:@"续期 %lu 次", (unsigned long)self.renewCount]];
         }
@@ -359,7 +815,8 @@ static NSData *IPATKASilentWAV(double seconds, uint32_t sampleRate) {
 /// Info.plist 里 ForcePlaybackCategory=NO 可以关掉这个行为。
 static BOOL IPATKAForceCategory(AVAudioSessionCategory *category,
                                 AVAudioSessionCategoryOptions *options) {
-    if (!IPATKABool(@"SilentAudio", YES)) return NO;
+    // 画中画同样要求会话是 playback 类别，所以两种保活方式都要这层保护
+    if (!IPATKABool(@"SilentAudio", YES) && !IPATKABool(@"PictureInPicture", YES)) return NO;
     if (!IPATKABool(@"ForcePlaybackCategory", YES)) return NO;
     if ([*category isEqualToString:AVAudioSessionCategoryPlayback]) return NO;
     static NSTimeInterval lastLog = 0;
@@ -495,7 +952,7 @@ static void IPATKAInstallCategoryGuard(void) {
 }
 
 - (void)handleAudioInterruption:(NSNotification *)note {
-    if (!IPATKABool(@"SilentAudio", YES)) return;
+    if (![self wantsSilentAudio]) return;
     NSNumber *type = note.userInfo[AVAudioSessionInterruptionTypeKey];
     if (type.unsignedIntegerValue == AVAudioSessionInterruptionTypeEnded) {
         IPATKALog(@"音频中断结束，恢复保活播放");
@@ -505,7 +962,7 @@ static void IPATKAInstallCategoryGuard(void) {
 }
 
 - (void)handleMediaServicesReset:(NSNotification *)note {
-    if (!IPATKABool(@"SilentAudio", YES)) return;
+    if (![self wantsSilentAudio]) return;
     IPATKALog(@"媒体服务被重置，重建保活播放器");
     [self stopSilentAudio];
     [self activateAudioSession];
@@ -513,7 +970,7 @@ static void IPATKAInstallCategoryGuard(void) {
 }
 
 - (void)handleRouteChange:(NSNotification *)note {
-    if (!IPATKABool(@"SilentAudio", YES) || !self.player) return;
+    if (![self wantsSilentAudio] || !self.player) return;
     NSNumber *reason = note.userInfo[AVAudioSessionRouteChangeReasonKey];
     if (reason.unsignedIntegerValue == AVAudioSessionRouteChangeReasonOldDeviceUnavailable
         && !self.player.isPlaying) {
@@ -593,7 +1050,7 @@ static void IPATKAInstallCategoryGuard(void) {
 - (void)tickHeartbeat {
     self.heartbeat++;
     // 该播却没播：多半是游戏自己改了音频会话（这种情况没有系统通知），立刻补上
-    if (IPATKABool(@"SilentAudio", YES) && !self.player.isPlaying) {
+    if ([self wantsSilentAudio] && !self.player.isPlaying) {
         IPATKALog(@"心跳发现音频停了，重新起播（游戏可能改过音频会话）");
         [self activateAudioSession];
         [self startSilentAudio];
@@ -607,10 +1064,11 @@ static void IPATKAInstallCategoryGuard(void) {
     NSTimeInterval remaining = app.backgroundTimeRemaining;
     NSTimeInterval behind = self.enterBackgroundTime > 0
         ? [NSDate timeIntervalSinceReferenceDate] - self.enterBackgroundTime : 0;
-    IPATKALog(@"心跳 %lu 状态=%@ 已后台%.0fs 音频播放=%d 会话=%@ 其它音频在播=%d 后台任务剩余=%@",
+    IPATKALog(@"心跳 %lu 状态=%@ 已后台%.0fs 画中画=%d 音频播放=%d 会话=%@ 其它音频在播=%d 后台任务剩余=%@",
               (unsigned long)self.heartbeat,
               inBackground ? @"后台" : @"前台",
               behind,
+              [IPATPIPController shared].active,
               self.player.isPlaying,
               session.category,
               session.isOtherAudioPlaying,
@@ -811,6 +1269,15 @@ static void IPATKAInstallCategoryGuard(void) {
 
 #pragma mark 前后台
 
+/// 即将失去活跃（切后台 / 下拉通知栏 / 来电话）：画中画要趁 App 还"在前台"就起来，
+/// 等真的进了后台再启动，系统往往已经不给这个机会了
+- (void)handleWillResignActive {
+    if (!IPATKABool(@"Enabled", YES)) return;
+    if (!IPATKABool(@"PictureInPicture", YES)) return;
+    [[IPATPIPController shared] prepareIfNeeded];
+    [[IPATPIPController shared] startIfNeeded];
+}
+
 - (void)handleDidEnterBackground {
     if (!IPATKABool(@"Enabled", YES)) return;
     if (!self.started) [self start];
@@ -818,21 +1285,34 @@ static void IPATKAInstallCategoryGuard(void) {
     self.enterBackgroundTime = [NSDate timeIntervalSinceReferenceDate];
     self.heartbeatAtBackground = self.heartbeat;
     AVAudioSession *session = [AVAudioSession sharedInstance];
-    IPATKALog(@"进入后台：音频播放=%d 会话=%@ 其它音频在播=%d",
-              self.player.isPlaying, session.category, session.isOtherAudioPlaying);
+    IPATKALog(@"进入后台：画中画=%d 音频播放=%d 会话=%@ 其它音频在播=%d",
+              [IPATPIPController shared].active, self.player.isPlaying,
+              session.category, session.isOtherAudioPlaying);
+    // willResignActive 里没起来的，这里再试一次
+    if (IPATKABool(@"PictureInPicture", YES)) {
+        [[IPATPIPController shared] startIfNeeded];
+    }
     // 有些 App 会在自己启动后重设音频会话，这里再确认一次
-    if (IPATKABool(@"SilentAudio", YES)) {
+    if ([self wantsSilentAudio]) {
         [self activateAudioSession];
         [self startSilentAudio];
     }
-    if (IPATKABool(@"RenewBackgroundTask", YES)) {
+    if ([self wantsBackgroundTask]) {
         [self startRenewTimer];
         [self renewBackgroundTask];
     }
     [self postStatus];
 }
 
+- (void)handleDidBecomeActive {
+    if (IPATKABool(@"PictureInPicture", YES)) {
+        [[IPATPIPController shared] stopIfActive];
+    }
+    [self applyRuntimePolicy];
+}
+
 - (void)handleWillEnterForeground {
+    [[IPATPIPController shared] stopIfActive];
     NSTimeInterval behind = self.enterBackgroundTime > 0
         ? [NSDate timeIntervalSinceReferenceDate] - self.enterBackgroundTime : 0;
     IPATKALog(@"回到前台：后台共 %.0fs，其间心跳 %lu 次，音频播放=%d",

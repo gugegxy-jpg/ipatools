@@ -143,7 +143,7 @@ build_target() {
     -isysroot "$SDK" \
     -framework Foundation -framework UIKit -framework CoreGraphics \
     -framework AVFoundation -framework CoreMedia -framework CoreVideo \
-    -framework QuartzCore \
+    -framework AVKit -framework QuartzCore \
     ${extra[@]+"${extra[@]}"} \
     -install_name "@executable_path/Frameworks/$name.dylib" \
     -o "$out" "${srcs[@]}"; then
