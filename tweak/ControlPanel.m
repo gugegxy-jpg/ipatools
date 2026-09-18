@@ -505,11 +505,35 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
     self.button.frame = CGRectMake(x, y, size.width, size.height);
 }
 
+/// 这个功能算不算「开着」：有总开关就看总开关；没有总开关（比如后台保活）就看下面
+/// 有没有任意一个子开关开着 —— 子开关全关就等于把功能整个关掉。
+/// 一行开关都没有（只有动作行，比如文件导入导出）的算常开
+- (BOOL)isFeatureOn:(NSString *)featureId {
+    NSDictionary *reg = self.features[featureId];
+    if (![reg isKindOfClass:[NSDictionary class]]) return NO;
+    NSString *masterKey = reg[IPATRegMasterKey];
+    if ([masterKey isKindOfClass:[NSString class]] && masterKey.length > 0) {
+        return IPATCpStoredBool(masterKey, [reg[IPATRegEnabled] boolValue]);
+    }
+    NSArray *rows = reg[IPATRegRows];
+    if (![rows isKindOfClass:[NSArray class]]) return YES;
+    NSUInteger switches = 0;
+    for (NSDictionary *row in rows) {
+        if (![row isKindOfClass:[NSDictionary class]]) continue;
+        NSString *kind = row[IPATRowKind] ?: IPATRowKindSwitch;
+        if (![kind isEqualToString:IPATRowKindSwitch]) continue;
+        NSString *key = row[IPATRowKey];
+        if (![key isKindOfClass:[NSString class]] || key.length == 0) continue;
+        switches++;
+        if (IPATCpStoredBool(key, [row[IPATRowValue] boolValue])) return YES;
+    }
+    return switches == 0;
+}
+
 - (void)refreshButtonAppearance {
     BOOL anyEnabled = NO;
     for (NSString *featureId in self.features) {
-        NSDictionary *reg = self.features[featureId];
-        if (IPATCpStoredBool(reg[IPATRegMasterKey], [reg[IPATRegEnabled] boolValue])) {
+        if ([self isFeatureOn:featureId]) {
             anyEnabled = YES;
             break;
         }
@@ -960,7 +984,8 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
     }
     NSDictionary *userInfo = @{
         IPATChgId: featureId,
-        IPATChgEnabled: @(IPATCpStoredBool(reg[IPATRegMasterKey], [reg[IPATRegEnabled] boolValue])),
+        // 没有总开关的功能（后台保活）传子开关的汇总结果，别拿 nil 当 key 去查 NSUserDefaults
+        IPATChgEnabled: @([self isFeatureOn:featureId]),
         IPATChgValues: values,
     };
     [[NSNotificationCenter defaultCenter] postNotificationName:IPATControlDidChangeNotification

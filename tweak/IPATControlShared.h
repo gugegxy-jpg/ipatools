@@ -134,7 +134,7 @@ static void IPATAppendLogLine(NSString *line) {
 // 键的取值含义与 Info.plist 里同名配置保持一致（不取反），面板上的文案负责表达。
 // 面板只暴露常用项；标注「仅 plist」的没有面板开关，只能用 Info.plist / 命令行参数配置。
 
-#define IPATKeyKAEnabled @"IPAToolPanelKeepAliveEnabled"
+#define IPATKeyKAEnabled @"IPAToolPanelKeepAliveEnabled"  // 已不在面板使用（无总开关）：只认 Info.plist 的 Enabled
 #define IPATKeyKAPiP @"IPAToolPanelKeepAlivePiP"            // 画中画保活（切后台自动开画中画）
 #define IPATKeyKASilentAudio @"IPAToolPanelKeepAliveSilentAudio"  // 静音音频保活（画中画起不来时兜底）
 #define IPATKeyKAFetch @"IPAToolPanelKeepAliveFetch"        // 仅 plist：开启要重启 App，面板上点了没用

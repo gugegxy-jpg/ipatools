@@ -236,7 +236,7 @@ python -m ipatool inject game.ipa --files -o out.ipa                     # 文�
 
 | 面板项 | 对应配置 | 立即生效 |
 | --- | --- | --- |
-| 后台保活（总开关） | `IPAToolKeepAlive.Enabled` | 是 |
+| 后台保活（无总开关，默认开） | — | 下面是两个手段，都关掉 = 关保活 |
 | ├ 画中画保活 | `IPAToolKeepAlive.PictureInPicture` | 是（切后台自动开、回前台自动关） |
 | └ 静音音频保活 | `IPAToolKeepAlive.SilentAudio` | 是（画中画在跑时自动停，关掉则完全不播） |
 | 文件导入导出（常开） | `IPAToolFiles.Enabled` | 否（注入即用，面板没有开关；要关只能改 Info.plist） |

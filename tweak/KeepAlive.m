@@ -39,7 +39,7 @@
 //
 //  运行时开关：
 //    带了悬浮窗时 App 里会出现可拖动的悬浮按钮，点开即可实时开关保活
-//    （面板上是「总开关 + 画中画 + 静音音频」三个开关），
+//    （面板上没有总开关，直接在「画中画 / 静音音频」里选用哪种；两个都关掉就是关保活），
 //    面板写入的值存在 NSUserDefaults 里，优先级高于上面的 Info.plist 初始值。
 //    注意：定时唤醒的 launch handler 只能在启动阶段注册，所以「定时唤醒」开关
 //    打开后要下次启动才真正生效（关闭是立刻生效的），面板上会显示当前状态。
@@ -79,10 +79,10 @@ static NSString *IPATKAPanelKey(NSString *plistKey) {
     static NSDictionary *map;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        // 面板上能改的：总开关 + 画中画 + 静音音频。
-        // 剩下的（任务续期 / 定时唤醒 / 定位）只认 Info.plist，避免面板上误改改不回来
+        // 面板上能改的只有两个手段（画中画 / 静音音频），没有总开关：
+        // 两个都关掉就等于关保活。剩下的（任务续期 / 定时唤醒 / 定位）只认 Info.plist
+        // 「Enabled」刻意不放进面板：旧版本在面板上改过一次会留下旧值，容易改不回来
         map = @{
-            @"Enabled": IPATKeyKAEnabled,
             @"PictureInPicture": IPATKeyKAPiP,
             @"SilentAudio": IPATKeyKASilentAudio,
             @"Fetch": IPATKeyKAFetch,
@@ -606,6 +606,10 @@ failedToStartPictureInPictureWithError:(NSError *)error {
 
 - (void)start {
     if (!IPATKABool(@"Enabled", YES)) return;
+    if (![self hasAnyMethod]) {
+        IPATKALog(@"保活未启动：没有选中任何保活方式（画中画 / 静音音频都关着）");
+        return;
+    }
     if (self.started) return;
     self.started = YES;
     IPATKALog(@"启用保活：pip=%d silentAudio=%d renew=%d location=%d fetch=%d processing=%d",
@@ -657,7 +661,7 @@ failedToStartPictureInPictureWithError:(NSError *)error {
 
 /// 面板改了开关：重新读一遍配置，把变化立刻落到运行状态上
 - (void)applyPanelState {
-    if (!IPATKABool(@"Enabled", YES)) {
+    if (!IPATKABool(@"Enabled", YES) || ![self hasAnyMethod]) {
         [self stop];
         [self postStatus];
         return;
@@ -676,6 +680,16 @@ failedToStartPictureInPictureWithError:(NSError *)error {
 }
 
 #pragma mark 画中画 / 静音音频 的分工
+
+/// 有没有选中任何一种保活手段。面板上没有总开关，两个手段都关掉就等于关保活：
+/// 这时候要真的把画中画、音频、续期、定位全停掉，而不是留一堆定时器空转
+- (BOOL)hasAnyMethod {
+    return IPATKABool(@"PictureInPicture", YES)
+        || IPATKABool(@"SilentAudio", YES)
+        || IPATKABool(@"Location", NO)
+        || IPATKABool(@"Fetch", NO)
+        || IPATKABool(@"Processing", NO);
+}
 
 /// 画中画开关开着、而且真的能用（player + 控制器都就绪）时，由画中画顶替静音音频
 - (BOOL)pipTakesOver {
@@ -706,7 +720,7 @@ failedToStartPictureInPictureWithError:(NSError *)error {
 
 /// 把运行状态对齐到当前配置 + 画中画状态（面板改动 / 前后台切换 / 画中画状态变化都走这里）
 - (void)applyRuntimePolicy {
-    if (!IPATKABool(@"Enabled", YES)) {
+    if (!IPATKABool(@"Enabled", YES) || ![self hasAnyMethod]) {
         [self stop];
         [self postStatus];
         return;
@@ -749,8 +763,8 @@ failedToStartPictureInPictureWithError:(NSError *)error {
         IPATRegId: IPATFeatureKeepAlive,
         IPATRegTitle: @"后台保活",
         IPATRegDetail: @"切后台后进程不被挂起",
-        IPATRegMasterKey: IPATKeyKAEnabled,
-        IPATRegEnabled: @(IPATKABool(@"Enabled", YES)),
+        // 没有总开关：默认就是开着的，用户直接在下面挑用哪种手段，两个都关掉等于关保活
+        IPATRegMasterHidden: @YES,
         // 面板上两个手段各自的开关：画中画优先，静音音频当兜底。
         // 两个都开着时画中画一跑起来，静音音频会自动停掉（同一件事不叠加）
         IPATRegRows: @[
@@ -784,6 +798,8 @@ failedToStartPictureInPictureWithError:(NSError *)error {
     NSString *detail;
     if (!IPATKABool(@"Enabled", YES)) {
         detail = @"已关闭";
+    } else if (![self hasAnyMethod]) {
+        detail = @"未选择保活方式";
     } else {
         NSMutableArray<NSString *> *parts = [NSMutableArray array];
         IPATPIPController *pip = [IPATPIPController shared];
