@@ -418,13 +418,16 @@ static BOOL IPATPIPWriteVideoFile(NSString *path, UIImage *image) {
     player.actionAtItemEnd = AVPlayerActionAtItemEndNone;   // 播完自己 seek 回 0 循环
     player.muted = YES;
 
+    // 宿主视图：160x90 挂在游戏窗口左上角。不能用 hidden —— 画中画要求这个 layer 真的
+    // 在屏幕上，所以只把透明度压到几乎看不见（对画面没影响，触摸也穿透不了）。
+    // 尺寸别太小：2x2 那种针尖大的画面会被系统当成「没有可播放的内容」，
+    // isPictureInPicturePossible 会一直给 NO，画中画就再也起不来
+    CGRect pipFrame = CGRectMake(0.0, 0.0, 160.0, 90.0);
     AVPlayerLayer *layer = [AVPlayerLayer playerLayerWithPlayer:player];
     layer.videoGravity = AVLayerVideoGravityResizeAspect;
-    layer.frame = CGRectMake(0, 0, 2, 2);
+    layer.frame = pipFrame;
 
-    // 宿主视图：2x2 挂在游戏窗口上。不能用 hidden —— 画中画要求这个 layer 真的在
-    // 屏幕上，所以只把透明度压到几乎看不见（对画面没影响，触摸也穿透不了）
-    UIView *host = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 2, 2)];
+    UIView *host = [[UIView alloc] initWithFrame:pipFrame];
     host.alpha = 0.02;
     host.userInteractionEnabled = NO;
     host.backgroundColor = [UIColor clearColor];
@@ -535,12 +538,12 @@ static BOOL IPATPIPWriteVideoFile(NSString *path, UIImage *image) {
         });
         return;
     }
-    if (attempt >= 12) {   // 最多等约 1.2 秒
+    // 系统什么时候允许进画中画由它自己定（要等画面渲染出来 / 音频会话就位），
+    // 原来只等 1.2 秒，占位视频刚起播时经常来不及，就被判成「不可用」了。
+    // 放宽到 5 秒：这段时间静音音频一直在播，不会断保活
+    if (attempt >= 50) {
         self.starting = NO;
-        AVPlayerItem *item = self.player.currentItem;
-        // 这三项基本能定位「为什么起不来」：item 没就绪 / 画面没渲染出来 / 宿主视图不在窗口里
-        IPATKALog(@"画中画当前不可用（possible=NO，item=%ld，layerReady=%d，宿主视图在窗口里=%d），回退静音音频保活",
-                  (long)item.status, self.playerLayer.readyForDisplay, self.hostView.window != nil);
+        [self logWhyPipUnavailable];
         self.unavailableReason = (self.playerLayer && !self.playerLayer.readyForDisplay)
             ? @"画面未渲染" : @"系统拒绝启动";
         if (self.onStateChange) self.onStateChange();
@@ -552,12 +555,33 @@ static BOOL IPATPIPWriteVideoFile(NSString *path, UIImage *image) {
     });
 }
 
+/// 起不来的时候把关键状态一次打全，省得反复猜：系统支持与否、播放状态、画面尺寸、
+/// 画面有没有渲染出来、音频会话状态、是否低电量（低电量下系统会关掉画中画）
+- (void)logWhyPipUnavailable {
+    AVPlayerItem *item = self.player.currentItem;
+    CGSize size = item.presentationSize;
+    CGRect rect = self.playerLayer.videoRect;
+    AVAudioSession *session = [AVAudioSession sharedInstance];
+    IPATKALog(@"画中画起不来（possible=NO）：系统支持=%d item=%ld 正在播放=%d "
+              @"画面=%.0fx%.0f videoRect=%.0fx%.0f layerReady=%d 宿主在窗口=%d "
+              @"音频类别=%@ 已激活=%d 低电量=%d 应用状态=%ld",
+              (int)[AVPictureInPictureController isPictureInPictureSupported],
+              (long)item.status, (int)(self.player.rate > 0.0),
+              size.width, size.height, rect.size.width, rect.size.height,
+              (int)self.playerLayer.readyForDisplay, (int)(self.hostView.window != nil),
+              session.category, (int)session.isActive,
+              (int)[NSProcessInfo processInfo].isLowPowerModeEnabled,
+              (long)[UIApplication sharedApplication].applicationState);
+}
+
 /// 回前台时调用
 - (void)stopIfActive {
     self.starting = NO;
     if (!self.pip) return;
     if (self.active) [self.pip stopPictureInPicture];
-    [self.player pause];   // 前台不用播，省一点电；切后台时会重新 play
+    // 回前台不 pause：一 pause 画面就停止渲染，系统会把 isPictureInPicturePossible
+    // 打回 NO，下次切后台得重新等它渲染出来，往往来不及（画中画就一直起不来）。
+    // 占位视频是静音的 160x90，常驻解码的开销可以忽略
 }
 
 #pragma mark AVPictureInPictureControllerDelegate
