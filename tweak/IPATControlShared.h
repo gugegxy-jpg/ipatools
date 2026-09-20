@@ -82,6 +82,7 @@ static void IPATAppendLogLine(NSString *line) {
 
 #pragma mark - 功能标识
 
+#define IPATFeaturePlugins @"plugins"
 #define IPATFeatureQNet @"qnet"
 #define IPATFeatureFiles @"files"
 
@@ -141,6 +142,11 @@ static void IPATAppendLogLine(NSString *line) {
 #define IPATKeyQNetJitterMs @"IPAToolPanelQNetJitterMs"   // 抖动 ms（延迟随机 ±该值）
 #define IPATKeyQNetLossPct @"IPAToolPanelQNetLossPct"     // 丢包率 0-100
 #define IPATKeyQNetCardFrame @"IPAToolPanelQNetCardFrame" // 弱网弹窗位置，NSStringFromCGRect
+
+#define IPATKeyPluginsEnabled @"IPAToolPanelPluginsEnabled"      // 插件加载总开关
+#define IPATKeyPluginsAutoLoad @"IPAToolPanelPluginsAutoLoad"     // 启动时自动加载上次加载过的插件
+#define IPATKeyPluginsLoaded @"IPAToolPanelPluginsLoaded"         // 已加载插件的绝对路径数组
+#define IPATKeyPluginsCardFrame @"IPAToolPanelPluginsCardFrame"   // 插件窗口位置，NSStringFromCGRect
 
 #define IPATKeyFilesEnabled @"IPAToolPanelFilesEnabled"  // 已弃用：文件功能常开，只看 Info.plist 的 Enabled
 #define IPATKeyFilesImportDir @"IPAToolPanelFilesImportDir"  // 仅 plist：导入的默认落地目录（相对沙盒）

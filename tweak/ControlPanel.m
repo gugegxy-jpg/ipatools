@@ -758,7 +758,7 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
 
 /// 顺序固定一下，免得每次加载顺序不同导致界面跳来跳去
 - (NSArray<NSString *> *)sortedFeatureIds {
-    NSArray *order = @[IPATFeatureQNet, IPATFeatureFiles];
+    NSArray *order = @[IPATFeatureQNet, IPATFeaturePlugins, IPATFeatureFiles];
     NSMutableArray<NSString *> *ids = [NSMutableArray array];
     for (NSString *featureId in order) {
         if (self.features[featureId]) [ids addObject:featureId];

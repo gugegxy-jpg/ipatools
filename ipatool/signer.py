@@ -74,6 +74,59 @@ def _temp_plist(data: bytes) -> str:
     return path
 
 
+def codesign_one(
+    path: str,
+    identity: str = "-",
+    entitlements: str | None = None,
+    hardened_runtime: bool = False,
+    keychain: str | None = None,
+    log=None,
+) -> None:
+    """
+    用 codesign 给单个 Mach-O（.dylib / .app / .framework ...）签名。
+
+    给插件 dylib 签名时用这个：运行时 dlopen 的库必须自己带一份有效签名，
+    而且是签主 App 的同一把证书（iOS 的 library validation 看 Team ID）。
+    没给 entitlements 时会先把原签名里的 entitlements 导出来带上，避免权限丢失。
+    """
+    temps: list[str] = []
+    try:
+        ent_file = entitlements
+        if not ent_file:
+            dumped = _dump_entitlements(path)
+            if dumped:
+                ent_file = _temp_plist(dumped)
+                temps.append(ent_file)
+
+        cmd = ["codesign", "--force", "--sign", identity, "--timestamp=none"]
+        if keychain:
+            cmd += ["--keychain", keychain]
+        if ent_file:
+            cmd += ["--entitlements", ent_file]
+        if hardened_runtime:
+            cmd += ["--options", "runtime"]
+        cmd += ["--generate-entitlements-der", path]
+
+        r = subprocess.run(cmd, capture_output=True, check=False)
+        if r.returncode != 0 and "--generate-entitlements-der" in cmd:
+            # 老版本 macOS 不支持 DER，降级重试
+            cmd.remove("--generate-entitlements-der")
+            r = subprocess.run(cmd, capture_output=True, check=False)
+        if r.returncode != 0:
+            raise SignError(
+                f"codesign 失败：{os.path.basename(path)}\n"
+                + (r.stderr.decode("utf-8", "replace").strip() or r.stdout.decode("utf-8", "replace").strip())
+            )
+        if log:
+            log(f"已签名 {os.path.basename(path)}")
+    finally:
+        for t in temps:
+            try:
+                os.remove(t)
+            except OSError:
+                pass
+
+
 def codesign_payload(
     payload_dir: str,
     identity: str = "-",
@@ -85,45 +138,18 @@ def codesign_payload(
 ) -> None:
     """用 codesign 对 Payload 内的所有条目按正确顺序重签名。"""
     main_abs = os.path.abspath(main_app) if main_app else None
-    temps: list[str] = []
 
-    try:
-        for path in _sign_items(payload_dir):
-            ent_file = None
-            if main_abs and os.path.abspath(path) == main_abs and entitlements:
-                ent_file = entitlements
-            else:
-                dumped = _dump_entitlements(path)
-                if dumped:
-                    ent_file = _temp_plist(dumped)
-                    temps.append(ent_file)
-
-            cmd = ["codesign", "--force", "--sign", identity, "--timestamp=none"]
-            if keychain:
-                cmd += ["--keychain", keychain]
-            if ent_file:
-                cmd += ["--entitlements", ent_file]
-            if hardened_runtime:
-                cmd += ["--options", "runtime"]
-            cmd += ["--generate-entitlements-der", path]
-
-            r = subprocess.run(cmd, capture_output=True, check=False)
-            if r.returncode != 0 and "--generate-entitlements-der" in cmd:
-                # 老版本 macOS 不支持 DER，降级重试
-                cmd.remove("--generate-entitlements-der")
-                r = subprocess.run(cmd, capture_output=True, check=False)
-            if r.returncode != 0:
-                raise SignError(
-                    f"codesign 失败：{os.path.relpath(path, payload_dir)}\n"
-                    + (r.stderr.decode("utf-8", "replace").strip() or r.stdout.decode("utf-8", "replace").strip())
-                )
-            log(f"  已签名 {os.path.relpath(path, payload_dir)}")
-    finally:
-        for t in temps:
-            try:
-                os.remove(t)
-            except OSError:
-                pass
+    for path in _sign_items(payload_dir):
+        # --entitlements 只给主 App，其余项沿用自己原来的 entitlements
+        ent = entitlements if (main_abs and os.path.abspath(path) == main_abs) else None
+        codesign_one(
+            path,
+            identity=identity,
+            entitlements=ent,
+            hardened_runtime=hardened_runtime,
+            keychain=keychain,
+        )
+        log(f"  已签名 {os.path.relpath(path, payload_dir)}")
 
 
 def zsign_ipa(

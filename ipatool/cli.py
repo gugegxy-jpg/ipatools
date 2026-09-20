@@ -71,7 +71,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     pj = sub.add_parser(
         "inject",
-        help="注入 dylib（内置 --files 文件导入导出、--qnet 弱网测试）",
+        help="注入 dylib（内置 --files 文件导入导出、--qnet 弱网测试、--plugins 运行时插件加载）",
         description="把 dylib 放进 App 的 Frameworks/ 并写入 LC_LOAD_DYLIB；注入后必须重新签名才能安装",
     )
     pj.add_argument("input", help="IPA 文件路径，或已解包且含 Payload 的目录")
@@ -97,6 +97,21 @@ def _build_parser() -> argparse.ArgumentParser:
     qnet.add_argument("--qnet-delay", type=int, metavar="MS", help="单向附加延迟，毫秒")
     qnet.add_argument("--qnet-jitter", type=int, metavar="MS", help="延迟抖动，毫秒（在延迟上随机 ±该值）")
     qnet.add_argument("--qnet-loss", type=int, metavar="PCT", help="丢包率，0-100")
+
+    plugins = pj.add_argument_group(
+        "运行时插件加载（--plugins）",
+        "注入一次之后，之后想试的 dylib 只要丢进 App 沙盒就能在悬浮窗里直接加载，"
+        "不用再重新打包签名安装（插件必须用签主 App 的同一把证书签名：ipatool signdylib）",
+    )
+    plugins.add_argument("--plugins", action="store_true", help="注入插件加载器")
+    plugins.add_argument("--no-plugins", action="store_true", help="不注入插件加载器")
+    plugins.add_argument("--plugins-dylib", metavar="PATH", help="插件加载器 dylib 路径，默认自动查找")
+    plugins.add_argument(
+        "--plugins-autoload",
+        dest="plugins_autoload",
+        action="store_true",
+        help="启动时自动加载上次加载过的插件（也可在面板里随时开关）",
+    )
 
     panel = pj.add_argument_group(
         "悬浮窗",
@@ -132,6 +147,27 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     _add_output_args(pj)
+
+    psd = sub.add_parser(
+        "signdylib",
+        help="给单个插件 dylib 签名（运行时 dlopen 加载的前提）",
+        description=(
+            "给插件 dylib 单独签名。iOS 的 library validation 要求插件和主 App 同一个 Team ID，\n"
+            "所以插件必须用签主 App 的那把证书签，否则 dlopen 会报 code signature invalid。\n"
+            "只能走 codesign 后端（macOS）：zsign 只能签整个 IPA。"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    psd.add_argument("dylib", help="要签名的 .dylib 文件")
+    psd.add_argument(
+        "--identity",
+        help="证书名称或 SHA-1，和重签 App 时用的那把一致（如 'Apple Development: x (TEAMID)'）",
+    )
+    psd.add_argument("--p12", help="p12/pfx 证书文件（和 --identity 二选一）")
+    psd.add_argument("--p12-password", help="证书密码，也可用 IPATOOL_P12_PASSWORD 环境变量")
+    psd.add_argument("--entitlements", help="给这个 dylib 用的 entitlements.plist")
+    psd.add_argument("--hardened-runtime", action="store_true", help="启用 hardened runtime")
+    psd.add_argument("-v", "--verbose", action="store_true")
 
     sub.add_parser(
         "gui",
@@ -253,6 +289,57 @@ def cmd_certs(args) -> int:
     for n, i in enumerate(ids, 1):
         print(f"  {n:>2}) {i}")
     print("\n用法示例: --identity <上面的 ID 或名称>")
+    return 0
+
+
+def cmd_signdylib(args) -> int:
+    """
+    给单个插件 dylib 签名。
+
+    运行时 dlopen 的库必须自带有效签名，而且和主 App 同一个 Team ID
+    （iOS 的 library validation），所以插件要用签 App 的那把证书签。
+    """
+    path = os.path.abspath(args.dylib)
+    if not os.path.isfile(path):
+        print(f"错误：找不到文件 {path}", file=sys.stderr)
+        return 2
+    if not ipa_mod.is_macho(path):
+        print(f"警告：{path} 不是 Mach-O 文件，codesign 多半会失败", file=sys.stderr)
+
+    try:
+        signer.resolve_backend("codesign")
+    except signer.SignError as e:
+        print(f"失败: {e}", file=sys.stderr)
+        print("提示：给单个 dylib 签名只能用 codesign（macOS），zsign 只能签整个 IPA", file=sys.stderr)
+        return 1
+
+    want_identity = args.identity if args.identity not in (None, "", "-") else None
+    if want_identity is None and not args.p12:
+        print("警告：没有指定证书，将按 ad-hoc 签名。ad-hoc 没有 Team ID，"
+              "iOS 上基本加载不了（除非主 App 也是 ad-hoc 签的）")
+
+    try:
+        with keystore.IdentitySession(
+            identity=want_identity,
+            p12=args.p12,
+            p12_password=args.p12_password,
+            backend="codesign",
+        ) as ident:
+            signer.codesign_one(
+                path,
+                identity=ident.value,
+                entitlements=args.entitlements,
+                hardened_runtime=args.hardened_runtime,
+                keychain=ident.keychain,
+                log=lambda m: print(f"  {m}"),
+            )
+    except (signer.SignError, RuntimeError, OSError, ValueError) as e:
+        print(f"失败: {e}", file=sys.stderr)
+        return 1
+
+    print(f"已签名插件  : {path}")
+    print("  放进 App 的 Documents（用悬浮窗的「文件导入导出」导入），"
+          "再到「插件加载 → 浏览并加载插件…」里点一下就能加载")
     return 0
 
 
@@ -424,12 +511,17 @@ def cmd_inject(args) -> int:
             args.qnet_loss is not None,
         ))
         qnet_enabled = bool(args.qnet or qnet_tuning) and not args.no_qnet
+        plugins_tuning = bool(args.plugins_dylib or args.plugins_autoload)
+        plugins_enabled = bool(args.plugins or plugins_tuning) and not args.no_plugins
         # 悬浮窗默认跟着内置功能一起注入；--no-panel 关掉它
         panel_tuning = bool(args.panel or args.panel_dylib or args.panel_title)
-        panel_enabled = bool(files_enabled or qnet_enabled or panel_tuning) and not args.no_panel
+        panel_enabled = bool(
+            files_enabled or qnet_enabled or plugins_enabled or panel_tuning
+        ) and not args.no_panel
         plist_touched = bool(
             files_enabled
             or qnet_enabled
+            or plugins_enabled
             or panel_enabled
             or args.background_mode
             or args.allow_arbitrary_loads
@@ -437,7 +529,8 @@ def cmd_inject(args) -> int:
         if not args.dylib and not plist_touched:
             print(
                 "错误：请用 --dylib 指定要注入的库，或用 --files（文件导入导出）"
-                "/ --qnet（弱网测试）注入内置 tweak，或用 --panel 只注入悬浮窗",
+                "/ --qnet（弱网测试）/ --plugins（运行时插件加载）注入内置 tweak，"
+                "或用 --panel 只注入悬浮窗",
                 file=sys.stderr,
             )
             return 2
@@ -451,12 +544,12 @@ def cmd_inject(args) -> int:
         print(f"Bundle ID   : {app.identifier}")
 
         planned: list[tuple[str, str]] = []  # (dylib 路径, 注入名)
-        # 三个功能合编在同一个 IPATool.dylib 里：用到任意一个就只注入这一个 dylib，
+        # 四个功能合编在同一个 IPATool.dylib 里：用到任意一个就只注入这一个 dylib，
         # 没用到的功能在 Info.plist 里显式关掉。只有显式给了某个功能的 dylib 路径时，
         # 才退回老的「一个功能一个 dylib」注入方式
         merged = bool(
-            (files_enabled or qnet_enabled or panel_enabled)
-            and not (args.files_dylib or args.qnet_dylib or args.panel_dylib)
+            (files_enabled or qnet_enabled or plugins_enabled or panel_enabled)
+            and not (args.files_dylib or args.qnet_dylib or args.plugins_dylib or args.panel_dylib)
         )
         if merged:
             tool_dylib = inject_mod.locate_merged_dylib(
@@ -464,7 +557,7 @@ def cmd_inject(args) -> int:
             )
             planned.append((tool_dylib, inject_mod.MERGED_DYLIB_NAME))
             print(f"内置 tweak  : {tool_dylib}")
-            print("              （悬浮窗 / 文件导入导出 / 弱网测试合编在一个 dylib 里，"
+            print("              （悬浮窗 / 文件导入导出 / 弱网测试 / 插件加载合编在一个 dylib 里，"
                   "没用到的功能在 Info.plist 里关掉）")
         else:
             if qnet_enabled:
@@ -474,6 +567,13 @@ def cmd_inject(args) -> int:
                 )
                 planned.append((qnet_dylib, inject_mod.QNET_DYLIB_NAME))
                 print(f"弱网测试    : {qnet_dylib}")
+            if plugins_enabled:
+                plugins_dylib = inject_mod.locate_plugins_dylib(
+                    explicit=args.plugins_dylib,
+                    log=lambda m: print(f"  {m}"),
+                )
+                planned.append((plugins_dylib, inject_mod.PLUGINS_DYLIB_NAME))
+                print(f"插件加载    : {plugins_dylib}")
             if files_enabled:
                 files_dylib = inject_mod.locate_files_dylib(
                     explicit=args.files_dylib,
@@ -541,6 +641,20 @@ def cmd_inject(args) -> int:
             settings.append((inject_mod.QNET_INFO_KEY,
                              inject_mod.build_qnet_options(enabled=False), "弱网测试"))
 
+        if plugins_enabled:
+            plugins_options = inject_mod.build_plugins_options(
+                enabled=True,
+                auto_load=True if args.plugins_autoload else None,
+            )
+            settings.append((inject_mod.PLUGINS_INFO_KEY, plugins_options, "运行时插件加载"))
+            if not panel_enabled:
+                warnings.append("没有注入悬浮窗，插件加载在 App 里没有入口，建议配合 --panel 使用")
+            if not files_enabled:
+                warnings.append("插件要靠「文件导入导出」放进沙盒，建议同时加 --files")
+        elif merged:
+            settings.append((inject_mod.PLUGINS_INFO_KEY,
+                             inject_mod.build_plugins_options(enabled=False), "运行时插件加载"))
+
         if plist_touched:
             plist_changes, plist_warnings = inject_mod.configure_plist(
                 app,
@@ -599,4 +713,6 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_certs(args)
     if args.cmd == "inject":
         return cmd_inject(args)
+    if args.cmd == "signdylib":
+        return cmd_signdylib(args)
     return cmd_modify(args)

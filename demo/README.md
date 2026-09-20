@@ -39,7 +39,7 @@ dylib 都是 `constructor` 自启动，宿主只要有可见窗口和 rootViewCo
 ```bash
 ./demo/build-demo.sh                       # 产出 demo/build/IPATDemo.ipa
 python -m ipatool inject demo/build/IPATDemo.ipa \
-  --files --qnet --in-place --sign none
+  --files --qnet --plugins --in-place --sign none
 ```
 
 链接时带了 `-Wl,-headerpad_max_install_names`：给 Mach-O 头部预留空间，

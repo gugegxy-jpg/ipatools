@@ -84,7 +84,7 @@ done
 sources_for_target() {
   case "$1" in
     IPATool)
-      printf '%s\n' "$HERE/ControlPanel.m" "$HERE/FileBridge.m" "$HERE/QNet.m" "$OUT_DIR/IPAToolIcon.m"
+      printf '%s\n' "$HERE/ControlPanel.m" "$HERE/FileBridge.m" "$HERE/QNet.m" "$HERE/PluginLoader.m" "$OUT_DIR/IPAToolIcon.m"
       ;;
     *)
       if [[ "$1" == "ControlPanel" ]]; then

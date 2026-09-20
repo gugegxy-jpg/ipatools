@@ -6,17 +6,19 @@ dylib 注入：把动态库放进 App 的 Frameworks/ 并给主可执行文件�
     （UIFileSharingEnabled / LSSupportsOpeningDocumentsInPlace）
   - 用来把游戏热更资源导出到「文件」App，或从「文件」App 导回沙盒
 
-以及「弱网测试」（--qnet）：
-  - 写入 IPAToolQNet 配置字典（上下行带宽 / 延迟 / 抖动 / 丢包）
-  - dylib 注入在 App 进程里改自己的 socket 读写，所以只对当前 App 生效，
-    不动系统设置、不影响其它 App，也不需要描述文件 / VPN
+以及「运行时插件加载」（--plugins）：
+  - 写入 IPAToolPlugins 配置字典（Enabled / AutoLoad）
+  - 注入一次之后，之后想试的 dylib 放进沙盒就能在 App 里直接 dlopen，
+    不用再重新打包签名安装。插件必须用签主 App 的同一把证书签名
+    （iOS 的 library validation 看 Team ID），签名用 ipatool signdylib
 
 上面这些功能都合编在同一个 IPATool.dylib 里（内含悬浮窗），注入一次即可，
 用哪个功能由对应的 Info.plist 配置字典决定（没用到的会写成 Enabled=NO）；
 用 --no-panel 可以不带悬浮窗。
 
 需要单独出包时（比如改了某个功能只想重编它）可以用 --files-dylib /
---qnet-dylib / --panel-dylib 指定单独的 dylib，那时退回一功能一库的注入方式。
+--qnet-dylib / --plugins-dylib / --panel-dylib 指定单独的 dylib，
+那时退回一功能一库的注入方式。
 """
 from __future__ import annotations
 
@@ -51,8 +53,13 @@ QNET_DEFAULT_PROFILE = {
     "LossPct": 2,
 }
 
-# 三个内置功能默认合编成一个 IPATool.dylib：只注入一次，
-# 开哪些功能由 Info.plist 里 IPAToolControl / IPAToolFiles / IPAToolQNet 的 Enabled 决定。
+PLUGINS_DYLIB_NAME = "PluginLoader.dylib"
+PLUGINS_INFO_KEY = "IPAToolPlugins"
+PLUGINS_NAME = "PluginLoader"
+
+# 四个内置功能默认合编成一个 IPATool.dylib：只注入一次，
+# 开哪些功能由 Info.plist 里 IPAToolControl / IPAToolFiles / IPAToolQNet / IPAToolPlugins
+# 的 Enabled 决定。
 # 单功能 dylib 仍然支持（显式给了某个功能的 dylib 路径时就用老的分离注入）。
 MERGED_DYLIB_NAME = "IPATool.dylib"
 MERGED_NAME = "IPATool"
@@ -62,6 +69,7 @@ TWEAKS = {
     PANEL_NAME: (CONTROL_PANEL_DYLIB_NAME, "IPATOOL_CONTROL_DYLIB"),
     FILES_NAME: (FILES_DYLIB_NAME, "IPATOOL_FILES_DYLIB"),
     QNET_NAME: (QNET_DYLIB_NAME, "IPATOOL_QNET_DYLIB"),
+    PLUGINS_NAME: (PLUGINS_DYLIB_NAME, "IPATOOL_PLUGINS_DYLIB"),
     MERGED_NAME: (MERGED_DYLIB_NAME, "IPATOOL_DYLIB"),
 }
 
@@ -157,6 +165,10 @@ def locate_files_dylib(explicit: str | None = None, auto_build: bool = True, log
 
 def locate_qnet_dylib(explicit: str | None = None, auto_build: bool = True, log=print) -> str:
     return locate_tweak_dylib(QNET_NAME, explicit=explicit, auto_build=auto_build, log=log)
+
+
+def locate_plugins_dylib(explicit: str | None = None, auto_build: bool = True, log=print) -> str:
+    return locate_tweak_dylib(PLUGINS_NAME, explicit=explicit, auto_build=auto_build, log=log)
 
 
 def locate_merged_dylib(explicit: str | None = None, auto_build: bool = True, log=print) -> str:
@@ -297,6 +309,27 @@ def build_qnet_options(
     detail_keys = ("DownKbps", "UpKbps", "DelayMs", "JitterMs", "LossPct")
     if use_defaults and not any(k in options for k in detail_keys):
         options.update(QNET_DEFAULT_PROFILE)
+    return options
+
+
+# --------------------------------------------------------------------------- #
+# 运行时插件加载（PluginLoader）配置
+# --------------------------------------------------------------------------- #
+def build_plugins_options(
+    enabled: bool | None = None,
+    auto_load: bool | None = None,
+) -> dict:
+    """
+    Enabled 控制能不能用（关掉后不再自动加载，面板入口也不可用）；
+    AutoLoad 控制下次启动是否自动 dlopen 上次加载过的插件。
+
+    插件文件本身不在这里配置：它是运行时从沙盒里挑的，见 tweak/PluginLoader.m。
+    """
+    options: dict = {}
+    if enabled is not None:
+        options["Enabled"] = enabled
+    if auto_load is not None:
+        options["AutoLoad"] = auto_load
     return options
 
 

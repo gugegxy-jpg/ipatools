@@ -18,6 +18,7 @@
 - **注入 dylib**（`inject`）：放进 `Frameworks/` 并给主可执行文件追加 `LC_LOAD_DYLIB`，支持 fat 二进制、幂等
 - **文件导入导出**：`inject --files` 注入文件桥，在悬浮面板里浏览 App 沙盒，把热更资源（补丁/配置/存档）导出到系统「文件」App，或从「文件」App 导入回沙盒
 - **弱网测试**：`inject --qnet` 注入弱网工具，在游戏内的弹窗里实时调限速 / 延迟 / 抖动 / 丢包，**只对当前 App 生效**，不动系统设置、不影响其它 App
+- **运行时插件加载**：`inject --plugins` 注入一次之后，之后想试的 dylib 丢进 App 沙盒就能在悬浮窗里直接加载，**不用再重新打包签名安装**
 - **应用内悬浮控制面板**：上面这些功能会顺带注入一个悬浮窗，点开即可在 App 里实时开关 / 操作它们（`--no-panel` 可关掉）
 - 重打包时尽量保留 Mach-O 可执行权限
 - 可选重签名（`codesign` / `zsign`）
@@ -170,6 +171,9 @@ python -m ipatool inject game.ipa --panel --panel-title 调试 -o out.ipa  # 只
 | --- | --- | --- |
 | 弱网测试（`--qnet`） | `IPAToolQNet.Enabled` | 是（总开关） |
 | └ 网络参数设置（动作行） | 带宽 / 延迟 / 抖动 / 丢包 | 打开参数弹窗：可拖动、右上角 ✕ 关闭、点空白处不关；改完立即生效 |
+| 插件加载（`--plugins`） | `IPAToolPlugins.Enabled` | 是（关掉后不再自动加载，入口也不可用） |
+| └ 浏览并加载插件…（动作行） | —— | 打开插件窗口：列出沙盒里的 dylib，点一下就 dlopen |
+| └ 启动时自动加载 | `IPAToolPlugins.AutoLoad` | 是（下次启动自动加载这次加载过的插件） |
 | 文件导入导出（常开） | `IPAToolFiles.Enabled` | 否（注入即用，面板没有开关；要关只能改 Info.plist） |
 | ├ 浏览并导出文件（动作行） | — | 打开沙盒文件浏览器，导出自动打包 zip |
 | └ 导入文件（动作行） | `IPAToolFiles.ImportDir`（默认落地目录） | 挑好落地目录后，在「文件」App 里选文件 / zip（可多选，zip 自动解压） |
@@ -324,12 +328,64 @@ python -m ipatool inject game.ipa --files --qnet -o out.ipa             # 文件
   启动瞬间建立的连接可能不受限，之后新建的连接一定生效。
 - 想确认有没有生效，看弹窗底部的实时速率，或控制台 `[ipatool-qnet]` 日志。
 
+### 运行时插件加载（`--plugins`）
+
+改一次 dylib 就要「重新打包 → 签名 → 装一次」，调试起来很慢。注入这个插件一次之后，
+**之后想试的 dylib 只要丢进 App 沙盒，就能在悬浮窗里直接 `dlopen` 起来**，不用再碰 IPA。
+
+```bash
+# 1) 只打这一次包：把插件加载器和「文件导入导出」（用来把插件放进沙盒）一起注入
+python -m ipatool inject game.ipa --plugins --files -o out.ipa
+
+# 2) 插件必须用签主 App 的同一把证书签名（这步省不了）
+ipatool signdylib MyPlugin.dylib --identity "Apple Development: you (TEAMID)"
+
+# 3) 手机上：悬浮窗 →「文件导入导出」把 MyPlugin.dylib 导到 Documents
+# 4) 悬浮窗 →「插件加载」→「浏览并加载插件…」→ 点一下那个文件就加载了
+```
+
+**先搞清楚这三条限制**（不是这个工具的限制，是 iOS 的）：
+
+1. **插件必须有效签名，且 Team ID 要和主 App 一致** —— iOS 的 library validation。
+   用签 App 的那把证书签插件就行；**ad-hoc 签的 App 基本加载不了任何 dylib**
+   （ad-hoc 没有 Team ID），所以重签时别用 `--identity -`。
+2. **架构要一致**：真机包只能加载 arm64 的 iOS dylib，模拟器编的装不进去。
+   加载前会先读 Mach-O 头检查，不匹配会把这话直接写出来。
+3. **`dlclose` 在 iOS 上基本不会真正卸载镜像**：改完插件要重启 App 才干净；
+   插件的 `__DATA,__interpose` 也只对 dlopen 之后**新绑定**的调用生效。
+
+| 参数 | 说明 |
+| --- | --- |
+| `--plugins` | 注入插件加载器 |
+| `--no-plugins` | 不注入插件加载器 |
+| `--plugins-dylib` | dylib 路径，默认找 `tweak/build/` |
+| `--plugins-autoload` | 启动时自动加载上次加载过的插件（面板里也能随时开关） |
+
+写入的 Info.plist：
+
+```xml
+<key>IPAToolPlugins</key>
+<dict>
+  <key>Enabled</key><true/>
+  <key>AutoLoad</key><true/>
+</dict>
+```
+
+插件窗口的行为和弱网弹窗一致：右上角 **✕** 关闭、**点空白处不关闭**（空白触摸穿透给游戏）、
+**拖标题栏换位置**且位置会被记住。列表里每个 dylib 一行，已加载的显示 ✓ 并且可以重载；
+**加载失败会把 `dlopen` 的原文翻译后整段显示出来**（签名不对 / 架构不对 /
+依赖的库没一起放进来，各说各的，不用自己去猜）。
+
+顺带一个好处：加载进来的插件如果也按 `tweak/IPATControlShared.h` 的协议 post 一次
+`IPATControlRegister`，**悬浮面板会自动多出它自己那一节**，面板不用改一行代码
+（加载完会广播一次 Discover，晚加载的插件也能把注册补上）。
+
 ### 编译内置 tweak
 
-三个内置功能（悬浮窗 / 文件导入导出 / 弱网测试）的源码是分开的，但**默认合编成一个 `IPATool.dylib`**：
-注入一次就够，开哪些功能由 `Info.plist` 里 `IPAToolControl` / `IPAToolFiles` / `IPAToolQNet`
+四个内置功能（悬浮窗 / 文件导入导出 / 弱网测试 / 插件加载）的源码是分开的，但**默认合编成一个 `IPATool.dylib`**：
+注入一次就够，开哪些功能由 `Info.plist` 里 `IPAToolControl` / `IPAToolFiles` / `IPAToolQNet` / `IPAToolPlugins`
 的 `Enabled` 决定（`ipatool inject` 会把没用到的功能自动写成 `Enabled=NO`）。
-三者之间只用「通知 + NSUserDefaults」通信（见 `tweak/IPATControlShared.h`），
+四者之间只用「通知 + NSUserDefaults」通信（见 `tweak/IPATControlShared.h`），
 顶层函数全是 `static`、类名前缀各不相同，所以合编不会撞符号。
 
 ```bash
@@ -371,6 +427,7 @@ tweak/
   ControlPanel.m        应用内悬浮控制面板（悬浮按钮 + 开关小窗口）
   FileBridge.m          沙盒文件浏览 / 导出到「文件」App / 从「文件」App 导入
   QNet.m                弱网测试：拦截 socket 读写做限速 / 延迟 / 抖动 / 丢包 + 参数弹窗
+  PluginLoader.m        运行时插件加载：扫描沙盒里的 dylib 并 dlopen（不用重打包）+ 插件窗口
   IPATControlShared.h   面板与各功能 dylib 之间的约定（通知名 / 配置键）
   build.sh              编译脚本（需要 macOS + Xcode，默认把三个功能合编成一个 IPATool.dylib）
 ```
