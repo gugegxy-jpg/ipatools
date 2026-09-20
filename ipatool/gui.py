@@ -15,6 +15,7 @@ import contextlib
 import io
 import json
 import os
+import platform
 import queue
 import sys
 import threading
@@ -33,6 +34,23 @@ else:
 OPT_DEFAULT = "(默认)"
 PASSWORD_MASK = "********"
 APP_TITLE = "ipatool"
+
+
+def _gui_config_path() -> str:
+    """
+    GUI 设置（含上次选的证书路径与密码）存哪。
+
+    放用户配置目录，不写在工作目录里；密码是**明文**，只为了下次不用重输，
+    不想留就在「签名」页取消勾选，或点「清除已保存的证书」。
+    """
+    system = platform.system()
+    if system == "Windows":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        return os.path.join(base, "ipatool", "gui.json")
+    if system == "Darwin":
+        return os.path.expanduser("~/Library/Application Support/ipatool/gui.json")
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "ipatool", "gui.json")
 APP_SUBTITLE = "修改 IPA 的 Bundle ID / 名称，注入 dylib 并重新签名"
 CAPTURE_TASKS = ("info", "certs")
 
@@ -250,6 +268,7 @@ class IpatoolGui:
         self.v_provision = tk.StringVar()
         self.v_entitlements = tk.StringVar()
         self.v_zip_level = tk.StringVar(value="auto")
+        self.v_remember = tk.BooleanVar(value=True)
         self.v_hardened = tk.BooleanVar(value=False)
         self.v_dry_run = tk.BooleanVar(value=False)
         self.v_verbose = tk.BooleanVar(value=False)
@@ -260,6 +279,14 @@ class IpatoolGui:
 
         # 状态
         self.v_status = tk.StringVar(value="就绪")
+
+        # 上次的签名设置（证书 / 密码）：启动时恢复，之后改动自动保存
+        self._save_job: str | None = None
+        self._restore_settings()
+        for var in (self.v_sign, self.v_identity, self.v_p12, self.v_p12_password,
+                    self.v_provision, self.v_entitlements, self.v_zip_level,
+                    self.v_remember):
+            var.trace_add("write", self._schedule_save)
 
     # ------------------------------------------------------------------ #
     # 顶部：输入 / 输出
@@ -552,6 +579,21 @@ class IpatoolGui:
                  "注入和签名本来就是同一次里做完的，不用再跑第二个工具",
         ).grid(row=3, column=2, sticky="w", pady=(6, 3))
 
+        # 证书 / 密码存下来，下次打开自动填好
+        keep = self._group(page, "记住设置", 2)
+        ttk.Checkbutton(
+            keep, text="记住证书 / 密码 / ID 签名，下次打开自动填好",
+            variable=self.v_remember,
+        ).grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(
+            keep, style="Muted.TLabel", justify="left", wraplength=620,
+            text=f"保存在本机配置文件里（明文）：{_gui_config_path()}\n"
+                 "不想留就取消勾选；也可以点右边按钮把已保存的清掉（不影响证书文件本身）。",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Button(
+            keep, text="清除已保存的证书", command=self._clear_settings,
+        ).grid(row=1, column=2, sticky="e", padx=(10, 0))
+
     # ------------------------------------------------------------------ #
     # 底部：日志 + 操作
     # ------------------------------------------------------------------ #
@@ -599,6 +641,82 @@ class IpatoolGui:
         box.columnconfigure(1, weight=1)
         parent.columnconfigure(0, weight=1)
         return box
+
+    # ------------------------------------------------------------------ #
+    # 记住上次的签名设置（证书 / 密码）
+    # ------------------------------------------------------------------ #
+    def _read_settings(self) -> dict:
+        try:
+            with open(_gui_config_path(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _restore_settings(self) -> None:
+        """启动时把上次选的证书 / 密码填回去（没有文件就当第一次用）。"""
+        data = self._read_settings()
+        if not data:
+            return
+        self.v_sign.set(str(data.get("sign") or "auto"))
+        self.v_identity.set(str(data.get("identity") or ""))
+        self.v_p12.set(str(data.get("p12") or ""))
+        self.v_provision.set(str(data.get("provision") or ""))
+        self.v_entitlements.set(str(data.get("entitlements") or ""))
+        self.v_zip_level.set(str(data.get("zip_level") or "auto"))
+        self.v_remember.set(bool(data.get("remember", True)))
+        if self.v_remember.get():
+            self.v_p12_password.set(str(data.get("p12_password") or ""))
+        if self.v_p12.get() or self.v_identity.get():
+            self.v_status.set("已载入上次的签名设置")
+
+    def _write_settings(self) -> None:
+        self._save_job = None
+        path = _gui_config_path()
+        data = {
+            "sign": self.v_sign.get(),
+            "identity": self.v_identity.get(),
+            "p12": self.v_p12.get(),
+            "provision": self.v_provision.get(),
+            "entitlements": self.v_entitlements.get(),
+            "zip_level": self.v_zip_level.get(),
+            "remember": bool(self.v_remember.get()),
+            # 明文保存：图的是下次不用重输。不想留就取消勾选，或点「清除已保存的证书」
+            "p12_password": self.v_p12_password.get() if self.v_remember.get() else "",
+        }
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            if os.name == "posix":
+                os.chmod(path, 0o600)     # 只有自己能读
+        except OSError as exc:
+            self._append(f"[设置] 保存失败：{exc}\n", "err")
+            return
+        self._append(f"[设置] 已保存证书设置（{path}）\n")
+
+    def _schedule_save(self, *_args) -> None:
+        """变量一变就排队保存；防抖 500ms，免得每敲一个字符写一次盘。"""
+        if self._save_job:
+            try:
+                self.root.after_cancel(self._save_job)
+            except Exception:
+                pass
+        self._save_job = self.root.after(500, self._write_settings)
+
+    def _clear_settings(self) -> None:
+        if not messagebox.askyesno("清除已保存的证书",
+                                   "确定要删掉已保存的证书路径和密码吗？\n"
+                                   "（不影响证书文件本身，只是不再自动填）"):
+            return
+        try:
+            os.remove(_gui_config_path())
+        except OSError:
+            pass
+        self.v_p12_password.set("")
+        self.v_p12.set("")
+        self.v_identity.set("")
+        self._append("[设置] 已清除保存的证书信息\n")
 
     def _entry(self, box, row, label, var, hint=None, browse=None, width=36):
         ttk.Label(box, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=3)
@@ -898,7 +1016,18 @@ class IpatoolGui:
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:
+        # 关窗时兜底存一次（防抖可能还没触发）
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.mainloop()
+
+    def _on_close(self) -> None:
+        if self._save_job:
+            try:
+                self.root.after_cancel(self._save_job)
+            except Exception:
+                pass
+        self._write_settings()
+        self.root.destroy()
 
 
 def main(argv: list[str] | None = None) -> int:
