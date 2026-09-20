@@ -13,6 +13,9 @@
 //         下行带宽 / 上行带宽（KB/s，0 = 不限，令牌桶限速）
 //         延迟（ms，单向附加延迟）+ 抖动（ms，在延迟上随机 ±抖动）
 //         丢包（%，上行直接丢弃不算发送；下行丢弃后继续等下一个包）
+//       参数在弹窗里直接输数字（超过上限会自动夹回来）；常用的组合可以存成预设，
+//       预设列表同一时刻只启用一条——启用另一条会先把当前这条关掉。
+//       手动改参数 / 手动关开关，都会把「启用中的预设」清掉，免得状态和参数对不上。
 //       上行延迟是「异步晚一点再发」：不阻塞游戏线程，免得游戏掉帧。
 //       下行延迟阻塞在网络线程上（本来就是等数据的线程），这才是弱网该有的体感。
 //    4. 只对 socket 生效：read / write 也会被拦，但先用 getsockopt 判断 fd 是不是
@@ -231,6 +234,10 @@ static NSDictionary *IPATQnPlistConfig(void) {
         cfg = [value isKindOfClass:[NSDictionary class]] ? value : @{};
     });
     return cfg;
+}
+
+static int IPATQnIntOf(id value) {
+    return [value respondsToSelector:@selector(intValue)] ? [value intValue] : 0;
 }
 
 static int IPATQnIntSetting(NSString *panelKey, NSString *plistKey, int fallback) {
@@ -577,14 +584,15 @@ static int IPATQnParamMax(IPATQnParam param) {
     }
 }
 
-static int IPATQnParamStep(IPATQnParam param) {
+/// 输入框后面的单位提示
+static NSString *IPATQnParamUnit(IPATQnParam param) {
     switch (param) {
-        case IPATQnParamDown:   return 10;
-        case IPATQnParamUp:     return 10;
-        case IPATQnParamDelay:  return 10;
-        case IPATQnParamJitter: return 5;
-        case IPATQnParamLoss:   return 1;
-        default:                return 1;
+        case IPATQnParamDown:
+        case IPATQnParamUp:     return @"KB/s";
+        case IPATQnParamDelay:
+        case IPATQnParamJitter: return @"ms";
+        case IPATQnParamLoss:   return @"%";
+        default:                return @"";
     }
 }
 
@@ -615,47 +623,180 @@ static int IPATQnParamValue(IPATQnParam param) {
     }
 }
 
-/// 预设：点一下把五个参数一起设好
-static NSString *IPATQnPresetName(NSInteger index) {
-    static NSString *const names[] = {@"正常", @"3G", @"2G", @"极差", @"断网"};
-    if (index < 0 || index > 4) return @"";
-    return names[index];
+#pragma mark - 预设
+
+@interface IPATQnPresetItem : NSObject
+
+@property (nonatomic, copy) NSString *presetId;
+@property (nonatomic, copy) NSString *name;
+@property (nonatomic, assign) int downKbps;
+@property (nonatomic, assign) int upKbps;
+@property (nonatomic, assign) int delayMs;
+@property (nonatomic, assign) int jitterMs;
+@property (nonatomic, assign) int lossPct;
+
+@end
+
+@implementation IPATQnPresetItem
+
+- (instancetype)initWithDictionary:(NSDictionary *)dict {
+    if ((self = [super init])) {
+        self.presetId = [dict[@"id"] isKindOfClass:[NSString class]] ? dict[@"id"] : @"";
+        self.name = [dict[@"name"] isKindOfClass:[NSString class]] ? dict[@"name"] : @"未命名";
+        self.downKbps = IPATQnIntOf(dict[@"down"]);
+        self.upKbps = IPATQnIntOf(dict[@"up"]);
+        self.delayMs = IPATQnIntOf(dict[@"delay"]);
+        self.jitterMs = IPATQnIntOf(dict[@"jitter"]);
+        self.lossPct = MIN(100, MAX(0, IPATQnIntOf(dict[@"loss"])));
+        if (self.presetId.length == 0) self.presetId = [[NSUUID UUID] UUIDString];
+    }
+    return self;
 }
 
-static void IPATQnApplyPreset(NSInteger index) {
-    //        下行  上行  延迟  抖动  丢包
-    int table[5][5] = {
-        {0,   0,   0,    0,   0},      // 正常
-        {300, 150, 150,  40,  2},      // 3G
-        {50,  30,  500,  120, 8},      // 2G
-        {20,  10,  1000, 300, 25},     // 极差
-        {0,   0,   0,    0,   100},    // 断网（全丢）
-    };
-    if (index < 0 || index > 4) return;
+- (NSDictionary *)dictionaryValue {
+    return @{@"id": self.presetId ?: @"",
+             @"name": self.name ?: @"",
+             @"down": @(self.downKbps),
+             @"up": @(self.upKbps),
+             @"delay": @(self.delayMs),
+             @"jitter": @(self.jitterMs),
+             @"loss": @(self.lossPct)};
+}
+
+@end
+
+static IPATQnPresetItem *IPATQnMakePreset(NSString *presetId, NSString *name,
+                                          int down, int up, int delay, int jitter, int loss) {
+    IPATQnPresetItem *item = [[IPATQnPresetItem alloc] init];
+    item.presetId = presetId.length > 0 ? presetId : [[NSUUID UUID] UUIDString];
+    item.name = name.length > 0 ? name : @"未命名";
+    item.downKbps = MAX(0, down);
+    item.upKbps = MAX(0, up);
+    item.delayMs = MAX(0, delay);
+    item.jitterMs = MAX(0, jitter);
+    item.lossPct = MIN(100, MAX(0, loss));
+    return item;
+}
+
+/// 第一次用时给的内置预设，之后就都按用户自己存的列表走
+static NSArray<IPATQnPresetItem *> *IPATQnBuiltinPresets(void) {
+    //                                 id                   名称        下行 上行 延迟  抖动 丢包
+    return @[
+        IPATQnMakePreset(@"builtin.normal",  @"正常网络",  0,   0,   0,    0,   0),
+        IPATQnMakePreset(@"builtin.3g",      @"3G",       300, 150, 150,  40,  2),
+        IPATQnMakePreset(@"builtin.2g",      @"2G",       50,  30,  500,  120, 8),
+        IPATQnMakePreset(@"builtin.bad",     @"极差网络",  20,  10,  1000, 300, 25),
+        IPATQnMakePreset(@"builtin.offline", @"断网",      0,   0,   0,    0,   100),
+    ];
+}
+
+static void IPATQnSavePresets(NSArray<IPATQnPresetItem *> *presets) {
+    NSMutableArray *stored = [NSMutableArray array];
+    for (IPATQnPresetItem *item in presets) [stored addObject:[item dictionaryValue]];
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    [defaults setInteger:table[index][0] forKey:IPATKeyQNetDownKbps];
-    [defaults setInteger:table[index][1] forKey:IPATKeyQNetUpKbps];
-    [defaults setInteger:table[index][2] forKey:IPATKeyQNetDelayMs];
-    [defaults setInteger:table[index][3] forKey:IPATKeyQNetJitterMs];
-    [defaults setInteger:table[index][4] forKey:IPATKeyQNetLossPct];
+    [defaults setObject:stored forKey:IPATKeyQNetPresets];
+    [defaults synchronize];
+}
+
+static NSArray<IPATQnPresetItem *> *IPATQnLoadPresets(void) {
+    id stored = [[NSUserDefaults standardUserDefaults] objectForKey:IPATKeyQNetPresets];
+    if ([stored isKindOfClass:[NSArray class]]) {
+        NSMutableArray *items = [NSMutableArray array];
+        for (id entry in (NSArray *)stored) {
+            if (![entry isKindOfClass:[NSDictionary class]]) continue;
+            [items addObject:[[IPATQnPresetItem alloc] initWithDictionary:entry]];
+        }
+        if (items.count > 0) return items;
+    }
+    NSArray<IPATQnPresetItem *> *builtin = IPATQnBuiltinPresets();
+    IPATQnSavePresets(builtin);
+    return builtin;
+}
+
+static NSString *IPATQnActivePresetId(void) {
+    id value = [[NSUserDefaults standardUserDefaults] objectForKey:IPATKeyQNetActivePreset];
+    return [value isKindOfClass:[NSString class]] ? value : @"";
+}
+
+static void IPATQnSetActivePresetId(NSString *presetId) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    [defaults setObject:presetId ?: @"" forKey:IPATKeyQNetActivePreset];
+    [defaults synchronize];
+}
+
+static IPATQnPresetItem *IPATQnActivePreset(void) {
+    NSString *active = IPATQnActivePresetId();
+    if (active.length == 0) return nil;
+    for (IPATQnPresetItem *item in IPATQnLoadPresets()) {
+        if ([item.presetId isEqualToString:active]) return item;
+    }
+    return nil;
+}
+
+/// 启用一条预设。同一时刻只会有一条生效：
+/// 已经有启用中的那一条时，先把它关掉（弱网停用 + 清掉启用标记），再启用新的这条。
+static void IPATQnEnablePreset(IPATQnPresetItem *item) {
+    if (!item) return;
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSString *active = IPATQnActivePresetId();
+    if (active.length > 0 && ![active isEqualToString:item.presetId]) {
+        IPATQnLog(@"关掉当前预设，改启用「%@」", item.name);
+        [defaults setBool:NO forKey:IPATKeyQNetEnabled];
+        IPATQnSetActivePresetId(@"");
+        IPATQnReloadConfig();
+    }
+    [defaults setInteger:item.downKbps forKey:IPATKeyQNetDownKbps];
+    [defaults setInteger:item.upKbps forKey:IPATKeyQNetUpKbps];
+    [defaults setInteger:item.delayMs forKey:IPATKeyQNetDelayMs];
+    [defaults setInteger:item.jitterMs forKey:IPATKeyQNetJitterMs];
+    [defaults setInteger:item.lossPct forKey:IPATKeyQNetLossPct];
+    [defaults setBool:YES forKey:IPATKeyQNetEnabled];
+    IPATQnSetActivePresetId(item.presetId);
+    [defaults synchronize];
+    IPATQnReloadConfig();
+    IPATQnLog(@"已启用预设「%@」：下行 %@ / 上行 %@ / 延迟 %d±%d ms / 丢包 %d%%",
+              item.name,
+              IPATQnParamText(IPATQnParamDown, item.downKbps),
+              IPATQnParamText(IPATQnParamUp, item.upKbps),
+              item.delayMs, item.jitterMs, item.lossPct);
+}
+
+/// 关掉当前启用的那条预设：弱网一起停用，启用标记清空
+static void IPATQnDisableActivePreset(void) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    [defaults setBool:NO forKey:IPATKeyQNetEnabled];
+    IPATQnSetActivePresetId(@"");
     [defaults synchronize];
     IPATQnReloadConfig();
 }
 
+static NSString *IPATQnPresetSummary(IPATQnPresetItem *item) {
+    return [NSString stringWithFormat:@"↓%@ ↑%@ · %@±%@ · 丢%@",
+            IPATQnParamText(IPATQnParamDown, item.downKbps),
+            IPATQnParamText(IPATQnParamUp, item.upKbps),
+            IPATQnParamText(IPATQnParamDelay, item.delayMs),
+            IPATQnParamText(IPATQnParamJitter, item.jitterMs),
+            IPATQnParamText(IPATQnParamLoss, item.lossPct)];
+}
+
 #pragma mark - 参数弹窗（可拖动 / 右上角关闭 / 点空白处不关闭）
 
-@interface IPATQnCard : UIView
+@interface IPATQnCard : UIView <UITextFieldDelegate>
 
 @property (nonatomic, strong) UISwitch *enableSwitch;
-@property (nonatomic, strong) NSMutableArray<UISlider *> *sliders;
-@property (nonatomic, strong) NSMutableArray<UILabel *> *valueLabels;
+@property (nonatomic, strong) NSMutableArray<UITextField *> *fields;      // 五个参数直接输数字
+@property (nonatomic, strong) NSMutableArray<UILabel *> *unitLabels;      // 输入框右边的单位
 @property (nonatomic, strong) UILabel *rateLabel;
 @property (nonatomic, strong) UILabel *hookLabel;         // 拦截诊断：到底拦没拦到
+@property (nonatomic, strong) UIView *presetSection;      // 预设列表（增删后整段重建）
+@property (nonatomic, strong) UILabel *noteLabel;         // 最下面那行说明，跟着预设列表走
+@property (nonatomic, strong) UITextField *presetNameField;
 @property (nonatomic, strong) UIView *headerView;          // 标题栏，拖动窗口的地方
 @property (nonatomic, strong) UIScrollView *scrollView;   // 横屏高度不够时内容可以滚
 @property (nonatomic, assign) CGFloat contentHeight;
 @property (nonatomic, copy) void (^onClose)(void);
 @property (nonatomic, copy) void (^onChanged)(void);
+@property (nonatomic, copy) void (^onResize)(void);        // 内容变高了，让外面重新排版
 
 @end
 
@@ -668,8 +809,8 @@ static void IPATQnApplyPreset(NSInteger index) {
         self.layer.masksToBounds = YES;
         self.layer.borderWidth = 1.0;
         self.layer.borderColor = [[UIColor colorWithWhite:1.0 alpha:0.15] CGColor];
-        self.sliders = [NSMutableArray array];
-        self.valueLabels = [NSMutableArray array];
+        self.fields = [NSMutableArray array];
+        self.unitLabels = [NSMutableArray array];
         UIScrollView *scroll = [[UIScrollView alloc]
             initWithFrame:CGRectMake(0, 46.0, frame.size.width, MAX(0.0, frame.size.height - 46.0))];
         scroll.backgroundColor = [UIColor clearColor];
@@ -734,29 +875,38 @@ static void IPATQnApplyPreset(NSInteger index) {
     for (NSInteger i = 0; i < IPATQnParamCount; i++) {
         IPATQnParam param = (IPATQnParam)i;
 
-        UILabel *name = [[UILabel alloc] initWithFrame:CGRectMake(margin, y, 70.0, 20.0)];
+        UILabel *name = [[UILabel alloc] initWithFrame:CGRectMake(margin, y + 5.0, 70.0, 20.0)];
         name.text = IPATQnParamTitle(param);
         name.textColor = [UIColor colorWithWhite:1.0 alpha:0.9];
         name.font = [UIFont systemFontOfSize:13.0];
         [self.scrollView addSubview:name];
 
-        UILabel *value = [[UILabel alloc] initWithFrame:CGRectMake(width - margin - 84.0, y, 84.0, 20.0)];
-        value.textAlignment = NSTextAlignmentRight;
-        value.textColor = [UIColor greenColor];
-        value.font = [UIFont systemFontOfSize:13.0];
-        [self.scrollView addSubview:value];
-        [self.valueLabels addObject:value];
+        UITextField *field =
+            [[UITextField alloc] initWithFrame:CGRectMake(margin + 74.0, y, rowWidth - 74.0 - 44.0, 30.0)];
+        field.borderStyle = UITextBorderStyleRoundedRect;
+        field.keyboardType = UIKeyboardTypeNumberPad;
+        field.textAlignment = NSTextAlignmentRight;
+        field.textColor = [UIColor greenColor];
+        field.font = [UIFont systemFontOfSize:13.0];
+        field.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.14];
+        field.clearButtonMode = UITextFieldViewModeWhileEditing;
+        field.returnKeyType = UIReturnKeyDone;
+        field.tag = i;
+        field.delegate = self;
+        field.inputAccessoryView = [self ipatDoneToolbar];
+        [field addTarget:self
+                  action:@selector(handleParamChanged:)
+        forControlEvents:UIControlEventEditingDidEnd];
+        [self.scrollView addSubview:field];
+        [self.fields addObject:field];
 
-        UISlider *slider = [[UISlider alloc] initWithFrame:CGRectMake(margin, y + 20.0, rowWidth, 30.0)];
-        slider.minimumValue = 0.0;
-        slider.maximumValue = (float)IPATQnParamMax(param);
-        slider.tag = i;
-        [slider addTarget:self action:@selector(handleSliderChanged:) forControlEvents:UIControlEventValueChanged];
-        [slider addTarget:self action:@selector(handleSliderUp:) forControlEvents:UIControlEventTouchUpInside];
-        [slider addTarget:self action:@selector(handleSliderUp:) forControlEvents:UIControlEventTouchUpOutside];
-        [self.scrollView addSubview:slider];
-        [self.sliders addObject:slider];
-        y += 54.0;
+        UILabel *unit = [[UILabel alloc] initWithFrame:CGRectMake(width - margin - 40.0, y + 5.0, 40.0, 20.0)];
+        unit.text = IPATQnParamUnit(param);
+        unit.textColor = [UIColor colorWithWhite:1.0 alpha:0.7];
+        unit.font = [UIFont systemFontOfSize:12.0];
+        [self.scrollView addSubview:unit];
+        [self.unitLabels addObject:unit];
+        y += 36.0;
     }
 
     UILabel *rate = [[UILabel alloc] initWithFrame:CGRectMake(margin, y, rowWidth, 20.0)];
@@ -777,21 +927,11 @@ static void IPATQnApplyPreset(NSInteger index) {
     self.hookLabel = hookInfo;
     y += 34.0;
 
-    CGFloat buttonWidth = (rowWidth - 8.0 * 4) / 5.0;
-    for (NSInteger i = 0; i < 5; i++) {
-        UIButton *preset = [UIButton buttonWithType:UIButtonTypeSystem];
-        preset.frame = CGRectMake(margin + (buttonWidth + 8.0) * (CGFloat)i, y, buttonWidth, 30.0);
-        [preset setTitle:IPATQnPresetName(i) forState:UIControlStateNormal];
-        [preset setTitleColor:[UIColor greenColor] forState:UIControlStateNormal];
-        preset.titleLabel.font = [UIFont systemFontOfSize:12.0];
-        preset.layer.cornerRadius = 6.0;
-        preset.layer.borderWidth = 1.0;
-        preset.layer.borderColor = [[UIColor greenColor] CGColor];
-        preset.tag = i;
-        [preset addTarget:self action:@selector(handlePreset:) forControlEvents:UIControlEventTouchUpInside];
-        [self.scrollView addSubview:preset];
-    }
-    y += 38.0;
+    // 预设列表放在最后：条目增减时整段重建，后面的说明跟着往下挪
+    UIView *section = [[UIView alloc] initWithFrame:CGRectMake(margin, y, rowWidth, 80.0)];
+    section.backgroundColor = [UIColor clearColor];
+    [self.scrollView addSubview:section];
+    self.presetSection = section;
 
     UILabel *note = [[UILabel alloc] initWithFrame:CGRectMake(margin, y, rowWidth, 32.0)];
     note.text = @"只对当前 App 生效，不动系统设置，也不影响其它 App";
@@ -799,13 +939,9 @@ static void IPATQnApplyPreset(NSInteger index) {
     note.font = [UIFont systemFontOfSize:11.0];
     note.numberOfLines = 2;
     [self.scrollView addSubview:note];
-    y += 38.0;
+    self.noteLabel = note;
 
-    self.contentHeight = y + 8.0;
-    self.scrollView.contentSize = CGSizeMake(width, self.contentHeight);
-    CGRect frame = self.frame;
-    frame.size.height = 46.0 + self.contentHeight;
-    self.frame = frame;
+    [self rebuildPresetSection];   // 会把说明行的位置和卡片高度一起算好
 }
 
 - (void)layoutSubviews {
@@ -820,23 +956,55 @@ static void IPATQnApplyPreset(NSInteger index) {
     return 46.0 + MAX(self.contentHeight, 120.0);
 }
 
+#pragma mark 输入框
+
+/// 数字键盘没有回车键，给个「完成」把键盘收掉（收掉时参数就顺带写进去了）
+- (UIToolbar *)ipatDoneToolbar {
+    UIToolbar *bar = [[UIToolbar alloc] initWithFrame:CGRectMake(0, 0, self.bounds.size.width, 36.0)];
+    bar.barStyle = UIBarStyleBlack;
+    bar.translucent = YES;
+    UIBarButtonItem *space =
+        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemFlexibleSpace
+                                                     target:nil
+                                                     action:nil];
+    UIBarButtonItem *done =
+        [[UIBarButtonItem alloc] initWithTitle:@"完成"
+                                         style:UIBarButtonItemStyleDone
+                                        target:self
+                                        action:@selector(handleInputDone)];
+    bar.items = @[space, done];
+    [bar sizeToFit];
+    return bar;
+}
+
+- (void)handleInputDone {
+    [self endEditing:YES];
+}
+
+- (BOOL)textFieldShouldReturn:(UITextField *)textField {
+    [textField resignFirstResponder];
+    return YES;
+}
+
 - (void)refreshValues {
     IPATQnConfig cfg = IPATQnSnapshot();
     self.enableSwitch.on = cfg.enabled ? YES : NO;
     for (NSInteger i = 0; i < IPATQnParamCount; i++) {
         IPATQnParam param = (IPATQnParam)i;
-        int value = IPATQnParamValue(param);
-        if (i < (NSInteger)self.sliders.count) self.sliders[i].value = (float)value;
-        if (i < (NSInteger)self.valueLabels.count) {
-            self.valueLabels[i].text = IPATQnParamText(param, value);
-        }
+        if (i >= (NSInteger)self.fields.count) continue;
+        UITextField *field = self.fields[i];
+        if (field.isEditing) continue;   // 正在输的数别被覆盖掉
+        field.text = [NSString stringWithFormat:@"%d", IPATQnParamValue(param)];
     }
+    [self rebuildPresetSection];
     [self updateHookInfo];
 }
 
 - (void)handleToggle:(UISwitch *)sender {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     [defaults setBool:sender.isOn forKey:IPATKeyQNetEnabled];
+    // 手动关掉弱网 = 预设也不再算启用中
+    if (!sender.isOn) IPATQnSetActivePresetId(@"");
     [defaults synchronize];
     IPATQnReloadConfig();
     IPATQnConfig cfg = IPATQnSnapshot();
@@ -845,33 +1013,201 @@ static void IPATQnApplyPreset(NSInteger index) {
               IPATQnParamText(IPATQnParamDown, cfg.downKbps),
               IPATQnParamText(IPATQnParamUp, cfg.upKbps),
               cfg.delayMs, cfg.jitterMs, cfg.lossPct);
+    [self rebuildPresetSection];
     if (self.onChanged) self.onChanged();
 }
 
-- (void)handleSliderChanged:(UISlider *)sender {
+/// 输完一个参数：夹到合法范围里存起来；手动改过之后就不再算某条预设了
+- (void)handleParamChanged:(UITextField *)sender {
     IPATQnParam param = (IPATQnParam)sender.tag;
-    int step = IPATQnParamStep(param);
-    int value = (int)(roundf(sender.value / (float)step) * (float)step);
+    int max = IPATQnParamMax(param);
+    int value = [sender.text intValue];
     if (value < 0) value = 0;
+    if (value > max) value = max;
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     [defaults setInteger:value forKey:IPATQnParamUserKey(param)];
+    if (IPATQnActivePresetId().length > 0) IPATQnSetActivePresetId(@"");
     [defaults synchronize];
     IPATQnReloadConfig();
-    if (sender.tag < (NSInteger)self.valueLabels.count) {
-        self.valueLabels[sender.tag].text = IPATQnParamText(param, value);
-    }
-}
-
-/// 手松开了才通知面板改状态行，拖动过程中别一直刷
-- (void)handleSliderUp:(UISlider *)sender {
-    sender.value = (float)IPATQnParamValue((IPATQnParam)sender.tag);
+    sender.text = [NSString stringWithFormat:@"%d", value];
+    [self rebuildPresetSection];
     if (self.onChanged) self.onChanged();
 }
 
-- (void)handlePreset:(UIButton *)sender {
-    IPATQnApplyPreset(sender.tag);
+#pragma mark 预设列表
+
+/// 预设条目是动态的（可增删），所以整段重建：列表 → 下面那行说明 → 卡片高度
+- (void)rebuildPresetSection {
+    UIView *section = self.presetSection;
+    if (!section) return;
+    for (UIView *subview in [section.subviews copy]) [subview removeFromSuperview];
+
+    CGFloat width = section.bounds.size.width;
+    CGFloat y = 0.0;
+
+    UILabel *caption = [[UILabel alloc] initWithFrame:CGRectMake(0, y, width, 20.0)];
+    caption.text = @"预设（同一时刻只启用一条）";
+    caption.textColor = [UIColor whiteColor];
+    caption.font = [UIFont boldSystemFontOfSize:13.0];
+    [section addSubview:caption];
+    y += 24.0;
+
+    NSString *activeId = IPATQnActivePresetId();
+    NSArray<IPATQnPresetItem *> *presets = IPATQnLoadPresets();
+    for (NSUInteger index = 0; index < presets.count; index++) {
+        IPATQnPresetItem *item = presets[index];
+        BOOL active = [item.presetId isEqualToString:activeId];
+
+        UIView *row = [[UIView alloc] initWithFrame:CGRectMake(0, y, width, 40.0)];
+        row.backgroundColor = active ? [[UIColor greenColor] colorWithAlphaComponent:0.16]
+                                     : [[UIColor whiteColor] colorWithAlphaComponent:0.05];
+        row.layer.cornerRadius = 6.0;
+        [section addSubview:row];
+
+        UILabel *name = [[UILabel alloc] initWithFrame:CGRectMake(8.0, 3.0, width - 108.0, 18.0)];
+        name.text = item.name;
+        name.textColor = active ? [UIColor greenColor] : [UIColor whiteColor];
+        name.font = [UIFont boldSystemFontOfSize:13.0];
+        [row addSubview:name];
+
+        UILabel *summary = [[UILabel alloc] initWithFrame:CGRectMake(8.0, 20.0, width - 108.0, 20.0)];
+        summary.text = IPATQnPresetSummary(item);
+        summary.textColor = [UIColor colorWithWhite:1.0 alpha:0.55];
+        summary.font = [UIFont systemFontOfSize:10.0];
+        summary.numberOfLines = 2;
+        [row addSubview:summary];
+
+        UIButton *remove = [UIButton buttonWithType:UIButtonTypeSystem];
+        remove.frame = CGRectMake(width - 96.0, 6.0, 26.0, 28.0);
+        [remove setTitle:@"✕" forState:UIControlStateNormal];
+        [remove setTitleColor:[UIColor colorWithWhite:1.0 alpha:0.6] forState:UIControlStateNormal];
+        remove.titleLabel.font = [UIFont systemFontOfSize:14.0];
+        remove.tag = 2000 + (NSInteger)index;
+        [remove addTarget:self
+                   action:@selector(handlePresetRemove:)
+         forControlEvents:UIControlEventTouchUpInside];
+        [row addSubview:remove];
+
+        UIButton *toggle = [UIButton buttonWithType:UIButtonTypeSystem];
+        toggle.frame = CGRectMake(width - 66.0, 6.0, 62.0, 28.0);
+        [toggle setTitle:active ? @"已启用" : @"启用" forState:UIControlStateNormal];
+        [toggle setTitleColor:active ? [UIColor orangeColor] : [UIColor greenColor]
+                     forState:UIControlStateNormal];
+        toggle.titleLabel.font = [UIFont systemFontOfSize:13.0];
+        toggle.layer.cornerRadius = 6.0;
+        toggle.layer.borderWidth = 1.0;
+        toggle.layer.borderColor = active ? [[UIColor orangeColor] CGColor]
+                                          : [[UIColor greenColor] CGColor];
+        toggle.tag = 1000 + (NSInteger)index;
+        [toggle addTarget:self
+                   action:@selector(handlePresetToggle:)
+         forControlEvents:UIControlEventTouchUpInside];
+        [row addSubview:toggle];
+
+        y += 44.0;
+    }
+
+    UITextField *nameField =
+        [[UITextField alloc] initWithFrame:CGRectMake(0, y + 1.0, width - 92.0, 30.0)];
+    nameField.borderStyle = UITextBorderStyleRoundedRect;
+    nameField.placeholder = @"预设名称（可留空）";
+    nameField.textColor = [UIColor whiteColor];
+    nameField.font = [UIFont systemFontOfSize:12.0];
+    nameField.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.14];
+    nameField.returnKeyType = UIReturnKeyDone;
+    nameField.delegate = self;
+    nameField.inputAccessoryView = [self ipatDoneToolbar];
+    [section addSubview:nameField];
+    self.presetNameField = nameField;
+
+    UIButton *save = [UIButton buttonWithType:UIButtonTypeSystem];
+    save.frame = CGRectMake(width - 86.0, y + 1.0, 86.0, 30.0);
+    [save setTitle:@"保存当前" forState:UIControlStateNormal];
+    [save setTitleColor:[UIColor greenColor] forState:UIControlStateNormal];
+    save.titleLabel.font = [UIFont systemFontOfSize:13.0];
+    save.layer.cornerRadius = 6.0;
+    save.layer.borderWidth = 1.0;
+    save.layer.borderColor = [[UIColor greenColor] CGColor];
+    [save addTarget:self
+             action:@selector(handlePresetSave:)
+   forControlEvents:UIControlEventTouchUpInside];
+    [section addSubview:save];
+    y += 38.0;
+
+    CGRect frame = section.frame;
+    frame.size.height = y;
+    section.frame = frame;
+    [self updateContentLayout];
+}
+
+/// 预设区高度变了，后面的说明行往下挪，卡片高度和内容高度一起更新
+- (void)updateContentLayout {
+    if (!self.presetSection || !self.noteLabel) return;
+    CGFloat width = self.bounds.size.width;
+    CGRect note = self.noteLabel.frame;
+    note.origin.y = CGRectGetMaxY(self.presetSection.frame) + 6.0;
+    self.noteLabel.frame = note;
+
+    CGFloat total = CGRectGetMaxY(note) + 8.0;
+    self.contentHeight = total;
+    self.scrollView.contentSize = CGSizeMake(width, total);
+    CGRect frame = self.frame;
+    frame.size.height = 46.0 + total;
+    self.frame = frame;
+    if (self.onResize) self.onResize();
+}
+
+- (void)handlePresetToggle:(UIButton *)sender {
+    NSArray<IPATQnPresetItem *> *presets = IPATQnLoadPresets();
+    NSInteger index = sender.tag - 1000;
+    if (index < 0 || index >= (NSInteger)presets.count) return;
+    IPATQnPresetItem *item = presets[index];
+    if ([item.presetId isEqualToString:IPATQnActivePresetId()]) {
+        IPATQnDisableActivePreset();            // 再点一次 = 关掉这一条
+        IPATQnLog(@"已关闭预设「%@」", item.name);
+    } else {
+        IPATQnEnablePreset(item);               // 有别的在启用时，里面会先把那条关掉
+    }
+    [self finishPresetChange];
+}
+
+- (void)handlePresetRemove:(UIButton *)sender {
+    NSMutableArray<IPATQnPresetItem *> *presets = [IPATQnLoadPresets() mutableCopy];
+    NSInteger index = sender.tag - 2000;
+    if (index < 0 || index >= (NSInteger)presets.count) return;
+    IPATQnPresetItem *item = presets[index];
+    if ([item.presetId isEqualToString:IPATQnActivePresetId()]) IPATQnDisableActivePreset();
+    [presets removeObjectAtIndex:(NSUInteger)index];
+    IPATQnSavePresets(presets);
+    IPATQnLog(@"已删除预设「%@」", item.name);
+    [self finishPresetChange];
+}
+
+/// 把当前五个参数存成一条新预设
+- (void)handlePresetSave:(UIButton *)sender {
+    IPATQnConfig cfg = IPATQnSnapshot();
+    NSMutableArray<IPATQnPresetItem *> *presets = [IPATQnLoadPresets() mutableCopy];
+    NSString *name = [self.presetNameField.text
+        stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (name.length == 0) {
+        name = [NSString stringWithFormat:@"自定义 %lu", (unsigned long)(presets.count + 1)];
+    }
+    IPATQnPresetItem *item = IPATQnMakePreset([[NSUUID UUID] UUIDString], name,
+                                              cfg.downKbps, cfg.upKbps,
+                                              cfg.delayMs, cfg.jitterMs, cfg.lossPct);
+    [presets addObject:item];
+    IPATQnSavePresets(presets);
+    IPATQnLog(@"已把当前参数存为预设「%@」：下行 %@ / 上行 %@ / 延迟 %d±%d ms / 丢包 %d%%",
+              name,
+              IPATQnParamText(IPATQnParamDown, cfg.downKbps),
+              IPATQnParamText(IPATQnParamUp, cfg.upKbps),
+              cfg.delayMs, cfg.jitterMs, cfg.lossPct);
+    [self.presetNameField resignFirstResponder];
+    [self finishPresetChange];
+}
+
+- (void)finishPresetChange {
     [self refreshValues];
-    IPATQnLog(@"已套用预设：%@", IPATQnPresetName(sender.tag));
     if (self.onChanged) self.onChanged();
 }
 
@@ -1028,8 +1364,10 @@ static void IPATQnApplyPreset(NSInteger index) {
 
 - (void)postStatus {
     IPATQnConfig cfg = IPATQnSnapshot();
+    IPATQnPresetItem *preset = IPATQnActivePreset();
     NSString *text = cfg.enabled
-        ? [NSString stringWithFormat:@"已开启：下行 %@ / 上行 %@ / 延迟 %d ms / 丢包 %d%%",
+        ? [NSString stringWithFormat:@"已开启%@：下行 %@ / 上行 %@ / 延迟 %d ms / 丢包 %d%%",
+                                     preset ? [NSString stringWithFormat:@"（预设 %@）", preset.name] : @"",
                                      IPATQnParamText(IPATQnParamDown, cfg.downKbps),
                                      IPATQnParamText(IPATQnParamUp, cfg.upKbps),
                                      cfg.delayMs, cfg.lossPct]
@@ -1048,10 +1386,13 @@ static void IPATQnApplyPreset(NSInteger index) {
 
 - (void)handlePanelChange:(NSNotification *)note {
     if (![note.userInfo[IPATChgId] isEqualToString:IPATFeatureQNet]) return;
+    // 从面板把总开关关掉 = 预设也不再算启用中
     id enabled = note.userInfo[IPATChgEnabled];
     if ([enabled respondsToSelector:@selector(boolValue)]) {
+        BOOL on = [enabled boolValue];
         NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-        [defaults setBool:[enabled boolValue] forKey:IPATKeyQNetEnabled];
+        [defaults setBool:on forKey:IPATKeyQNetEnabled];
+        if (!on) IPATQnSetActivePresetId(@"");
         [defaults synchronize];
     }
     IPATQnReloadConfig();
@@ -1116,6 +1457,8 @@ static void IPATQnApplyPreset(NSInteger index) {
             __weak typeof(self) weakSelf = self;
             card.onClose = ^{ [weakSelf closeSettings]; };
             card.onChanged = ^{ [weakSelf registerWithPanel]; };
+            // 预设增删后内容变高，让外面按新高度重新排版
+            card.onResize = ^{ [weakSelf layoutCard]; };
             // 拖动手势只挂在标题栏上：内容区让给 scrollView 自己滚，互不打架
             UIPanGestureRecognizer *pan =
                 [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handleDrag:)];

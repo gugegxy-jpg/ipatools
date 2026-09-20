@@ -142,6 +142,8 @@ static void IPATAppendLogLine(NSString *line) {
 #define IPATKeyQNetJitterMs @"IPAToolPanelQNetJitterMs"   // 抖动 ms（延迟随机 ±该值）
 #define IPATKeyQNetLossPct @"IPAToolPanelQNetLossPct"     // 丢包率 0-100
 #define IPATKeyQNetCardFrame @"IPAToolPanelQNetCardFrame" // 弱网弹窗位置，NSStringFromCGRect
+#define IPATKeyQNetPresets @"IPAToolPanelQNetPresets"     // 预设列表，NSArray<NSDictionary *>
+#define IPATKeyQNetActivePreset @"IPAToolPanelQNetActivePreset" // 当前启用的预设 id，空串 = 没启用任何预设
 
 #define IPATKeyPluginsEnabled @"IPAToolPanelPluginsEnabled"      // 插件加载总开关
 #define IPATKeyPluginsAutoLoad @"IPAToolPanelPluginsAutoLoad"     // 启动时自动加载上次加载过的插件
