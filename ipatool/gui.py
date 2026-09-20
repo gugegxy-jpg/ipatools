@@ -451,8 +451,8 @@ class IpatoolGui:
             text=(
                 "· 注入后原签名失效，必须重新签名才能安装（签名参数在「签名」页）。\n"
                 "· 想先看看会改什么，用底部的「预览（dry-run）」。\n"
-                "· 内置的文件导入导出 / 悬浮窗只在命令行提供：\n"
-                "    python -m ipatool inject <包> --files"
+                "· 内置的文件导入导出 / 弱网测试 / 悬浮窗只在命令行提供：\n"
+                "    python -m ipatool inject <包> --files --qnet"
             ),
         ).grid(row=0, column=0, columnspan=3, sticky="w")
 

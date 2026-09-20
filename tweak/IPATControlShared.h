@@ -82,6 +82,7 @@ static void IPATAppendLogLine(NSString *line) {
 
 #pragma mark - 功能标识
 
+#define IPATFeatureQNet @"qnet"
 #define IPATFeatureFiles @"files"
 
 #pragma mark - 注册（IPATControlRegisterNotification 的 userInfo）
@@ -132,6 +133,14 @@ static void IPATAppendLogLine(NSString *line) {
 // 功能侧先用这些键查 NSUserDefaults，查不到再回落到 Info.plist 的初始值。
 // 键的取值含义与 Info.plist 里同名配置保持一致（不取反），面板上的文案负责表达。
 // 面板只暴露常用项；标注「仅 plist」的没有面板开关，只能用 Info.plist / 命令行参数配置。
+
+#define IPATKeyQNetEnabled @"IPAToolPanelQNetEnabled"    // 弱网总开关
+#define IPATKeyQNetDownKbps @"IPAToolPanelQNetDownKbps"   // 下行带宽 KB/s，0 = 不限
+#define IPATKeyQNetUpKbps @"IPAToolPanelQNetUpKbps"       // 上行带宽 KB/s，0 = 不限
+#define IPATKeyQNetDelayMs @"IPAToolPanelQNetDelayMs"     // 单向附加延迟 ms
+#define IPATKeyQNetJitterMs @"IPAToolPanelQNetJitterMs"   // 抖动 ms（延迟随机 ±该值）
+#define IPATKeyQNetLossPct @"IPAToolPanelQNetLossPct"     // 丢包率 0-100
+#define IPATKeyQNetCardFrame @"IPAToolPanelQNetCardFrame" // 弱网弹窗位置，NSStringFromCGRect
 
 #define IPATKeyFilesEnabled @"IPAToolPanelFilesEnabled"  // 已弃用：文件功能常开，只看 Info.plist 的 Enabled
 #define IPATKeyFilesImportDir @"IPAToolPanelFilesImportDir"  // 仅 plist：导入的默认落地目录（相对沙盒）

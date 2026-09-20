@@ -17,6 +17,7 @@
 - 同步修改 `*.lproj/InfoPlist.strings` 中的本地化显示名（可用 `--no-localized` 关闭）
 - **注入 dylib**（`inject`）：放进 `Frameworks/` 并给主可执行文件追加 `LC_LOAD_DYLIB`，支持 fat 二进制、幂等
 - **文件导入导出**：`inject --files` 注入文件桥，在悬浮面板里浏览 App 沙盒，把热更资源（补丁/配置/存档）导出到系统「文件」App，或从「文件」App 导入回沙盒
+- **弱网测试**：`inject --qnet` 注入弱网工具，在游戏内的弹窗里实时调限速 / 延迟 / 抖动 / 丢包，**只对当前 App 生效**，不动系统设置、不影响其它 App
 - **应用内悬浮控制面板**：上面这些功能会顺带注入一个悬浮窗，点开即可在 App 里实时开关 / 操作它们（`--no-panel` 可关掉）
 - 重打包时尽量保留 Mach-O 可执行权限
 - 可选重签名（`codesign` / `zsign`）
@@ -142,7 +143,7 @@ python -m ipatool inject app.ipa --dylib MyTweak.dylib --dry-run
 
 ### 应用内悬浮控制面板（悬浮窗）
 
-注入 `--files` 时会**顺带注入一个悬浮窗**：App 里出现一个可拖动的小胶囊按钮，点开就是控制面板，能实时开关上面这些功能，不用改包重启。
+注入 `--files` / `--qnet` 时会**顺带注入一个悬浮窗**：App 里出现一个可拖动的小胶囊按钮，点开就是控制面板，能实时开关上面这些功能，不用改包重启。
 
 - 按钮默认显示 `IPAT`（`--panel-title` 可改）；有功能开着是绿色，全关是灰色
 - 按钮可拖到任意位置，位置会被记住；面板贴着按钮弹出
@@ -167,6 +168,8 @@ python -m ipatool inject game.ipa --panel --panel-title 调试 -o out.ipa  # 只
 
 | 面板项 | 对应配置 | 立即生效 |
 | --- | --- | --- |
+| 弱网测试（`--qnet`） | `IPAToolQNet.Enabled` | 是（总开关） |
+| └ 网络参数设置（动作行） | 带宽 / 延迟 / 抖动 / 丢包 | 打开参数弹窗：可拖动、右上角 ✕ 关闭、点空白处不关；改完立即生效 |
 | 文件导入导出（常开） | `IPAToolFiles.Enabled` | 否（注入即用，面板没有开关；要关只能改 Info.plist） |
 | ├ 浏览并导出文件（动作行） | — | 打开沙盒文件浏览器，导出自动打包 zip |
 | └ 导入文件（动作行） | `IPAToolFiles.ImportDir`（默认落地目录） | 挑好落地目录后，在「文件」App 里选文件 / zip（可多选，zip 自动解压） |
@@ -262,12 +265,71 @@ python -m ipatool inject game.ipa --files --no-files-sharing -o out.ipa   # 不�
 > - 装完在「文件」App 里看不到该 App，卸载重装一次（可见性在安装时被系统读取）。
 > - 真机排查看控制台里 `[ipatool-files]` 前缀的日志。
 
+### 弱网测试（`--qnet`）
+
+在游戏里直接模拟弱网，**只对当前 App 生效**：dylib 注入在 App 进程里，改的是这个进程自己的
+socket 读写。系统设置、Wi-Fi、蜂窝、其它 App 的网络完全不受影响，也不用装描述文件、
+VPN 或代理（不像 QNET 官方客户端那样要装东西）。
+
+```bash
+python -m ipatool inject game.ipa --qnet -o out.ipa                     # 3G 档默认值，带悬浮窗
+python -m ipatool inject game.ipa --qnet --qnet-down 50 --qnet-delay 500 --qnet-loss 5 -o out.ipa
+python -m ipatool inject game.ipa --files --qnet -o out.ipa             # 文件 + 弱网一起注入
+```
+
+**怎么调**：悬浮按钮 →「弱网测试（QNet）」→ 点**网络参数设置**打开弹窗
+
+- 弹窗**点空白处不会关闭**（空白处的触摸直接穿透给游戏），只有右上角 **✕** 才关
+- **拖动标题栏（或卡片空白处）换位置**，位置会被记住，下次打开还在原处
+- 弹窗里实时可调：上下行带宽、延迟、抖动、丢包率，改完立即生效，不用重启
+- 五个预设一键切换：正常 / 3G / 2G / 极差 / 断网
+- 底部实时显示上下行速率，方便对照限速到底有没有生效
+
+| 参数 | 说明 |
+| --- | --- |
+| `--qnet` | 注入弱网测试 tweak（不给细项时套用 3G 档：下行 300 / 上行 150 KB/s，延迟 150±40 ms，丢包 2%） |
+| `--no-qnet` | 不注入弱网测试 tweak |
+| `--qnet-dylib` | dylib 路径，默认找 `tweak/build/`（macOS 上找不到会自动编译） |
+| `--qnet-down` / `--qnet-up` | 下行 / 上行带宽上限，KB/s，`0` = 不限 |
+| `--qnet-delay` | 单向附加延迟，毫秒 |
+| `--qnet-jitter` | 延迟抖动，毫秒（在延迟上随机 ±该值） |
+| `--qnet-loss` | 丢包率，0-100 |
+
+写入的 Info.plist：
+
+```xml
+<key>IPAToolQNet</key>
+<dict>
+  <key>Enabled</key><true/>
+  <key>DownKbps</key><integer>300</integer>   <!-- 0 = 不限 -->
+  <key>UpKbps</key><integer>150</integer>
+  <key>DelayMs</key><integer>150</integer>
+  <key>JitterMs</key><integer>40</integer>
+  <key>LossPct</key><integer>2</integer>      <!-- 0-100 -->
+</dict>
+```
+
+实现方式和要注意的：
+
+- 拦截 `send` / `sendto` / `recv` / `recvfrom` / `read` / `write`，用的是 dyld 自带的
+  `__DATA,__interpose`（不需要 fishhook 之类的第三方库）；调用原函数一律走 `syscall()`
+  直接进内核，不会绕回自己的实现。
+- 限速用令牌桶；`read` / `write` 会先用 `getsockopt` 判断 fd 是不是 socket，
+  文件读写直接放行（结果按 fd 缓存），不会拖慢游戏读资源。
+- 上行延迟是「异步晚一点再发」，不阻塞游戏线程（免得掉帧）；下行延迟阻塞在
+  等数据的网络线程上，这才是弱网该有的体感。
+- 丢包：上行直接不发但对游戏说「发了」，让它自己的重传逻辑跑起来；下行丢掉这一段后
+  继续等下一个包（最多连丢 3 次，免得把线程卡死、看起来像断线）。
+- 只对跑在 libc 之上的 socket 调用生效，而且符号插入不追溯「已经绑定过的调用」：
+  启动瞬间建立的连接可能不受限，之后新建的连接一定生效。
+- 想确认有没有生效，看弹窗底部的实时速率，或控制台 `[ipatool-qnet]` 日志。
+
 ### 编译内置 tweak
 
-两个内置功能（悬浮窗 / 文件导入导出）的源码是分开的，但**默认合编成一个 `IPATool.dylib`**：
-注入一次就够，开哪些功能由 `Info.plist` 里 `IPAToolControl` / `IPAToolFiles`
+三个内置功能（悬浮窗 / 文件导入导出 / 弱网测试）的源码是分开的，但**默认合编成一个 `IPATool.dylib`**：
+注入一次就够，开哪些功能由 `Info.plist` 里 `IPAToolControl` / `IPAToolFiles` / `IPAToolQNet`
 的 `Enabled` 决定（`ipatool inject` 会把没用到的功能自动写成 `Enabled=NO`）。
-两者之间只用「通知 + NSUserDefaults」通信（见 `tweak/IPATControlShared.h`），
+三者之间只用「通知 + NSUserDefaults」通信（见 `tweak/IPATControlShared.h`），
 顶层函数全是 `static`、类名前缀各不相同，所以合编不会撞符号。
 
 ```bash
@@ -302,12 +364,13 @@ ipatool/
   plistutil.py plist 与 InfoPlist.strings 读写
   bundle.py    bundle 发现与 ID / 名称改写
   macho.py     Mach-O 解析与 LC_LOAD_DYLIB 注入
-  inject.py    dylib 落位、Info.plist 注入配置（文件导入导出 / 后台模式 / ATS）
+  inject.py    dylib 落位、Info.plist 注入配置（文件导入导出 / 弱网测试 / 后台模式 / ATS）
   keystore.py  签名身份管理：身份列举 / p12 导入钥匙串 / Windows 证书导出
   signer.py    codesign / zsign 重签名
 tweak/
   ControlPanel.m        应用内悬浮控制面板（悬浮按钮 + 开关小窗口）
   FileBridge.m          沙盒文件浏览 / 导出到「文件」App / 从「文件」App 导入
+  QNet.m                弱网测试：拦截 socket 读写做限速 / 延迟 / 抖动 / 丢包 + 参数弹窗
   IPATControlShared.h   面板与各功能 dylib 之间的约定（通知名 / 配置键）
   build.sh              编译脚本（需要 macOS + Xcode，默认把三个功能合编成一个 IPATool.dylib）
 ```

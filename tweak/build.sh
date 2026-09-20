@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
-# 编译注入用的 dylib（悬浮控制面板 / 文件导入导出）。需要 macOS + Xcode 命令行工具：
+# 编译注入用的 dylib（悬浮控制面板 / 文件导入导出 / 弱网测试）。需要 macOS + Xcode 命令行工具：
 #   xcode-select --install
 #
-#   ./tweak/build.sh                               默认只出 IPATool.dylib（两个功能合编在一起）
-#   IPATOOL_TARGETS="ControlPanel FileBridge" ./tweak/build.sh   只编译指定目标（单独出包）
+#   ./tweak/build.sh                               默认只出 IPATool.dylib（三个功能合编在一起）
+#   IPATOOL_TARGETS="ControlPanel FileBridge QNet" ./tweak/build.sh   只编译指定目标（单独出包）
 #
-# 两个功能默认合编成一个 IPATool.dylib：注入一次就够，开哪些功能由 Info.plist 里
-# 对应的 IPAToolControl / IPAToolFiles 的 Enabled 决定。
+# 三个功能默认合编成一个 IPATool.dylib：注入一次就够，开哪些功能由 Info.plist 里
+# 对应的 IPAToolControl / IPAToolFiles / IPAToolQNet 的 Enabled 决定。
 # 合编是安全的：三份源码的顶层函数全是 static，类名前缀各不相同，
 # 各自的 constructor 也是 static，链接时不会撞符号。
 #
@@ -84,7 +84,7 @@ done
 sources_for_target() {
   case "$1" in
     IPATool)
-      printf '%s\n' "$HERE/ControlPanel.m" "$HERE/FileBridge.m" "$OUT_DIR/IPAToolIcon.m"
+      printf '%s\n' "$HERE/ControlPanel.m" "$HERE/FileBridge.m" "$HERE/QNet.m" "$OUT_DIR/IPAToolIcon.m"
       ;;
     *)
       if [[ "$1" == "ControlPanel" ]]; then

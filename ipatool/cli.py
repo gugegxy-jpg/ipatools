@@ -71,7 +71,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     pj = sub.add_parser(
         "inject",
-        help="注入 dylib（内置 --files 文件导入导出）",
+        help="注入 dylib（内置 --files 文件导入导出、--qnet 弱网测试）",
         description="把 dylib 放进 App 的 Frameworks/ 并写入 LC_LOAD_DYLIB；注入后必须重新签名才能安装",
     )
     pj.add_argument("input", help="IPA 文件路径，或已解包且含 Payload 的目录")
@@ -84,10 +84,24 @@ def _build_parser() -> argparse.ArgumentParser:
         help="写 NSAllowsArbitraryLoads=YES 关掉 ATS 限制（热更服务器用明文 HTTP 时需要）",
     )
 
+    qnet = pj.add_argument_group(
+        "弱网测试（QNet）",
+        "在悬浮窗里打开参数弹窗，实时调限速 / 延迟 / 抖动 / 丢包，"
+        "只对当前 App 生效（改的是这个进程自己的 socket 读写，不影响系统设置和其它 App）",
+    )
+    qnet.add_argument("--qnet", action="store_true", help="注入弱网测试 tweak（不给参数时套用 3G 档默认值）")
+    qnet.add_argument("--no-qnet", action="store_true", help="不注入弱网测试 tweak")
+    qnet.add_argument("--qnet-dylib", metavar="PATH", help="弱网测试 dylib 路径，默认自动查找（macOS 上会自动编译）")
+    qnet.add_argument("--qnet-down", type=int, metavar="KBPS", help="下行带宽上限，KB/s，0 = 不限")
+    qnet.add_argument("--qnet-up", type=int, metavar="KBPS", help="上行带宽上限，KB/s，0 = 不限")
+    qnet.add_argument("--qnet-delay", type=int, metavar="MS", help="单向附加延迟，毫秒")
+    qnet.add_argument("--qnet-jitter", type=int, metavar="MS", help="延迟抖动，毫秒（在延迟上随机 ±该值）")
+    qnet.add_argument("--qnet-loss", type=int, metavar="PCT", help="丢包率，0-100")
+
     panel = pj.add_argument_group(
         "悬浮窗",
-        "在 App 里显示一个可拖动的悬浮按钮，点开后操作文件导入导出"
-        "（默认跟着 --files 一起注入）",
+        "在 App 里显示一个可拖动的悬浮按钮，点开后操作文件导入导出 / 弱网测试"
+        "（默认跟着 --files / --qnet 一起注入）",
     )
     panel.add_argument("--panel", action="store_true", help="强制注入悬浮窗")
     panel.add_argument("--no-panel", action="store_true", help="不注入悬浮窗（只改配置、不加界面）")
@@ -401,11 +415,21 @@ def cmd_inject(args) -> int:
             args.files_import_dir,
         ))
         files_enabled = bool(args.files or files_tuning) and not args.no_files
+        qnet_tuning = any((
+            args.qnet_dylib,
+            args.qnet_down is not None,
+            args.qnet_up is not None,
+            args.qnet_delay is not None,
+            args.qnet_jitter is not None,
+            args.qnet_loss is not None,
+        ))
+        qnet_enabled = bool(args.qnet or qnet_tuning) and not args.no_qnet
         # 悬浮窗默认跟着内置功能一起注入；--no-panel 关掉它
         panel_tuning = bool(args.panel or args.panel_dylib or args.panel_title)
-        panel_enabled = bool(files_enabled or panel_tuning) and not args.no_panel
+        panel_enabled = bool(files_enabled or qnet_enabled or panel_tuning) and not args.no_panel
         plist_touched = bool(
             files_enabled
+            or qnet_enabled
             or panel_enabled
             or args.background_mode
             or args.allow_arbitrary_loads
@@ -413,7 +437,7 @@ def cmd_inject(args) -> int:
         if not args.dylib and not plist_touched:
             print(
                 "错误：请用 --dylib 指定要注入的库，或用 --files（文件导入导出）"
-                "注入内置 tweak，或用 --panel 只注入悬浮窗",
+                "/ --qnet（弱网测试）注入内置 tweak，或用 --panel 只注入悬浮窗",
                 file=sys.stderr,
             )
             return 2
@@ -427,12 +451,12 @@ def cmd_inject(args) -> int:
         print(f"Bundle ID   : {app.identifier}")
 
         planned: list[tuple[str, str]] = []  # (dylib 路径, 注入名)
-        # 两个功能合编在同一个 IPATool.dylib 里：用到任意一个就只注入这一个 dylib，
+        # 三个功能合编在同一个 IPATool.dylib 里：用到任意一个就只注入这一个 dylib，
         # 没用到的功能在 Info.plist 里显式关掉。只有显式给了某个功能的 dylib 路径时，
         # 才退回老的「一个功能一个 dylib」注入方式
         merged = bool(
-            (files_enabled or panel_enabled)
-            and not (args.files_dylib or args.panel_dylib)
+            (files_enabled or qnet_enabled or panel_enabled)
+            and not (args.files_dylib or args.qnet_dylib or args.panel_dylib)
         )
         if merged:
             tool_dylib = inject_mod.locate_merged_dylib(
@@ -440,9 +464,16 @@ def cmd_inject(args) -> int:
             )
             planned.append((tool_dylib, inject_mod.MERGED_DYLIB_NAME))
             print(f"内置 tweak  : {tool_dylib}")
-            print("              （悬浮窗 / 文件导入导出合编在一个 dylib 里，"
+            print("              （悬浮窗 / 文件导入导出 / 弱网测试合编在一个 dylib 里，"
                   "没用到的功能在 Info.plist 里关掉）")
         else:
+            if qnet_enabled:
+                qnet_dylib = inject_mod.locate_qnet_dylib(
+                    explicit=args.qnet_dylib,
+                    log=lambda m: print(f"  {m}"),
+                )
+                planned.append((qnet_dylib, inject_mod.QNET_DYLIB_NAME))
+                print(f"弱网测试    : {qnet_dylib}")
             if files_enabled:
                 files_dylib = inject_mod.locate_files_dylib(
                     explicit=args.files_dylib,
@@ -492,6 +523,23 @@ def cmd_inject(args) -> int:
         elif merged:
             settings.append((inject_mod.FILES_INFO_KEY,
                              inject_mod.build_files_options(enabled=False), "文件导入导出"))
+
+        if qnet_enabled:
+            qnet_options = inject_mod.build_qnet_options(
+                enabled=True,
+                down=args.qnet_down,
+                up=args.qnet_up,
+                delay=args.qnet_delay,
+                jitter=args.qnet_jitter,
+                loss=args.qnet_loss,
+                use_defaults=args.qnet,
+            )
+            settings.append((inject_mod.QNET_INFO_KEY, qnet_options, "弱网测试"))
+            if not panel_enabled:
+                warnings.append("没有注入悬浮窗，弱网测试在 App 里没有入口，建议配合 --panel 使用")
+        elif merged:
+            settings.append((inject_mod.QNET_INFO_KEY,
+                             inject_mod.build_qnet_options(enabled=False), "弱网测试"))
 
         if plist_touched:
             plist_changes, plist_warnings = inject_mod.configure_plist(

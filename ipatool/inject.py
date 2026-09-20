@@ -6,12 +6,17 @@ dylib 注入：把动态库放进 App 的 Frameworks/ 并给主可执行文件�
     （UIFileSharingEnabled / LSSupportsOpeningDocumentsInPlace）
   - 用来把游戏热更资源导出到「文件」App，或从「文件」App 导回沙盒
 
+以及「弱网测试」（--qnet）：
+  - 写入 IPAToolQNet 配置字典（上下行带宽 / 延迟 / 抖动 / 丢包）
+  - dylib 注入在 App 进程里改自己的 socket 读写，所以只对当前 App 生效，
+    不动系统设置、不影响其它 App，也不需要描述文件 / VPN
+
 上面这些功能都合编在同一个 IPATool.dylib 里（内含悬浮窗），注入一次即可，
 用哪个功能由对应的 Info.plist 配置字典决定（没用到的会写成 Enabled=NO）；
 用 --no-panel 可以不带悬浮窗。
 
 需要单独出包时（比如改了某个功能只想重编它）可以用 --files-dylib /
---panel-dylib 指定单独的 dylib，那时退回一功能一库的注入方式。
+--qnet-dylib / --panel-dylib 指定单独的 dylib，那时退回一功能一库的注入方式。
 """
 from __future__ import annotations
 
@@ -33,8 +38,21 @@ FILES_INFO_KEY = "IPAToolFiles"
 FILES_NAME = "FileBridge"
 FILES_DEFAULT_IMPORT_DIR = "Documents"
 
-# 两个内置功能默认合编成一个 IPATool.dylib：只注入一次，
-# 开哪些功能由 Info.plist 里 IPAToolControl / IPAToolFiles 的 Enabled 决定。
+QNET_DYLIB_NAME = "QNet.dylib"
+QNET_INFO_KEY = "IPAToolQNet"
+QNET_NAME = "QNet"
+# 开了弱网但一项参数都没给时套用的档位（大概 3G 水平），
+# 这样 --qnet 一注入就能看出效果，不用再逐个调
+QNET_DEFAULT_PROFILE = {
+    "DownKbps": 300,
+    "UpKbps": 150,
+    "DelayMs": 150,
+    "JitterMs": 40,
+    "LossPct": 2,
+}
+
+# 三个内置功能默认合编成一个 IPATool.dylib：只注入一次，
+# 开哪些功能由 Info.plist 里 IPAToolControl / IPAToolFiles / IPAToolQNet 的 Enabled 决定。
 # 单功能 dylib 仍然支持（显式给了某个功能的 dylib 路径时就用老的分离注入）。
 MERGED_DYLIB_NAME = "IPATool.dylib"
 MERGED_NAME = "IPATool"
@@ -43,6 +61,7 @@ MERGED_NAME = "IPATool"
 TWEAKS = {
     PANEL_NAME: (CONTROL_PANEL_DYLIB_NAME, "IPATOOL_CONTROL_DYLIB"),
     FILES_NAME: (FILES_DYLIB_NAME, "IPATOOL_FILES_DYLIB"),
+    QNET_NAME: (QNET_DYLIB_NAME, "IPATOOL_QNET_DYLIB"),
     MERGED_NAME: (MERGED_DYLIB_NAME, "IPATOOL_DYLIB"),
 }
 
@@ -136,8 +155,12 @@ def locate_files_dylib(explicit: str | None = None, auto_build: bool = True, log
     return locate_tweak_dylib(FILES_NAME, explicit=explicit, auto_build=auto_build, log=log)
 
 
+def locate_qnet_dylib(explicit: str | None = None, auto_build: bool = True, log=print) -> str:
+    return locate_tweak_dylib(QNET_NAME, explicit=explicit, auto_build=auto_build, log=log)
+
+
 def locate_merged_dylib(explicit: str | None = None, auto_build: bool = True, log=print) -> str:
-    """定位合编了两个功能的 IPATool.dylib。"""
+    """定位合编了三个功能的 IPATool.dylib。"""
     return locate_tweak_dylib(MERGED_NAME, explicit=explicit, auto_build=auto_build, log=log)
 
 
@@ -237,6 +260,43 @@ def build_files_options(
         options["ImportDir"] = import_dir
     if enabled is not None:
         options["Enabled"] = enabled
+    return options
+
+
+# --------------------------------------------------------------------------- #
+# 弱网测试（QNet）配置
+# --------------------------------------------------------------------------- #
+def build_qnet_options(
+    enabled: bool | None = None,
+    down: int | None = None,
+    up: int | None = None,
+    delay: int | None = None,
+    jitter: int | None = None,
+    loss: int | None = None,
+    use_defaults: bool = False,
+) -> dict:
+    """
+    只写入显式指定的项，其余交给 dylib 里的默认值（0 = 不限制）。
+
+    use_defaults=True 且一项参数都没指定时，套一份 3G 档的默认值（QNET_DEFAULT_PROFILE），
+    免得「开了弱网但什么都不设」看起来跟没开一样。
+    """
+    options: dict = {}
+    if enabled is not None:
+        options["Enabled"] = enabled
+    if down is not None:
+        options["DownKbps"] = int(down)
+    if up is not None:
+        options["UpKbps"] = int(up)
+    if delay is not None:
+        options["DelayMs"] = int(delay)
+    if jitter is not None:
+        options["JitterMs"] = int(jitter)
+    if loss is not None:
+        options["LossPct"] = max(0, min(100, int(loss)))
+    detail_keys = ("DownKbps", "UpKbps", "DelayMs", "JitterMs", "LossPct")
+    if use_defaults and not any(k in options for k in detail_keys):
+        options.update(QNET_DEFAULT_PROFILE)
     return options
 
 
