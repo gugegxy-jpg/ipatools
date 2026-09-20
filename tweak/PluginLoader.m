@@ -279,7 +279,11 @@ static NSString *IPATPlLoad(NSString *path) {
 
     BOOL ok = NO;
     NSString *problem = IPATPlCheckFile(full, &ok);
-    if (!ok) return problem;
+    if (!ok) {
+        // 预检失败也要落日志：面板上文字再全，也总有看不全的时候
+        IPATPlLog(@"加载失败（预检）：%@ -> %@", full, problem);
+        return problem;
+    }
 
     dlerror();  // 先清掉历史错误，否则下面可能拿到上一次的残留
     void *handle = dlopen(full.fileSystemRepresentation, RTLD_NOW);
@@ -516,7 +520,6 @@ static IPATPlEntry *IPATPlMakeEntry(NSString *path) {
 
     for (NSUInteger i = 0; i < self.entries.count; i++) {
         IPATPlEntry *entry = self.entries[i];
-        CGFloat rowHeight = entry.error.length > 0 ? 96.0 : 54.0;
 
         UIButton *row = [UIButton buttonWithType:UIButtonTypeCustom];
         row.frame = CGRectMake(margin, y, rowWidth, 46.0);
@@ -555,14 +558,41 @@ static IPATPlEntry *IPATPlMakeEntry(NSString *path) {
         y += 54.0;
 
         if (entry.error.length > 0) {
-            // 加载失败：把 dlopen 的原文（翻译过）整段显示出来，别只说「失败」
-            UILabel *error = [[UILabel alloc] initWithFrame:CGRectMake(margin + 4.0, y - 4.0, rowWidth - 8.0, 40.0)];
+            // 加载失败：把 dlopen 的原文 + 提示整段显示出来。
+            // 这里必须按实际文字算高度（以前的固定 40pt / 3 行会把提示截掉，
+            // 用户只看到半句「签名无效…」就不知道下一步该干嘛了）。
+            UIFont *errorFont = [UIFont systemFontOfSize:10.0];
+            CGFloat errorWidth = rowWidth - 8.0;
+            CGRect box = [entry.error boundingRectWithSize:CGSizeMake(errorWidth, CGFLOAT_MAX)
+                                                  options:NSStringDrawingUsesLineFragmentOrigin
+                                               attributes:@{NSFontAttributeName: errorFont}
+                                                  context:nil];
+            CGFloat errorHeight = MAX(22.0, ceil(box.size.height) + 2.0);
+
+            UILabel *error =
+                [[UILabel alloc] initWithFrame:CGRectMake(margin + 4.0, y - 4.0, errorWidth, errorHeight)];
             error.text = entry.error;
-            error.numberOfLines = 3;
+            error.numberOfLines = 0;   // 不截断
             error.textColor = [UIColor colorWithRed:1.0 green:0.45 blue:0.45 alpha:1.0];
-            error.font = [UIFont systemFontOfSize:10.0];
+            error.font = errorFont;
             [self.scrollView addSubview:error];
-            y += 42.0;
+            y += errorHeight + 2.0;
+
+            // 手机上这行小字不好抄，给个按钮一键拷到剪贴板
+            UIButton *copy = [UIButton buttonWithType:UIButtonTypeSystem];
+            copy.frame = CGRectMake(margin + 4.0, y, 100.0, 24.0);
+            [copy setTitle:@"复制错误信息" forState:UIControlStateNormal];
+            [copy setTitleColor:[UIColor colorWithWhite:1.0 alpha:0.85] forState:UIControlStateNormal];
+            copy.titleLabel.font = [UIFont systemFontOfSize:11.0];
+            copy.layer.cornerRadius = 5.0;
+            copy.layer.borderWidth = 1.0;
+            copy.layer.borderColor = [[UIColor colorWithWhite:1.0 alpha:0.35] CGColor];
+            copy.tag = 3000 + (NSInteger)i;
+            [copy addTarget:self
+                     action:@selector(handleCopyError:)
+           forControlEvents:UIControlEventTouchUpInside];
+            [self.scrollView addSubview:copy];
+            y += 30.0;
         }
     }
 
@@ -595,6 +625,16 @@ static IPATPlEntry *IPATPlMakeEntry(NSString *path) {
 
 - (void)handleRefresh {
     if (self.onRescan) self.onRescan();
+}
+
+- (void)handleCopyError:(UIButton *)sender {
+    NSInteger index = sender.tag - 3000;
+    if (index < 0 || index >= (NSInteger)self.entries.count) return;
+    IPATPlEntry *entry = self.entries[index];
+    if (entry.error.length == 0) return;
+    // 贴到聊天/备忘录里看，比在手机上眯小字强；ipatool.log 里也有同一份
+    [UIPasteboard generalPasteboard].string = entry.error;
+    IPATPlLog(@"已把失败原因复制到剪贴板：%@", entry.path.lastPathComponent);
 }
 
 - (void)handleClose {
