@@ -12,8 +12,10 @@
 //       直接调内核，不走 libc 符号，所以不会递归回自己的实现。
 //       两个必须知道的边界：符号插入对「声明它的镜像自己」不生效（dyld 防递归），
 //       所以别用「在自己 dylib 里调 send 看计数」来判断有没有生效；插入表也不回溯
-//       已经绑定好的指针，来自 CFNetwork 这类共享缓存库里、启动早期就绑完的调用点
-//       可能拦不到（那种情况只能靠运行时重绑定，见 IPATQnInterposeEntryCount 附近）。
+//       已经绑定好的指针——换过宿主（LiveContainer 这类用 dlopen 加载 guest 的）
+//       时，进程里绝大多数镜像早在我们之前就绑定完了，光靠插入表一个都拦不到。
+//       所以另外配了一套运行时重绑定（IPATQnRunRebind）：直接把已加载镜像里
+//       指向这些 libc 函数的指针换成我们的实现，不看加载顺序，也不依赖插入表。
 //    3. 四类参数，全部可以在游戏里的弹窗中实时调：
 //         下行带宽 / 上行带宽（KB/s，0 = 不限，令牌桶限速）
 //         延迟（ms，单向附加延迟）+ 抖动（ms，在延迟上随机 ±抖动）
@@ -28,10 +30,13 @@
 //    5. 实时速率：统计上下行字节数，弹窗里每 0.5 秒刷一次，方便对照限速有没有生效。
 //
 //  已知边界（说在前面，免得到时候当成 bug）：
-//    - 只对「被注入的进程里、经过 dyld 绑定的 socket 调用」生效。引擎自带网络库
-//      （Unity / UE 那套）一般走 send / recv / sendmsg，都插到了；但 NSURLSession
-//      这类走 CFNetwork（在 dyld 共享缓存里、启动早期就绑定完）的调用点可能拦不到，
-//      面板上会显示「hook 已装载，但没拦到网络调用」。
+//    - 只对「被注入的进程里、最终走到这些 libc 函数」的 socket 调用生效。引擎自带
+//      网络库（Unity / UE 那套）走 send / recv / sendmsg，都拦得到；直接操作
+//      socket 之外的东西（比如自己实现 TCP over pcap、或用 nw_* 的高层 API）
+//      不在此列。
+//    - 面板那行是判断依据：先看「重绑 N 处」，N = 0 说明一个调用点都没找到
+//      （多半是镜像里一个都没用这些函数，或 App 还没开始跑网络）；N 很大却仍然
+//      0 次拦截，那就是这个 App 真的不走这些函数。点一下「重新扫描」可以手动再扫。
 //    - Interpose 段被裁掉（-dead_strip 之类）时不会自动报错，启动日志里会打印
 //      「hook 段自检：N 条 __interpose 条目」，N 为 0 就是注入的包不对。
 //    - 符号插入对「已经绑定过的调用」不追溯：第一次调用时才生效，
@@ -57,6 +62,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -614,6 +620,154 @@ static int IPATQnInterposeEntryCount(void) {
         cursor += cmd->cmdsize;
     }
     return 0;
+}
+
+#pragma mark - 运行时重绑定（把已经绑定好的函数指针改成我们的实现）
+
+/// 为什么除了 __DATA,__interpose 还要这一套：
+///   插入表只对「插入表建立之后才发生的绑定」生效。换过宿主（比如 LiveContainer
+///   用 dlopen 加载 guest）之后，进程里绝大部分镜像——包括系统库里 CFNetwork /
+///   libnetwork 这些真正干活的调用点——在我们被加载之前就已经绑定完了，
+///   插入表够不到，现象就是「hook 装好了，但一次网络调用都拦不到」。
+///   这里直接把已加载镜像里指向这些 libc 函数的指针换成我们的实现：不看加载顺序，
+///   也不依赖 dyld 有没有把插入表应用上。
+///   本 dylib 只编 arm64（进程里没有带 PAC 签名的函数指针），所以指针都是原值，
+///   可以精确比对；小整数、明显不是指针的值一律跳过。
+
+typedef struct {
+    const char *name;
+    const void *replacement;
+} IPATQnSweepTarget;
+
+static const IPATQnSweepTarget kIPATQnSweepTargets[] = {
+    { "send",     (const void *)&ipat_qn_send },
+    { "sendto",   (const void *)&ipat_qn_sendto },
+    { "sendmsg",  (const void *)&ipat_qn_sendmsg },
+    { "recv",     (const void *)&ipat_qn_recv },
+    { "recvfrom", (const void *)&ipat_qn_recvfrom },
+    { "recvmsg",  (const void *)&ipat_qn_recvmsg },
+    { "read",     (const void *)&ipat_qn_read },
+    { "write",    (const void *)&ipat_qn_write },
+    { "readv",    (const void *)&ipat_qn_readv },
+    { "writev",   (const void *)&ipat_qn_writev },
+    { "close",    (const void *)&ipat_qn_close },
+    // 系统库内部还有一票「不可取消」版本（libdispatch / CFNetwork 会走），
+    // 名字对不上就 dlsym 不到，循环里会自动跳过，不影响别的符号
+    { "send$NOCANCEL",     (const void *)&ipat_qn_send },
+    { "sendto$NOCANCEL",   (const void *)&ipat_qn_sendto },
+    { "sendmsg$NOCANCEL",  (const void *)&ipat_qn_sendmsg },
+    { "recv$NOCANCEL",     (const void *)&ipat_qn_recv },
+    { "recvfrom$NOCANCEL", (const void *)&ipat_qn_recvfrom },
+    { "recvmsg$NOCANCEL",  (const void *)&ipat_qn_recvmsg },
+    { "read$NOCANCEL",     (const void *)&ipat_qn_read },
+    { "write$NOCANCEL",    (const void *)&ipat_qn_write },
+};
+#define IPAT_QN_SWEEP_TARGET_COUNT (sizeof(kIPATQnSweepTargets) / sizeof(kIPATQnSweepTargets[0]))
+
+// 一次扫描最多读这么多字节（镜像特别多的宿主上别把启动拖太久）
+#define IPAT_QN_SWEEP_MAX_BYTES (256ull * 1024 * 1024)
+
+static uint64_t gQnRebindSlots = 0;     // 累计改掉了多少个函数指针
+static uint64_t gQnRebindImages = 0;    // 最近一次扫了多少个镜像
+
+static void IPATQnRebindStats(uint64_t *slots, uint64_t *images) {
+    pthread_mutex_lock(&gQnLock);
+    if (slots) *slots = gQnRebindSlots;
+    if (images) *images = gQnRebindImages;
+    pthread_mutex_unlock(&gQnLock);
+}
+
+/// 把 addr 所在的页改成可写。__DATA_CONST 这类只读页要用 VM_PROT_COPY 拿私有副本，
+/// 直接 mprotect 在只读文件映射上可能失败。
+static bool IPATQnMakeWritable(void *addr, size_t len) {
+    vm_size_t page = vm_page_size ? vm_page_size : 16384;
+    uintptr_t start = (uintptr_t)addr & ~(uintptr_t)(page - 1);
+    uintptr_t end = ((uintptr_t)addr + len + page - 1) & ~(uintptr_t)(page - 1);
+    if (end <= start) end = start + page;
+    if (vm_protect(mach_task_self(), (vm_address_t)start, (vm_size_t)(end - start), FALSE,
+                   VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) == KERN_SUCCESS) {
+        return true;
+    }
+    return mprotect((void *)start, (size_t)(end - start), PROT_READ | PROT_WRITE) == 0;
+}
+
+/// 扫一遍所有已加载镜像的可写数据段，把指向这些 libc 函数的指针换成我们的实现。
+/// 构造函数里先跑一次；隔几秒再跑一次兜底（有些镜像启动过程中才 dlopen 进来）；
+/// 面板上的「重新扫描」也能手动触发。
+static void IPATQnRunRebind(void) {
+    const void *targets[IPAT_QN_SWEEP_TARGET_COUNT];
+    const void *replacements[IPAT_QN_SWEEP_TARGET_COUNT];
+    size_t count = 0;
+    uint64_t minTarget = UINT64_MAX;
+    uint64_t maxTarget = 0;
+    for (size_t i = 0; i < IPAT_QN_SWEEP_TARGET_COUNT; i++) {
+        const void *original = dlsym(RTLD_DEFAULT, kIPATQnSweepTargets[i].name);
+        if (original == NULL) continue;   // 这个符号在当前系统上不存在，跳过
+        uint64_t raw = (uint64_t)(uintptr_t)original;
+        targets[count] = original;
+        replacements[count] = kIPATQnSweepTargets[i].replacement;
+        count++;
+        if (raw < minTarget) minTarget = raw;
+        if (raw > maxTarget) maxTarget = raw;
+    }
+    if (count == 0) return;
+
+    Dl_info selfInfo;
+    const void *selfBase =
+        dladdr((const void *)&IPATQnRunRebind, &selfInfo) ? selfInfo.dli_fbase : NULL;
+
+    uint32_t imageCount = _dyld_image_count();
+    uint64_t slots = 0;
+    uint64_t images = 0;
+    uint64_t bytes = 0;
+    for (uint32_t i = 0; i < imageCount && bytes < IPAT_QN_SWEEP_MAX_BYTES; i++) {
+        const struct mach_header_64 *header =
+            (const struct mach_header_64 *)_dyld_get_image_header(i);
+        if (header == NULL || header->magic != MH_MAGIC_64) continue;
+        if (selfBase != NULL && (const void *)header == selfBase) continue;   // 自己的镜像跳过
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+        images++;
+
+        const uint8_t *cursor = (const uint8_t *)header + sizeof(struct mach_header_64);
+        for (uint32_t c = 0; c < header->ncmds; c++) {
+            const struct load_command *cmd = (const struct load_command *)cursor;
+            if (cmd->cmdsize < sizeof(struct load_command)) break;
+            cursor += cmd->cmdsize;
+            if (cmd->cmd != LC_SEGMENT_64 || cmd->cmdsize < sizeof(struct segment_command_64)) {
+                continue;
+            }
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)cmd;
+            // 只看可写、不可执行的数据段：函数指针都在这一类里
+            if (seg->vmsize == 0 || (seg->initprot & VM_PROT_WRITE) == 0 ||
+                (seg->initprot & VM_PROT_EXECUTE) != 0) {
+                continue;
+            }
+            uint64_t *word = (uint64_t *)(slide + seg->vmaddr);
+            uint64_t *end = (uint64_t *)(slide + seg->vmaddr + seg->vmsize);
+            for (; word < end; word++) {
+                uint64_t value = *word;
+                if (value < minTarget || value > maxTarget) continue;
+                for (size_t t = 0; t < count; t++) {
+                    if (value != (uint64_t)(uintptr_t)targets[t]) continue;
+                    if (IPATQnMakeWritable(word, sizeof(uint64_t))) {
+                        *word = (uint64_t)(uintptr_t)replacements[t];
+                        slots++;
+                    }
+                    break;
+                }
+            }
+            bytes += seg->vmsize;
+            if (bytes >= IPAT_QN_SWEEP_MAX_BYTES) break;
+        }
+    }
+
+    pthread_mutex_lock(&gQnLock);
+    gQnRebindSlots += slots;
+    gQnRebindImages = images;
+    pthread_mutex_unlock(&gQnLock);
+    uint64_t elapsedMs = (IPATQnNowUs() - startUs) / 1000;
+    IPATQnLog(@"运行时重绑定：扫了 %llu 个镜像 / %llu KB 可写数据，改掉 %llu 处函数指针（用时 %llu ms）",
+              images, bytes / 1024, slots, elapsedMs);
 }
 
 #pragma mark - 参数定义
@@ -1291,6 +1445,18 @@ static NSString *IPATQnPresetSummary(IPATQnPresetItem *item) {
     if (self.onClose) self.onClose();
 }
 
+/// 手动重扫一遍：App 中途又 dlopen 了新的网络库（或引擎起来后才开始发数据）时，
+/// 点一下就把它们已经绑定好的函数指针一起换掉
+- (void)handleRescan {
+    IPATQnLog(@"手动触发重新扫描（已拦到网络调用 %llu 次）", ({ uint64_t __c = 0; IPATQnHookStats(&__c, NULL, NULL); __c; }));
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        IPATQnRunRebind();
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self updateHookInfo];
+        });
+    });
+}
+
 /// 每 0.5 秒刷一次实时速率（不管开关状态都显示，方便对照限速有没有生效）
 - (void)updateRate {
     static uint64_t lastUp = 0;
@@ -1319,14 +1485,17 @@ static NSString *IPATQnPresetSummary(IPATQnPresetItem *item) {
 
 /// 「到底拦没拦到」——参数不生效时先看这一行。三种状态：
 ///   段没了        → 注入的是旧包 / QNet 没编进去
-///   拦到 0 次网络 → hook 装好了，但这个 App 的流量不走这些函数（引擎用别的入口，
-///                   或调用点在 CFNetwork 这类启动早期就绑定好的系统库里）
+///   拦到 0 次网络 → 调用点还没换掉（重绑 0 处 = 一个都没找到，按「重新扫描」再试；
+///                   重绑了很多处还是 0 → 这个 App 的流量不走这些函数）
 ///   拦到 N 次网络 → hook 真的在工作，这时再不生效就看参数 / 开关
 - (void)updateHookInfo {
     uint64_t calls = 0;
     uint64_t socketCalls = 0;
     uint64_t dropped = 0;
+    uint64_t slots = 0;
+    uint64_t images = 0;
     IPATQnHookStats(&calls, &socketCalls, &dropped);
+    IPATQnRebindStats(&slots, &images);
 
     if (IPATQnHookState() < 0) {
         self.hookLabel.textColor = [UIColor orangeColor];
@@ -1336,12 +1505,13 @@ static NSString *IPATQnPresetSummary(IPATQnPresetItem *item) {
     if (socketCalls == 0) {
         self.hookLabel.textColor = [UIColor orangeColor];
         self.hookLabel.text = [NSString stringWithFormat:
-            @"hook 已装载，但没拦到网络调用（已放行 %llu 次文件读写）", calls];
+            @"已重绑 %llu 处（%llu 个镜像），仍未拦到网络调用（放行文件读写 %llu 次）",
+            slots, images, calls];
         return;
     }
     self.hookLabel.textColor = [UIColor colorWithWhite:1.0 alpha:0.55];
-    self.hookLabel.text = [NSString stringWithFormat:@"已拦到 %llu 次网络调用（丢包 %llu）",
-                           socketCalls, dropped];
+    self.hookLabel.text = [NSString stringWithFormat:@"已拦到 %llu 次网络调用（丢包 %llu，重绑 %llu 处）",
+                           socketCalls, dropped, slots];
 }
 
 @end
@@ -1705,6 +1875,20 @@ __attribute__((constructor)) static void IPATQNetInit(void) {
     IPATQnLog(@"配置来源：Info.plist 的 IPAToolQNet %@；最终生效值 enabled=%d 下行=%d 上行=%d 延迟=%d 抖动=%d 丢包=%d",
               plistCfg.count > 0 ? @"找到了" : @"没找到",
               cfg.enabled, cfg.downKbps, cfg.upKbps, cfg.delayMs, cfg.jitterMs, cfg.lossPct);
+
+    // 把已经绑定好的函数指针改成我们的实现。换过宿主（LiveContainer 这类用
+    // dlopen 加载 guest 的）时这一步是关键：那时系统库里的调用点早绑定完了，
+    // 只靠 __DATA,__interpose 一个都拦不到。
+    IPATQnRunRebind();
+    // 有镜像（引擎、热更库）是启动过程中才 dlopen 进来的，隔几秒再扫两遍兜底；
+    // 面板上的「重新扫描」也能手动触发
+    for (int i = 0; i < 2; i++) {
+        int64_t delay = i == 0 ? 3 : 8;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay * NSEC_PER_SEC),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            IPATQnRunRebind();
+        });
+    }
 
     dispatch_async(dispatch_get_main_queue(), ^{
         [[IPATQnBridge shared] start];
