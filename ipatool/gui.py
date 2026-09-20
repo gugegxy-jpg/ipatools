@@ -542,18 +542,22 @@ class IpatoolGui:
     def _build_pack_run(self, page, row: int) -> None:
         run = self._group(page, "执行", row)
         ttk.Button(
-            run, text="改 ID / 名称（含签名）", width=22,
+            run, text="改 ID / 名称（含签名）", width=20,
             command=lambda: self._run_modify(False),
         ).grid(row=0, column=0, sticky="w")
         ttk.Button(
-            run, text="注入 dylib（含签名）", width=22,
+            run, text="注入 dylib（含签名）", width=20,
             command=lambda: self._run_inject(False),
         ).grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Button(
+            run, text="只重新签名", width=20,
+            command=lambda: self._run_sign(False),
+        ).grid(row=0, column=2, sticky="w", padx=(8, 0))
         ttk.Label(
             run, style="Muted.TLabel", justify="left", wraplength=620,
-            text="两个操作各自要解包打包一次，所以点哪个就只做哪个（都要做就是两次）。"
-                 "底部「开始执行」按当前填写自动选：列表里有 dylib 就注入，否则改名。"
-                 "「预览（dry-run）」只打印会改什么，不写文件。",
+            text="三个操作各自要解包打包一次，点哪个就只做哪个。\n"
+                 "底部「开始执行」按当前填写自动选：列表里有 dylib 就注入，填了 ID / 名称就改名，"
+                 "什么都没填就只重新打包 + 签名。「预览（dry-run）」只打印会改什么，不写文件。",
         ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
     # ------------------------------------------------------------------ #
@@ -799,7 +803,7 @@ class IpatoolGui:
             btn.configure(state="normal")
         if code == 0:
             self._set_status("完成")
-            if task in ("inject", "modify"):
+            if task in ("inject", "modify", "sign"):
                 messagebox.showinfo("完成", "处理完成，输出文件已生成。")
             return
         self._set_status(f"失败（退出码 {code}）", "err")
@@ -927,6 +931,14 @@ class IpatoolGui:
             return None
         return argv
 
+    def _sign_argv(self) -> list[str] | None:
+        """只重新打包 + 签名：不改 ID、不注入。"""
+        src = self.v_input.get().strip()
+        if not src:
+            messagebox.showwarning("缺少输入", "请先选择要处理的 IPA 文件或已解包目录。")
+            return None
+        return ["sign", src] + self._common_args()
+
     # ------------------------------------------------------------------ #
     # 动作
     # ------------------------------------------------------------------ #
@@ -955,30 +967,34 @@ class IpatoolGui:
         if self.nb.index(self.nb.select()) == 0:
             self._load_info()
             return
+        fill_ident = bool(self.v_bundle_id.get().strip() or self.v_name.get().strip())
         if self.custom_dylibs:
-            if self.v_bundle_id.get().strip() or self.v_name.get().strip():
+            if fill_ident:
                 self._append("[执行] 本次只做「注入」。要同时改 ID / 名称，请点上面的「改 ID / 名称（含签名）」。\n")
             self._run_inject(dry_run)
             return
-        self._run_modify(dry_run)
+        if fill_ident:
+            self._run_modify(dry_run)
+            return
+        # 什么都没填：只重新打包 + 签名（以前会被「至少填一项」挡住，跑不了）
+        self._run_sign(dry_run)
 
     def _run_modify(self, dry_run: bool = False) -> None:
-        argv = self._modify_argv()
-        if argv is None:
-            return
-        if dry_run and "--dry-run" not in argv:
-            argv.append("--dry-run")
-        self._set_text(self.log, "")
-        self._start(argv, "modify")
+        self._start_task(self._modify_argv(), "modify", dry_run)
 
     def _run_inject(self, dry_run: bool = False) -> None:
-        argv = self._inject_argv()
+        self._start_task(self._inject_argv(), "inject", dry_run)
+
+    def _run_sign(self, dry_run: bool = False) -> None:
+        self._start_task(self._sign_argv(), "sign", dry_run)
+
+    def _start_task(self, argv: list[str] | None, task: str, dry_run: bool) -> None:
         if argv is None:
             return
         if dry_run and "--dry-run" not in argv:
             argv.append("--dry-run")
         self._set_text(self.log, "")
-        self._start(argv, "inject")
+        self._start(argv, task)
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:

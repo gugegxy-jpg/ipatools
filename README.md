@@ -16,6 +16,7 @@
 - 递归替换 plist 中所有引用旧 Bundle ID 的字符串
 - 同步修改 `*.lproj/InfoPlist.strings` 中的本地化显示名（可用 `--no-localized` 关闭）
 - **注入 dylib**（`inject`）：放进 `Frameworks/` 并给主可执行文件追加 `LC_LOAD_DYLIB`，支持 fat 二进制、幂等
+- **只重新签名**（`sign`）：不改 ID、不注入，只解包后重新签名再打包（`inject` / `modify` 都会顺带签名，但都要求至少改点东西）
 - **文件导入导出**：`inject --files` 注入文件桥，在悬浮面板里浏览 App 沙盒，把热更资源（补丁/配置/存档）导出到系统「文件」App，或从「文件」App 导入回沙盒
 - **弱网测试**：`inject --qnet` 注入弱网工具，在游戏内的弹窗里实时调限速 / 延迟 / 抖动 / 丢包，**只对当前 App 生效**，不动系统设置、不影响其它 App
 - **运行时插件加载**：`inject --plugins` 注入一次之后，之后想试的 dylib 丢进 App 沙盒就能在悬浮窗里直接加载，**不用再重新打包签名安装**
@@ -62,6 +63,12 @@ python -m ipatool modify app.ipa -i com.company.newapp -n "新名称" \
 python -m ipatool modify app.ipa -i com.company.newapp \
   --p12 cert.p12 --identity "Apple Distribution" -o out.ipa
 
+# 只重新打包 + 重新签名：不改 ID、不注入任何东西
+# （inject / modify 虽然都会顺带签名，但两者都要求至少改点东西；只想签一下就用这个）
+python -m ipatool sign app.ipa \
+  --sign codesign --identity "Apple Development: xxx (TEAMID)" \
+  --provision app.mobileprovision -o out.ipa
+
 # 先看看会改什么，不落盘
 python -m ipatool modify app.ipa -i com.company.newapp -n "新名称" --dry-run
 ```
@@ -84,7 +91,8 @@ python -m ipatool.gui
 用法要点：
 
 - 顶部选输入（`.ipa` 或已解包且含 `Payload` 的目录）和输出路径；**选中输入不会自动解析**，要看包内信息就点「读取信息」。
-- 合并页里「改 ID / 名称（含签名）」和「注入 dylib（含签名）」是两个按钮：各自要解包打包一次，点哪个就只做哪个；底部的「开始执行」按当前填写自动选（列表里有 dylib 就注入，否则改名）。
+- 合并页底部有三个按钮：「改 ID / 名称（含签名）」「注入 dylib（含签名）」「只重新签名」。三个操作各自要解包打包一次，点哪个就只做哪个。
+- 底部的「开始执行」按当前填写自动选：列表里有 dylib 就注入 → 填了 ID / 名称就改名 → 什么都没填就只重新打包 + 签名（所以「不改 ID、不注入，只签一下」直接点它就行）。
 - 签名参数两个操作共用，配一次就行；「读取系统证书」列出可用身份并填进下拉框（同 `certs`）。
 - 证书 / 密码 / ID 签名会被记住，下次打开自动填好；明文存在本机配置文件里，界面上可以取消勾选或一键清除。
 - 「预览（dry-run）」= 在当前参数上追加 `--dry-run`，先看会改什么；「开始执行」才真正落盘。

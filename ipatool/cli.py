@@ -207,6 +207,20 @@ def _build_parser() -> argparse.ArgumentParser:
     psd.add_argument("--hardened-runtime", action="store_true", help="启用 hardened runtime")
     psd.add_argument("-v", "--verbose", action="store_true")
 
+    psg = sub.add_parser(
+        "sign",
+        help="只重新打包 + 重新签名（不改 ID、不注入任何东西）",
+        description=(
+            "什么都不改，把包解包后按指定证书重新签名再打包。\n"
+            "inject / modify 虽然都会顺带签名，但两者都要求至少改点东西；\n"
+            "只想「签一下」的时候用这个，不用为了能执行去填一个假的 Bundle ID。\n"
+            "签名参数与 inject / modify 完全一致。"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    psg.add_argument("input", help="IPA 文件路径，或已解包且含 Payload 的目录")
+    _add_output_args(psg)
+
     sub.add_parser(
         "gui",
         help="打开图形界面（tkinter），功能与本命令行一致",
@@ -484,6 +498,50 @@ def _package_and_sign(args, root: str, payload: str, app, workdir: str,
     else:
         print(f"输出: {out}")
     return 0
+
+
+def cmd_sign(args) -> int:
+    """
+    只重新打包 + 重新签名：不改 Bundle ID / 名称，也不注入任何 dylib。
+
+    inject / modify 都会顺带把签名做掉，但两者都要求至少改点东西；
+    只想「签一下」的时候用这个，不用为了能跑起来而填一个假的 Bundle ID。
+    """
+    if args.in_place and args.output:
+        print("错误：--in-place 与 -o/--output 不能同时使用", file=sys.stderr)
+        return 2
+    _zip_level(args)   # 参数有问题立刻报错，别等解包都跑完才发现
+
+    workdir = tempfile.mkdtemp(prefix="ipatool-")
+    started = time.perf_counter()
+    try:
+        root, payload, _bundles, app = _open_package(args.input, workdir)
+        print(f"解包耗时    : {time.perf_counter() - started:.1f}s")
+        print(f"目标 App    : {app.rel}")
+        print(f"Bundle ID   : {app.identifier}")
+        print("改动        : 无（只重新打包 + 签名）")
+
+        if args.dry_run:
+            print("\n[dry-run] 未写入任何文件")
+            return 0
+
+        if args.provision:
+            dest = signer.embed_provision(app.path, args.provision)
+            print(f"已写入描述文件: {os.path.relpath(dest, root)}")
+
+        code = _package_and_sign(
+            args, root, payload, app, workdir,
+            unsigned_warning="没有可用的签名工具，输出的是未签名 IPA（等于只重新打包）",
+        )
+        if not args.provision:
+            print("提示: 未指定 --provision，若证书与描述文件不匹配将无法安装")
+        print(f"总耗时      : {time.perf_counter() - started:.1f}s")
+        return code
+    except (signer.SignError, inject_mod.InjectError) as e:
+        print(f"失败: {e}", file=sys.stderr)
+        return 1
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 def cmd_modify(args) -> int:
@@ -801,4 +859,6 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_inject(args)
     if args.cmd == "signdylib":
         return cmd_signdylib(args)
+    if args.cmd == "sign":
+        return cmd_sign(args)
     return cmd_modify(args)
