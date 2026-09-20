@@ -21,6 +21,10 @@ on:
     paths:
       - "tweak/**"
       - "demo/**"
+      # CLI 改动靠下面那步「Inject tweaks into demo app」在 macOS runner 上验证，
+      # 所以它也属于触发路径（以前改了 ipatool/ 下面什么都没有跑）
+      - "ipatool/**"
+      - "requirements.txt"
       - ".github/workflows/build-tweak.yml"
 
 permissions:

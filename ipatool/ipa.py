@@ -22,6 +22,26 @@ BUNDLE_SUFFIXES = (".app", ".appex", ".framework", ".xctest", ".bundle", ".qlgen
 # 需要单独签名的动态库后缀
 DYLIB_SUFFIXES = (".dylib", ".so")
 
+# 本身已经是压缩格式的后缀：再 deflate 一遍几乎不省体积，纯烧 CPU，打包时直接存储。
+# 漏了某项也没关系（只是慢一点），所以这里只列常见且一定能确定的。
+ALREADY_COMPRESSED_SUFFIXES = (
+    # 图片 / 纹理
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic", ".heif", ".avif",
+    ".astc", ".ktx", ".ktx2", ".pvr", ".dds", ".basis",
+    # 音视频
+    ".mp3", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".wav", ".flac",
+    ".mp4", ".m4v", ".mov", ".mkv", ".webm",
+    # 压缩包 / 已压缩容器
+    ".zip", ".gz", ".bz2", ".xz", ".7z", ".rar", ".jar", ".apk", ".ipa",
+    ".unity3d", ".assetbundle", ".skadnetwork", ".pack",
+    # 字体（自带压缩表）
+    ".woff", ".woff2", ".otf",
+)
+
+
+def _already_compressed(name: str) -> bool:
+    return name.lower().endswith(ALREADY_COMPRESSED_SUFFIXES)
+
 
 def is_macho(path: str) -> bool:
     """通过文件头判断是否为 Mach-O 可执行文件。"""
@@ -68,10 +88,20 @@ def _set_mtime(zi: zipfile.ZipInfo, path: str) -> None:
         pass
 
 
-def archive(src: str, out_path: str, compresslevel: int = 9) -> None:
-    """把目录重新打包成 IPA。"""
+def archive(src: str, out_path: str, compresslevel: int | None = None) -> None:
+    """
+    把目录重新打包成 IPA。
+
+    compresslevel 是打包耗时的大头（IPA 体积多大、CPU 就烧多久）：
+      None（默认）：智能。已经是压缩格式的资源（png / jpg / mp4 / astc / zip …）
+                    再 deflate 一遍几乎不省体积，直接 STORED；其余用 deflate。
+      0          ：全部 STORED，最快，体积最大。
+      1-9        ：全部 deflate，数字越小越快、越大越慢越小。
+    """
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
-    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=compresslevel) as zf:
+    default_type = zipfile.ZIP_STORED if compresslevel == 0 else zipfile.ZIP_DEFLATED
+    open_kwargs = {} if compresslevel in (None, 0) else {"compresslevel": compresslevel}
+    with zipfile.ZipFile(out_path, "w", default_type, **open_kwargs) as zf:
         for root, dirs, files in os.walk(src):
             dirs.sort()
             files.sort()
@@ -79,8 +109,9 @@ def archive(src: str, out_path: str, compresslevel: int = 9) -> None:
             if rel_root != ".":
                 zi = zipfile.ZipInfo(rel_root + "/")
                 zi.external_attr = (_mode_of(root, True) | stat.S_IFDIR) << 16 | 0x10
+                zi.compress_type = zipfile.ZIP_STORED
                 _set_mtime(zi, root)
-                zf.writestr(zi, b"")
+                zf.writestr(zi, b"", compress_type=zipfile.ZIP_STORED)
 
             for name in files:
                 full = os.path.join(root, name)
@@ -97,15 +128,23 @@ def archive(src: str, out_path: str, compresslevel: int = 9) -> None:
                     zi = zipfile.ZipInfo(rel)
                     zi.external_attr = (0o777 | stat.S_IFLNK) << 16
                     _set_mtime(zi, full)
-                    zf.writestr(zi, os.readlink(full).replace(os.sep, "/"))
+                    zf.writestr(zi, os.readlink(full).replace(os.sep, "/"),
+                                compress_type=zipfile.ZIP_STORED)
                     continue
 
+                store = compresslevel == 0 or (
+                    compresslevel is None and _already_compressed(name)
+                )
                 zi = zipfile.ZipInfo(rel)
                 zi.external_attr = _mode_of(full) << 16
-                zi.compress_type = zipfile.ZIP_DEFLATED
                 _set_mtime(zi, full)
                 with open(full, "rb") as f:
-                    zf.writestr(zi, f.read())
+                    data = f.read()
+                if store:
+                    zf.writestr(zi, data, compress_type=zipfile.ZIP_STORED)
+                else:
+                    zf.writestr(zi, data, compress_type=zipfile.ZIP_DEFLATED,
+                                compresslevel=compresslevel)
 
 
 def is_bundle_dir(name: str) -> bool:

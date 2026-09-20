@@ -249,6 +249,7 @@ class IpatoolGui:
         self.v_p12_password = tk.StringVar()
         self.v_provision = tk.StringVar()
         self.v_entitlements = tk.StringVar()
+        self.v_zip_level = tk.StringVar(value="auto")
         self.v_hardened = tk.BooleanVar(value=False)
         self.v_dry_run = tk.BooleanVar(value=False)
         self.v_verbose = tk.BooleanVar(value=False)
@@ -492,6 +493,17 @@ class IpatoolGui:
         ttk.Checkbutton(opt, text="只预览不写文件（--dry-run）", variable=self.v_dry_run).grid(row=0, column=0, sticky="w")
         ttk.Checkbutton(opt, text="输出详细日志（-v）", variable=self.v_verbose).grid(row=1, column=0, sticky="w")
         ttk.Checkbutton(opt, text="codesign 启用 hardened runtime", variable=self.v_hardened).grid(row=2, column=0, sticky="w")
+
+        # 打包是耗时大头：auto 会把已经压缩过的资源直接存储（明显更快，体积几乎不变）
+        ttk.Label(opt, text="打包压缩（--zip-level）").grid(row=3, column=0, sticky="w", pady=(6, 3))
+        ttk.Combobox(
+            opt, textvariable=self.v_zip_level, state="readonly", width=8,
+            values=["auto", "0", "1", "3", "6", "9"],
+        ).grid(row=3, column=1, sticky="w", padx=(0, 8), pady=(6, 3))
+        ttk.Label(
+            opt, style="Muted.TLabel",
+            text="auto：已压缩资源直接存储；0 全部存储最快；1-9 deflate，越小越快",
+        ).grid(row=3, column=2, sticky="w", pady=(6, 3))
 
     # ------------------------------------------------------------------ #
     # 底部：日志 + 操作
@@ -748,6 +760,8 @@ class IpatoolGui:
         _add(argv, "--p12-password", self.v_p12_password.get())
         _add(argv, "--provision", self.v_provision.get())
         _add(argv, "--entitlements", self.v_entitlements.get())
+        if self.v_zip_level.get().strip() not in ("", "auto"):
+            _add(argv, "--zip-level", self.v_zip_level.get().strip())
         _flag(argv, "--hardened-runtime", self.v_hardened.get())
         _flag(argv, "--dry-run", self.v_dry_run.get())
         _flag(argv, "-v", self.v_verbose.get())

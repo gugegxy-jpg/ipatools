@@ -8,6 +8,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 
 from . import bundle as bundle_mod
 from . import inject as inject_mod
@@ -43,8 +44,45 @@ def _add_output_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--provision", help="写入 App 的 embedded.mobileprovision 描述文件")
     p.add_argument("--entitlements", help="主 App 使用的 entitlements.plist")
     p.add_argument("--hardened-runtime", action="store_true", help="codesign 时启用 hardened runtime")
+    p.add_argument(
+        "--zip-level",
+        default="auto",
+        metavar="auto|0-9",
+        help="打包压缩级别（打包是耗时大头）：auto=默认，已经压缩过的资源"
+             "（png/mp4/astc…）直接存储、其余 deflate；0=全部存储，最快、体积最大；"
+             "1-9=全部 deflate，越小越快",
+    )
     p.add_argument("--dry-run", action="store_true", help="只打印将要发生的改动，不写文件")
     p.add_argument("-v", "--verbose", action="store_true")
+
+
+def _zip_level(args) -> int | None:
+    """解析 --zip-level：auto -> None（智能），0 -> 全存储，1-9 -> deflate 等级。"""
+    raw = str(getattr(args, "zip_level", "auto") or "auto").strip().lower()
+    if raw in ("", "auto"):
+        return None
+    try:
+        level = int(raw)
+    except ValueError:
+        raise SystemExit(f"错误：--zip-level 只接受 auto 或 0-9，收到 {raw!r}")
+    if not 0 <= level <= 9:
+        raise SystemExit(f"错误：--zip-level 只能是 0-9，收到 {level}")
+    return level
+
+
+def _zip_level_text(level: int | None) -> str:
+    if level is None:
+        return "auto（已压缩资源直接存储，其余 deflate）"
+    if level == 0:
+        return "0（全部存储，最快，体积最大）"
+    return f"{level}（deflate）"
+
+
+def _timed(fn, *args, **kwargs):
+    """跑一个步骤并返回 (结果, 用了多少秒)。"""
+    start = time.perf_counter()
+    result = fn(*args, **kwargs)
+    return result, time.perf_counter() - start
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -355,10 +393,18 @@ def _output_path(args, workdir: str) -> str:
 
 def _package_and_sign(args, root: str, payload: str, app, workdir: str,
                       zsign_bundle_id: str | None = None, unsigned_warning: str | None = None) -> int:
-    """打包 + 按所选后端重签名 + 落盘。"""
+    """打包 + 按所选后端重签名 + 落盘。
+
+    注入和签名本来就是这一条命令里做完的：解包一次、打包一次、中间把签名一起做掉，
+    不需要再拿第二个工具跑一遍（那样会白白多一次解包 + 打包）。
+    想只要注入不签名就 `--sign none`。
+    """
     out = _output_path(args, workdir)
     backend = signer.resolve_backend(args.sign)
+    level = _zip_level(args)
     print(f"重签名后端  : {backend}")
+    if backend != "none":
+        print(f"打包压缩    : {_zip_level_text(level)}")
 
     want_identity = args.identity if args.identity not in (None, "", "-") else None
     if backend == "none" and (args.p12 or want_identity):
@@ -366,6 +412,8 @@ def _package_and_sign(args, root: str, payload: str, app, workdir: str,
     elif backend == "none" and unsigned_warning:
         print(f"  警告: {unsigned_warning}")
 
+    sign_seconds = 0.0
+    archive_seconds = 0.0
     with keystore.IdentitySession(
         identity=want_identity,
         p12=args.p12,
@@ -373,7 +421,8 @@ def _package_and_sign(args, root: str, payload: str, app, workdir: str,
         backend=backend,
     ) as ident:
         if backend == "codesign":
-            signer.codesign_payload(
+            _, sign_seconds = _timed(
+                signer.codesign_payload,
                 payload,
                 identity=ident.value,
                 main_app=app.path,
@@ -382,11 +431,13 @@ def _package_and_sign(args, root: str, payload: str, app, workdir: str,
                 keychain=ident.keychain,
                 log=lambda m: print(m) if args.verbose else None,
             )
-            ipa_mod.archive(root, out)
+            _, archive_seconds = _timed(ipa_mod.archive, root, out, level)
         elif backend == "zsign":
             unsigned = os.path.join(workdir, "unsigned.ipa")
-            ipa_mod.archive(root, unsigned)
-            signer.zsign_ipa(
+            # 中间包还要被 zsign 重新打一次，所以这里一律不压缩，省一遍 CPU
+            _, archive_seconds = _timed(ipa_mod.archive, root, unsigned, 0)
+            _, sign_seconds = _timed(
+                signer.zsign_ipa,
                 unsigned,
                 out,
                 p12=ident.p12_path,
@@ -397,8 +448,11 @@ def _package_and_sign(args, root: str, payload: str, app, workdir: str,
                 log=lambda m: print(m) if args.verbose else None,
             )
         else:
-            ipa_mod.archive(root, out)
+            _, archive_seconds = _timed(ipa_mod.archive, root, out, level)
             print("  警告: 未找到可用的签名工具，输出的是未签名 IPA，设备无法直接安装")
+
+    if backend != "none":
+        print(f"阶段耗时    : 签名 {sign_seconds:.1f}s / 打包 {archive_seconds:.1f}s")
 
     if args.in_place:
         shutil.move(out, os.path.abspath(args.input))
@@ -418,11 +472,14 @@ def cmd_modify(args) -> int:
     if args.in_place and args.output:
         print("错误：--in-place 与 -o/--output 不能同时使用", file=sys.stderr)
         return 2
+    _zip_level(args)   # 参数有问题立刻报错，别等解包都跑完才发现
 
     new_bundle_name = args.bundle_name
     workdir = tempfile.mkdtemp(prefix="ipatool-")
+    started = time.perf_counter()
     try:
         root, payload, _bundles, app = _open_package(args.input, workdir)
+        print(f"解包耗时    : {time.perf_counter() - started:.1f}s")
 
         old_id = app.identifier or ""
         old_display = app.display_name or app.bundle_name or ""
@@ -465,6 +522,7 @@ def cmd_modify(args) -> int:
         )
         if not args.provision:
             print("提示: 未指定 --provision，原描述文件与新 Bundle ID 可能不匹配（通配符描述文件除外）")
+        print(f"总耗时      : {time.perf_counter() - started:.1f}s")
         return code
     except (signer.SignError, inject_mod.InjectError) as e:
         print(f"失败: {e}", file=sys.stderr)
@@ -477,10 +535,13 @@ def cmd_inject(args) -> int:
     if args.in_place and args.output:
         print("错误：--in-place 与 -o/--output 不能同时使用", file=sys.stderr)
         return 2
+    _zip_level(args)   # 参数有问题立刻报错，别等解包+注入都跑完才发现
 
     workdir = tempfile.mkdtemp(prefix="ipatool-")
+    started = time.perf_counter()
     try:
         root, payload, _bundles, app = _open_package(args.input, workdir)
+        print(f"解包耗时    : {time.perf_counter() - started:.1f}s")
 
         if args.list:
             try:
@@ -692,6 +753,7 @@ def cmd_inject(args) -> int:
         if not args.provision:
             print("提示: 未指定 --provision，若证书与描述文件不匹配将无法安装；"
                   "注入 dylib 会让原签名失效，必须重签")
+        print(f"总耗时      : {time.perf_counter() - started:.1f}s")
         return code
     except (signer.SignError, inject_mod.InjectError) as e:
         print(f"失败: {e}", file=sys.stderr)
