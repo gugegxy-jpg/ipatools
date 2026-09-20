@@ -403,8 +403,7 @@ def _package_and_sign(args, root: str, payload: str, app, workdir: str,
     backend = signer.resolve_backend(args.sign)
     level = _zip_level(args)
     print(f"重签名后端  : {backend}")
-    if backend != "none":
-        print(f"打包压缩    : {_zip_level_text(level)}")
+    print(f"打包压缩    : {_zip_level_text(level)}")
 
     want_identity = args.identity if args.identity not in (None, "", "-") else None
     if backend == "none" and (args.p12 or want_identity):
@@ -451,7 +450,9 @@ def _package_and_sign(args, root: str, payload: str, app, workdir: str,
             _, archive_seconds = _timed(ipa_mod.archive, root, out, level)
             print("  警告: 未找到可用的签名工具，输出的是未签名 IPA，设备无法直接安装")
 
-    if backend != "none":
+    if backend == "none":
+        print(f"阶段耗时    : 打包 {archive_seconds:.1f}s")
+    else:
         print(f"阶段耗时    : 签名 {sign_seconds:.1f}s / 打包 {archive_seconds:.1f}s")
 
     if args.in_place:
