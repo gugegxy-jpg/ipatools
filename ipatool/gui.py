@@ -273,10 +273,6 @@ class IpatoolGui:
         self.v_dry_run = tk.BooleanVar(value=False)
         self.v_verbose = tk.BooleanVar(value=False)
 
-        # 注入
-        self.v_background_mode = tk.StringVar()
-        self.v_allow_arbitrary_loads = tk.BooleanVar(value=False)
-
         # 状态
         self.v_status = tk.StringVar(value="就绪")
 
@@ -369,9 +365,16 @@ class IpatoolGui:
         self.nb = ttk.Notebook(self.root)
         self.nb.grid(row=3, column=0, sticky="nsew", padx=12)
         self._build_info_tab()
-        self._build_modify_tab()
-        self._build_inject_tab()
-        self._build_sign_tab()
+        self._build_pack_tab()
+
+    # ---- 改 ID · 注入 · 签名（合并页） -------------------------------- #
+    def _build_pack_tab(self) -> None:
+        page = self._scroll_page("  改 ID · 注入 · 签名  ")
+        self._build_pack_identity(page, 0)
+        self._build_pack_dylib(page, 1)
+        self._build_pack_sign(page, 2)
+        self._build_pack_keep(page, 3)
+        self._build_pack_run(page, 4)
 
     # ---- 信息 --------------------------------------------------------- #
     def _build_info_tab(self) -> None:
@@ -451,37 +454,19 @@ class IpatoolGui:
         outer.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
         return inner
 
-    # ---- 修改 --------------------------------------------------------- #
-    def _build_modify_tab(self) -> None:
-        page = self._scroll_page("  改 ID / 名称  ")
-
-        box = self._group(page, "新的标识", 0)
-        self._entry(box, 0, "Bundle Identifier", self.v_bundle_id, "如 com.company.newapp（留空表示不改）")
+    # ---- 改 ID / 名称 -------------------------------------------------- #
+    def _build_pack_identity(self, page, row: int) -> None:
+        box = self._group(page, "改 Bundle ID / 名称（留空表示不改）", row)
+        self._entry(box, 0, "Bundle Identifier", self.v_bundle_id, "如 com.company.newapp")
         self._entry(box, 1, "显示名称", self.v_name, "CFBundleDisplayName（桌面图标下的名字）")
-        self._entry(box, 2, "CFBundleName", self.v_bundle_name, "留空则跟随上一条（与原 CFBundleName 一致时）")
         ttk.Checkbutton(
             box, text="不同步修改本地化名称（InfoPlist.strings / --no-localized）",
             variable=self.v_no_localized,
-        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
-        tips = self._group(page, "说明", 1)
-        ttk.Label(
-            tips,
-            justify="left",
-            style="Muted.TLabel",
-            text=(
-                "· 内嵌的 Extension / WatchApp / Framework 的 Bundle ID 会按前缀联动修改，\n"
-                "  plist 里引用旧 ID 的字符串也会被递归替换（WKAppBundleIdentifier、CFBundleURLName 等）。\n"
-                "· 改完必须重新签名才能安装；签名信息在「签名」页配置。\n"
-                "· 想先看看会改什么，勾上「只预览不写文件」再执行。"
-            ),
-        ).grid(row=0, column=0, columnspan=3, sticky="w")
-
-    # ---- 注入 --------------------------------------------------------- #
-    def _build_inject_tab(self) -> None:
-        page = self._scroll_page("  注入 dylib  ")
-
-        box = self._group(page, "要注入的 dylib", 0)
+    # ---- 注入 dylib ---------------------------------------------------- #
+    def _build_pack_dylib(self, page, row: int) -> None:
+        box = self._group(page, "注入 dylib（不注入就留空）", row)
         wrap = ttk.Frame(box)
         wrap.grid(row=0, column=0, columnspan=2, sticky="ew")
         wrap.columnconfigure(0, weight=1)
@@ -500,42 +485,17 @@ class IpatoolGui:
         btns.grid(row=0, column=2, sticky="nw", padx=(10, 0))
         ttk.Button(btns, text="添加…", width=10, command=self._add_dylib).pack()
         ttk.Button(btns, text="移除", width=10, command=self._remove_dylib).pack(pady=4)
-        ttk.Button(btns, text="清空", width=10, command=self._clear_dylib).pack()
+        ttk.Button(btns, text="清空", width=10, command=self._clear_dylib).pack(pady=4)
+        ttk.Button(btns, text="核对产物", width=10, command=self._list_injected).pack()
 
         ttk.Label(
             box, style="Muted.TLabel", justify="left",
             text="dylib 会被放进 App 的 Frameworks/，并写入主可执行文件的 LC_LOAD_DYLIB；列表顺序即加载顺序。",
         ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
-        extra = self._group(page, "Info.plist 附加配置（可选）", 1)
-        self._entry(extra, 0, "后台模式", self.v_background_mode,
-                    "逗号分隔，追加到 UIBackgroundModes，如 fetch,processing")
-        ttk.Checkbutton(
-            extra, text="允许明文 HTTP（NSAllowsArbitraryLoads，热更服务器常用）",
-            variable=self.v_allow_arbitrary_loads,
-        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
-
-        bar = ttk.Frame(extra)
-        bar.grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
-        ttk.Button(bar, text="查看已注入的 dylib", command=self._list_injected).pack(side="left")
-        ttk.Label(bar, text="  核对产物里实际注入了哪些库，不改动任何文件", style="Muted.TLabel").pack(side="left")
-
-        tips = self._group(page, "说明", 2)
-        ttk.Label(
-            tips, style="Muted.TLabel", justify="left",
-            text=(
-                "· 注入后原签名失效，必须重新签名才能安装（签名参数在「签名」页）。\n"
-                "· 想先看看会改什么，用底部的「预览（dry-run）」。\n"
-                "· 内置的文件导入导出 / 弱网测试 / 运行时插件加载 / 悬浮窗只在命令行提供：\n"
-                "    python -m ipatool inject <包> --files --qnet --plugins"
-            ),
-        ).grid(row=0, column=0, columnspan=3, sticky="w")
-
-    # ---- 签名 --------------------------------------------------------- #
-    def _build_sign_tab(self) -> None:
-        page = self._scroll_page("  签名  ")
-
-        box = self._group(page, "签名方式（二选一，都不给则 ad-hoc 签名，真机装不上）", 0)
+    # ---- 签名 ---------------------------------------------------------- #
+    def _build_pack_sign(self, page, row: int) -> None:
+        box = self._group(page, "签名（改 ID / 注入共用，二选一，都不给则 ad-hoc 签名，真机装不上）", row)
         ttk.Label(box, text="后端").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=3)
         ttk.Combobox(
             box, textvariable=self.v_sign, values=list(signer.BACKENDS),
@@ -560,27 +520,11 @@ class IpatoolGui:
         )
 
         self._entry(box, 4, "描述文件", self.v_provision, "embedded.mobileprovision，改过 Bundle ID 时必须匹配", browse=lambda: self._pick_file(self.v_provision, [("描述文件", "*.mobileprovision"), ("所有文件", "*.*")]))
-        self._entry(box, 5, "Entitlements", self.v_entitlements, "entitlements.plist（可选）", browse=lambda: self._pick_file(self.v_entitlements, [("plist", "*.plist"), ("所有文件", "*.*")]))
 
-        opt = self._group(page, "运行选项", 1)
-        ttk.Checkbutton(opt, text="只预览不写文件（--dry-run）", variable=self.v_dry_run).grid(row=0, column=0, sticky="w")
-        ttk.Checkbutton(opt, text="输出详细日志（-v）", variable=self.v_verbose).grid(row=1, column=0, sticky="w")
-        ttk.Checkbutton(opt, text="codesign 启用 hardened runtime", variable=self.v_hardened).grid(row=2, column=0, sticky="w")
-
-        # 打包是耗时大头：auto 会把已经压缩过的资源直接存储（明显更快，体积几乎不变）
-        ttk.Label(opt, text="打包压缩（--zip-level）").grid(row=3, column=0, sticky="w", pady=(6, 3))
-        ttk.Combobox(
-            opt, textvariable=self.v_zip_level, state="readonly", width=8,
-            values=["auto", "0", "1", "3", "6", "9"],
-        ).grid(row=3, column=1, sticky="w", padx=(0, 8), pady=(6, 3))
-        ttk.Label(
-            opt, style="Muted.TLabel", justify="left", wraplength=420,
-            text="auto：已压缩资源直接存储；0 全部存储最快；1-9 deflate，越小越快。"
-                 "注入和签名本来就是同一次里做完的，不用再跑第二个工具",
-        ).grid(row=3, column=2, sticky="w", pady=(6, 3))
-
+    # ---- 记住设置 ------------------------------------------------------ #
+    def _build_pack_keep(self, page, row: int) -> None:
         # 证书 / 密码存下来，下次打开自动填好
-        keep = self._group(page, "记住设置", 2)
+        keep = self._group(page, "记住设置", row)
         ttk.Checkbutton(
             keep, text="记住证书 / 密码 / ID 签名，下次打开自动填好",
             variable=self.v_remember,
@@ -593,6 +537,24 @@ class IpatoolGui:
         ttk.Button(
             keep, text="清除已保存的证书", command=self._clear_settings,
         ).grid(row=1, column=2, sticky="e", padx=(10, 0))
+
+    # ---- 执行 ---------------------------------------------------------- #
+    def _build_pack_run(self, page, row: int) -> None:
+        run = self._group(page, "执行", row)
+        ttk.Button(
+            run, text="改 ID / 名称（含签名）", width=22,
+            command=lambda: self._run_modify(False),
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Button(
+            run, text="注入 dylib（含签名）", width=22,
+            command=lambda: self._run_inject(False),
+        ).grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(
+            run, style="Muted.TLabel", justify="left", wraplength=620,
+            text="两个操作各自要解包打包一次，所以点哪个就只做哪个（都要做就是两次）。"
+                 "底部「开始执行」按当前填写自动选：列表里有 dylib 就注入，否则改名。"
+                 "「预览（dry-run）」只打印会改什么，不写文件。",
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
     # ------------------------------------------------------------------ #
     # 底部：日志 + 操作
@@ -958,19 +920,10 @@ class IpatoolGui:
         argv = ["inject", src]
         for path in self.custom_dylibs:
             argv += ["--dylib", path]
-
-        for mode in self.v_background_mode.get().replace("，", ",").split(","):
-            _add(argv, "--background-mode", mode)
-        _flag(argv, "--allow-arbitrary-loads", self.v_allow_arbitrary_loads.get())
-
         argv += self._common_args()
 
-        if not self.custom_dylibs and not self.v_background_mode.get().strip() \
-                and not self.v_allow_arbitrary_loads.get():
-            messagebox.showwarning(
-                "没有要注入的东西",
-                "请至少添加一个 dylib；只想改 Info.plist 的话，填后台模式或勾上「允许明文 HTTP」。",
-            )
+        if not self.custom_dylibs:
+            messagebox.showwarning("没有要注入的东西", "请先点「添加…」选一个 dylib。")
             return None
         return argv
 
@@ -998,21 +951,34 @@ class IpatoolGui:
         self._start(["inject", src, "--list"], "inject-list")
 
     def _run_current(self, dry_run: bool) -> None:
-        index = self.nb.index(self.nb.select())
-        if index == 0:  # 信息页
+        """底部「开始执行 / 预览」：信息页读信息，合并页按当前填写自动选。"""
+        if self.nb.index(self.nb.select()) == 0:
             self._load_info()
             return
-        if index == 3:  # 签名页：只放配置，没有可执行的动作
-            messagebox.showinfo("提示", "签名参数是「改 ID / 名称」和「注入 dylib」两个页签共用的，请切到对应页签执行。")
+        if self.custom_dylibs:
+            if self.v_bundle_id.get().strip() or self.v_name.get().strip():
+                self._append("[执行] 本次只做「注入」。要同时改 ID / 名称，请点上面的「改 ID / 名称（含签名）」。\n")
+            self._run_inject(dry_run)
             return
-        task = "modify" if index == 1 else "inject"
-        argv = self._modify_argv() if index == 1 else self._inject_argv()
+        self._run_modify(dry_run)
+
+    def _run_modify(self, dry_run: bool = False) -> None:
+        argv = self._modify_argv()
         if argv is None:
             return
         if dry_run and "--dry-run" not in argv:
             argv.append("--dry-run")
         self._set_text(self.log, "")
-        self._start(argv, task)
+        self._start(argv, "modify")
+
+    def _run_inject(self, dry_run: bool = False) -> None:
+        argv = self._inject_argv()
+        if argv is None:
+            return
+        if dry_run and "--dry-run" not in argv:
+            argv.append("--dry-run")
+        self._set_text(self.log, "")
+        self._start(argv, "inject")
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:

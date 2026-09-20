@@ -74,24 +74,24 @@ python -m ipatool gui
 python -m ipatool.gui
 ```
 
-界面分成四个页签，功能与命令行一一对应：
+界面分成两个页签：
 
 | 页签 | 对应子命令 | 内容 |
 | --- | --- | --- |
 | 信息 | `info --json` | Bundle ID / 名称 / 版本 / 后台模式 / 内嵌 bundle / 已注入 dylib |
-| 改 ID / 名称 | `modify` | Bundle Identifier、显示名称、CFBundleName、本地化开关 |
-| 注入 dylib | `inject` | 自定义 dylib（`--dylib`）、后台模式、ATS |
-| 签名 | `modify` / `inject` 公共参数 | 签名后端、`--identity`、p12 与密码、描述文件、entitlements、dry-run |
+| 改 ID · 注入 · 签名 | `modify` + `inject` | Bundle Identifier / 显示名称、要注入的 dylib 列表、签名参数（后端 / `--identity` / p12 与密码 / 描述文件）、记住设置、执行按钮 |
 
 用法要点：
 
-- 顶部选输入（`.ipa` 或已解包且含 `Payload` 的目录）和输出路径；选完输入会自动解析一次信息。
-- 「签名」页的「读取系统证书」会列出可用身份并填进下拉框，和 `certs` 一样。
-- 「预览（dry-run）」= 在当前页签的参数上追加 `--dry-run`，先看会改什么；「开始执行」才真正落盘。
-- 「注入 dylib」页只提供 dylib 注入（`--dylib`）和 Info.plist 附加配置；内置的文件导入导出 / 悬浮窗请用命令行：`python -m ipatool inject <包> --files`。
+- 顶部选输入（`.ipa` 或已解包且含 `Payload` 的目录）和输出路径；**选中输入不会自动解析**，要看包内信息就点「读取信息」。
+- 合并页里「改 ID / 名称（含签名）」和「注入 dylib（含签名）」是两个按钮：各自要解包打包一次，点哪个就只做哪个；底部的「开始执行」按当前填写自动选（列表里有 dylib 就注入，否则改名）。
+- 签名参数两个操作共用，配一次就行；「读取系统证书」列出可用身份并填进下拉框（同 `certs`）。
+- 证书 / 密码 / ID 签名会被记住，下次打开自动填好；明文存在本机配置文件里，界面上可以取消勾选或一键清除。
+- 「预览（dry-run）」= 在当前参数上追加 `--dry-run`，先看会改什么；「开始执行」才真正落盘。
 - 日志区实时滚动命令输出（等价于把拼出来的命令行贴进终端），证书密码在回显里打码。
 - 任务跑在后台线程，界面不会卡死；同一时刻只允许一个任务。
 - 界面不重复实现业务逻辑：它只是把控件上的值拼成一份 argv 再交给 `cli.main()`，所以提示、警告、退出码和命令行完全一致。
+- 内置的文件导入导出 / 弱网测试 / 插件加载 / 悬浮窗只在命令行提供：`python -m ipatool inject <包> --files --qnet --plugins`。
 
 > 界面依赖 Python 自带的 tkinter（Windows / macOS 官方安装包都自带；Linux 上需装 `python3-tk`）。
 
