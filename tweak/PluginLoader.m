@@ -295,7 +295,7 @@ static NSString *IPATPlLoad(NSString *path) {
     pthread_mutex_unlock(&IPATPlLock);
 
     IPATPlLog(@"已加载插件：%@", full);
-    [IPATPlRemember(full, YES)];
+    IPATPlRemember(full, YES);
 
     // 插件要是按面板协议写了注册逻辑，重新广播一次 Discover 它就会自己冒出来
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -313,7 +313,7 @@ static NSString *IPATPlUnload(NSString *path) {
     [IPATPlHandleMap() removeObjectForKey:full];
     pthread_mutex_unlock(&IPATPlLock);
 
-    [IPATPlRemember(full, NO)];
+    IPATPlRemember(full, NO);
     if (!boxed) return nil;
 
     int result = dlclose(boxed.pointerValue);
