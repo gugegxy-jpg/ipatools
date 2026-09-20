@@ -57,7 +57,10 @@
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <mach-o/dyld.h>
 #include <mach-o/loader.h>
+#include <mach/mach.h>
+#include <mach/vm_map.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdlib.h>
@@ -695,6 +698,7 @@ static bool IPATQnMakeWritable(void *addr, size_t len) {
 /// 构造函数里先跑一次；隔几秒再跑一次兜底（有些镜像启动过程中才 dlopen 进来）；
 /// 面板上的「重新扫描」也能手动触发。
 static void IPATQnRunRebind(void) {
+    uint64_t startUs = IPATQnNowUs();
     const void *targets[IPAT_QN_SWEEP_TARGET_COUNT];
     const void *replacements[IPAT_QN_SWEEP_TARGET_COUNT];
     size_t count = 0;
