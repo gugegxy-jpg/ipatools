@@ -11,6 +11,10 @@ from .ipa import is_bundle_dir, is_dylib
 
 BACKENDS = ("auto", "codesign", "zsign", "none")
 
+ZSIGN_ENV = "IPATOOL_ZSIGN"          # 不在 PATH 里时可以直接指路径
+ZSIGN_HINT = ("https://github.com/zhlynn/zsign（跨平台，含 Windows）"
+              "或 https://github.com/claration/Zsign-Package")
+
 
 class SignError(RuntimeError):
     pass
@@ -20,19 +24,50 @@ def _have(tool: str) -> bool:
     return shutil.which(tool) is not None
 
 
+def zsign_binary() -> str | None:
+    """找 zsign：先看 IPATOOL_ZSIGN 指定的路径，再看 PATH。"""
+    explicit = os.environ.get(ZSIGN_ENV, "").strip().strip('"')
+    if explicit:
+        if os.path.isfile(explicit):
+            return explicit
+        raise SignError(f"{ZSIGN_ENV} 指向的文件不存在: {explicit}")
+    return shutil.which("zsign")
+
+
 def resolve_backend(backend: str) -> str:
     if backend != "auto":
         if backend == "codesign" and not (platform.system() == "Darwin" and _have("codesign")):
             raise SignError("当前系统不是 macOS 或找不到 codesign，无法使用 codesign 后端")
-        if backend == "zsign" and not _have("zsign"):
-            raise SignError("找不到 zsign，请先安装（https://github.com/zhlynn/zsign）或改用其它后端")
+        if backend == "zsign" and zsign_binary() is None:
+            raise SignError(
+                "找不到 zsign，无法签名。装好后让它出现在 PATH 里，"
+                f"或用 {ZSIGN_ENV}=/路径/zsign 指定可执行文件。\n下载: {ZSIGN_HINT}"
+            )
         return backend
 
     if platform.system() == "Darwin" and _have("codesign"):
         return "codesign"
-    if _have("zsign"):
+    if zsign_binary() is not None:
         return "zsign"
     return "none"
+
+
+def auto_backend_hint() -> str:
+    """auto 落到 none 时把原因和出路说清楚（否则用户只会看到一句「已忽略证书」）。"""
+    system = platform.system()
+    lines: list[str] = []
+    if system == "Darwin":
+        lines.append("原因: macOS 上靠系统自带的 codesign 签名，但现在找不到 codesign"
+                     "（装了 Xcode 命令行工具吗？xcrun --find codesign）")
+    else:
+        lines.append(f"原因: 当前系统是 {system}，用不了 macOS 自带的 codesign；"
+                     "非 macOS 上签 IPA 只能靠 zsign，而 PATH 里找不到 zsign")
+    lines.append(f"想在本机签: 装 zsign（{ZSIGN_HINT}），"
+                 f"或用 {ZSIGN_ENV}=/路径/zsign 指定可执行文件；"
+                 "证书用 --p12 cert.p12，或 Windows 证书存储里的身份加 --identity <指纹>")
+    lines.append("不想在本机签: 保留 --sign none，把未签名的 IPA 交给 "
+                 "Sideloadly / AltStore / SideStore / LiveContainer 去签")
+    return "\n".join(lines)
 
 
 def _sign_items(payload_dir: str) -> list[str]:
@@ -166,7 +201,12 @@ def zsign_ipa(
     if not p12:
         raise SignError("zsign 后端需要 --p12 证书，通常还要配合 --provision 描述文件")
 
-    cmd = ["zsign", "-k", p12]
+    binary = zsign_binary()
+    if not binary:
+        raise SignError(f"找不到 zsign。装好后让它出现在 PATH 里，"
+                        f"或用 {ZSIGN_ENV}=/路径/zsign 指定。\n下载: {ZSIGN_HINT}")
+
+    cmd = [binary, "-k", p12]
     if p12_password:
         cmd += ["-p", p12_password]
     if provision:

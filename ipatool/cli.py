@@ -327,6 +327,21 @@ def cmd_certs(args) -> int:
     for n, i in enumerate(ids, 1):
         print(f"  {n:>2}) {i}")
     print("\n用法示例: --identity <上面的 ID 或名称>")
+
+    # 有证书但本机没有签名工具时，下一步必然踩坑（--sign auto 会落到 none），提前说清楚
+    try:
+        backend = signer.resolve_backend("auto")
+    except signer.SignError as e:
+        print(f"\n注意: {e}")
+        backend = "none"
+    if backend == "none":
+        print("\n注意: 本机没有可用的签名工具（macOS 的 codesign / 任意平台的 zsign），"
+              "下面这些证书列出来也用不上，注入时只会得到未签名 IPA：")
+        for line in signer.auto_backend_hint().splitlines():
+            print(f"  {line}")
+    elif backend == "zsign":
+        print("\n提示: 本机签名会走 zsign（非 macOS 上只能这样），"
+              "ID 签名会先从证书存储导出 p12 再交给 zsign")
     return 0
 
 
@@ -406,10 +421,16 @@ def _package_and_sign(args, root: str, payload: str, app, workdir: str,
     print(f"打包压缩    : {_zip_level_text(level)}")
 
     want_identity = args.identity if args.identity not in (None, "", "-") else None
-    if backend == "none" and (args.p12 or want_identity):
-        print("  警告: 当前环境没有可用的签名工具，已忽略证书参数，输出的是未签名 IPA")
-    elif backend == "none" and unsigned_warning:
-        print(f"  警告: {unsigned_warning}")
+    if backend == "none":
+        # 光说「没有可用的签名工具」没用，把原因和两条出路一起打出来
+        if args.sign == "auto":
+            print("  说明: --sign auto 没找到可用的签名工具，本次只注入、不签名")
+            for line in signer.auto_backend_hint().splitlines():
+                print(f"        {line}")
+        if args.p12 or want_identity:
+            print("  警告: 证书参数被忽略（本机没有可用的签名工具），输出的是未签名 IPA")
+        elif unsigned_warning:
+            print(f"  警告: {unsigned_warning}")
 
     sign_seconds = 0.0
     archive_seconds = 0.0
@@ -448,7 +469,9 @@ def _package_and_sign(args, root: str, payload: str, app, workdir: str,
             )
         else:
             _, archive_seconds = _timed(ipa_mod.archive, root, out, level)
-            print("  警告: 未找到可用的签名工具，输出的是未签名 IPA，设备无法直接安装")
+            # 显式 --sign none 是用户自己的选择，别再说「未找到可用的签名工具」
+            if args.sign != "none":
+                print("  警告: 未找到可用的签名工具，输出的是未签名 IPA，设备无法直接安装")
 
     if backend == "none":
         print(f"阶段耗时    : 打包 {archive_seconds:.1f}s")
