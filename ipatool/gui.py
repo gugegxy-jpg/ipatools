@@ -281,8 +281,9 @@ class IpatoolGui:
 
         hint = ttk.Label(
             box,
-            text="输入可以是 .ipa，也可以是已解包且含 Payload 的目录；输出留空则按默认名字生成（覆盖原文件时忽略此项）。",
-            style="Muted.TLabel",
+            text="输入可以是 .ipa，也可以是已解包且含 Payload 的目录；输出留空则按默认名字生成（覆盖原文件时忽略此项）。"
+                 "选中后不会自动解析，需要包内信息时点「读取信息」。",
+            style="Muted.TLabel", justify="left", wraplength=940,
         )
         hint.grid(row=1, column=0, columnspan=6, sticky="w", pady=(6, 0))
 
@@ -303,14 +304,25 @@ class IpatoolGui:
         )
         if not path:
             return
-        self.v_input.set(path)
-        self._load_info()
+        self._set_input_path(path)
 
     def _pick_input_dir(self) -> None:
         path = filedialog.askdirectory(title="选择已解包的目录（内含 Payload）")
         if path:
-            self.v_input.set(path)
-            self._load_info()
+            self._set_input_path(path)
+
+    def _set_input_path(self, path: str) -> None:
+        """
+        选中输入包后**不自动解析**：解析要解包 / 遍历整个包，只想注入和签名的人
+        根本不需要这一步。要看 Bundle ID / 名称时，点「读取信息」再读。
+        """
+        self.v_input.set(path)
+        self._append(
+            f"[输入] {path}\n"
+            "        已选中，未解析（只想注入 / 签名可以直接开始执行）。\n"
+            "        需要包内的 Bundle ID / 名称 / 内嵌 bundle 时，点「读取信息」。\n"
+        )
+        self._set_status("已选择输入（未解析）")
 
     def _pick_output(self) -> None:
         current = self.v_output.get().strip()
