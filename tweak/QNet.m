@@ -47,6 +47,7 @@
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 #import <QuartzCore/QuartzCore.h>
@@ -105,6 +106,12 @@ static IPATQnBucket gQnDown;
 static IPATQnBucket gQnUp;
 static uint64_t gQnDownBytes = 0;
 static uint64_t gQnUpBytes = 0;
+// 诊断用：到底有没有拦到调用（hook 有没有生效，一眼就能看出来）
+static uint64_t gQnHookCalls = 0;    // 进 hook 的总次数（含文件读写）
+static uint64_t gQnSockCalls = 0;    // 其中确实是 socket 的次数
+static uint64_t gQnDropped = 0;      // 被丢掉的包数
+// 0 = 还没自检，1 = 符号插入生效，-1 = 没生效（弱网一定不起作用）
+static int gQnHookVerified = 0;
 // 0 = 还没问过内核，1 = 是 socket，2 = 不是 socket（文件 / pipe 之类）
 static int8_t gQnFdKind[IPAT_QN_FD_MAX];
 
@@ -281,13 +288,43 @@ static void IPATQnAddStats(BOOL uplink, size_t bytes) {
     pthread_mutex_unlock(&gQnLock);
 }
 
+/// 记一次「hook 被调用了」——弹窗里靠它判断符号插入到底有没有生效
+static void IPATQnNoteCall(BOOL isSocket) {
+    pthread_mutex_lock(&gQnLock);
+    gQnHookCalls++;
+    if (isSocket) gQnSockCalls++;
+    pthread_mutex_unlock(&gQnLock);
+}
+
+static void IPATQnNoteDrop(void) {
+    pthread_mutex_lock(&gQnLock);
+    gQnDropped++;
+    pthread_mutex_unlock(&gQnLock);
+}
+
+static void IPATQnHookStats(uint64_t *calls, uint64_t *sockCalls, uint64_t *dropped) {
+    pthread_mutex_lock(&gQnLock);
+    if (calls) *calls = gQnHookCalls;
+    if (sockCalls) *sockCalls = gQnSockCalls;
+    if (dropped) *dropped = gQnDropped;
+    pthread_mutex_unlock(&gQnLock);
+}
+
+static int IPATQnHookState(void) {
+    pthread_mutex_lock(&gQnLock);
+    int state = gQnHookVerified;
+    pthread_mutex_unlock(&gQnLock);
+    return state;
+}
+
 #pragma mark - 拦截实现
 
 /// 上行：限速（阻塞调用线程）+ 丢包 + 延迟异步发送
 static ssize_t IPATQnSendHook(int fd, const void *buf, size_t nbytes, int flags,
                               const struct sockaddr *addr, socklen_t addrlen) {
-    if (nbytes == 0) return IPATQnRawSend(fd, buf, nbytes, flags, addr, addrlen);
-    if (!IPATQnIsSocketFd(fd)) return IPATQnRawSend(fd, buf, nbytes, flags, addr, addrlen);
+    BOOL isSocket = IPATQnIsSocketFd(fd);
+    IPATQnNoteCall(isSocket);
+    if (nbytes == 0 || !isSocket) return IPATQnRawSend(fd, buf, nbytes, flags, addr, addrlen);
 
     IPATQnConfig cfg = IPATQnSnapshot();
     IPATQnAddStats(YES, nbytes);
@@ -295,7 +332,10 @@ static ssize_t IPATQnSendHook(int fd, const void *buf, size_t nbytes, int flags,
     if (!cfg.enabled) return IPATQnRawSend(fd, buf, nbytes, flags, addr, addrlen);
 
     // 丢包：数据不发出去，但对游戏说「发了」，让它的重传逻辑自己跑起来
-    if (IPATQnHitLoss(cfg.lossPct)) return (ssize_t)nbytes;
+    if (IPATQnHitLoss(cfg.lossPct)) {
+        IPATQnNoteDrop();
+        return (ssize_t)nbytes;
+    }
 
     if (cfg.upKbps > 0) {
         pthread_mutex_lock(&gQnLock);
@@ -333,7 +373,9 @@ static ssize_t IPATQnSendHook(int fd, const void *buf, size_t nbytes, int flags,
 /// 下行：限速 + 延迟（阻塞在等数据的线程上）+ 丢包（丢掉这段，继续等下一个包）
 static ssize_t IPATQnRecvHook(int fd, void *buf, size_t nbytes, int flags,
                               struct sockaddr *addr, socklen_t *addrlen) {
-    if (!IPATQnIsSocketFd(fd)) return IPATQnRawRecv(fd, buf, nbytes, flags, addr, addrlen);
+    BOOL isSocket = IPATQnIsSocketFd(fd);
+    IPATQnNoteCall(isSocket);
+    if (!isSocket) return IPATQnRawRecv(fd, buf, nbytes, flags, addr, addrlen);
 
     IPATQnConfig cfg = IPATQnSnapshot();
     if (!cfg.enabled) {
@@ -358,6 +400,7 @@ static ssize_t IPATQnRecvHook(int fd, void *buf, size_t nbytes, int flags,
         }
         if (delayUs > 0) IPATQnSleepUs(delayUs);
         if (!IPATQnHitLoss(cfg.lossPct)) return got;
+        IPATQnNoteDrop();   // 这一段丢了，继续收下一个
     }
     return result;
 }
@@ -388,6 +431,82 @@ static ssize_t ipat_qn_read(int fd, void *buf, size_t nbytes) {
 static ssize_t ipat_qn_write(int fd, const void *buf, size_t nbytes) {
     if (!IPATQnIsSocketFd(fd)) return (ssize_t)syscall(SYS_write, fd, buf, nbytes);
     return IPATQnSendHook(fd, buf, nbytes, 0, NULL, 0);
+}
+
+/// 不少网络库（尤其引擎自带的那套）走的是 sendmsg / writev，不是 send，
+/// 只插 send/recv 就会「参数调了但完全没感觉」。这几个入口一并补上。
+/// 保守的地方：带控制消息、一次收多段的，一律交回原函数——宁可不限速，
+/// 也不能为了限速把数据弄丢。
+static ssize_t ipat_qn_sendmsg(int fd, const struct msghdr *msg, int flags) {
+    if (!msg || !msg->msg_iov || msg->msg_iovlen <= 0 || msg->msg_control) {
+        return sendmsg(fd, msg, flags);
+    }
+    BOOL isSocket = IPATQnIsSocketFd(fd);
+    IPATQnNoteCall(isSocket);
+    if (!isSocket) return sendmsg(fd, msg, flags);
+
+    size_t total = 0;
+    for (int i = 0; i < msg->msg_iovlen; i++) total += msg->msg_iov[i].iov_len;
+    void *buf = total > 0 ? malloc(total) : NULL;
+    if (!buf) return sendmsg(fd, msg, flags);
+    size_t off = 0;
+    for (int i = 0; i < msg->msg_iovlen; i++) {
+        if (msg->msg_iov[i].iov_len > 0 && msg->msg_iov[i].iov_base) {
+            memcpy((char *)buf + off, msg->msg_iov[i].iov_base, msg->msg_iov[i].iov_len);
+            off += msg->msg_iov[i].iov_len;
+        }
+    }
+    // sendmsg / recvmsg / writev / readv 我们不插桩，所以这里直接调 libc 就是原函数
+    ssize_t sent = IPATQnSendHook(fd, buf, total, flags,
+                                  (const struct sockaddr *)msg->msg_name, msg->msg_namelen);
+    free(buf);
+    return sent;
+}
+
+static ssize_t ipat_qn_recvmsg(int fd, struct msghdr *msg, int flags) {
+    if (!msg || !msg->msg_iov || msg->msg_iovlen != 1) return recvmsg(fd, msg, flags);
+    BOOL isSocket = IPATQnIsSocketFd(fd);
+    IPATQnNoteCall(isSocket);
+    if (!isSocket) return recvmsg(fd, msg, flags);
+
+    struct iovec *iov = msg->msg_iov;
+    ssize_t got = IPATQnRecvHook(fd, iov[0].iov_base, iov[0].iov_len, flags,
+                                 (struct sockaddr *)msg->msg_name, &msg->msg_namelen);
+    if (got < 0) return got;
+    iov[0].iov_len = (size_t)got;
+    msg->msg_controllen = 0;   // 控制消息没处理，如实说 0，别让调用方读到脏数据
+    msg->msg_flags = 0;
+    return got;
+}
+
+static ssize_t ipat_qn_writev(int fd, const struct iovec *iov, int iovcnt) {
+    if (!iov || iovcnt <= 0) return writev(fd, iov, iovcnt);
+    BOOL isSocket = IPATQnIsSocketFd(fd);
+    IPATQnNoteCall(isSocket);
+    if (!isSocket) return writev(fd, iov, iovcnt);
+
+    size_t total = 0;
+    for (int i = 0; i < iovcnt; i++) total += iov[i].iov_len;
+    void *buf = total > 0 ? malloc(total) : NULL;
+    if (!buf) return writev(fd, iov, iovcnt);
+    size_t off = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        if (iov[i].iov_len > 0 && iov[i].iov_base) {
+            memcpy((char *)buf + off, iov[i].iov_base, iov[i].iov_len);
+            off += iov[i].iov_len;
+        }
+    }
+    ssize_t sent = IPATQnSendHook(fd, buf, total, 0, NULL, 0);
+    free(buf);
+    return sent;
+}
+
+static ssize_t ipat_qn_readv(int fd, const struct iovec *iov, int iovcnt) {
+    if (!iov || iovcnt != 1 || !iov[0].iov_base) return readv(fd, iov, iovcnt);
+    BOOL isSocket = IPATQnIsSocketFd(fd);
+    IPATQnNoteCall(isSocket);
+    if (!isSocket) return readv(fd, iov, iovcnt);
+    return IPATQnRecvHook(fd, iov[0].iov_base, iov[0].iov_len, 0, NULL, NULL);
 }
 
 static int ipat_qn_close(int fd) {
@@ -531,6 +650,7 @@ static void IPATQnApplyPreset(NSInteger index) {
 @property (nonatomic, strong) NSMutableArray<UISlider *> *sliders;
 @property (nonatomic, strong) NSMutableArray<UILabel *> *valueLabels;
 @property (nonatomic, strong) UILabel *rateLabel;
+@property (nonatomic, strong) UILabel *hookLabel;         // 拦截诊断：到底拦没拦到
 @property (nonatomic, strong) UIView *headerView;          // 标题栏，拖动窗口的地方
 @property (nonatomic, strong) UIScrollView *scrollView;   // 横屏高度不够时内容可以滚
 @property (nonatomic, assign) CGFloat contentHeight;
@@ -645,7 +765,17 @@ static void IPATQnApplyPreset(NSInteger index) {
     rate.font = [UIFont systemFontOfSize:12.0];
     [self.scrollView addSubview:rate];
     self.rateLabel = rate;
-    y += 28.0;
+    y += 22.0;
+
+    // 拦截诊断：看这一行就知道弱网为什么没反应
+    UILabel *hookInfo = [[UILabel alloc] initWithFrame:CGRectMake(margin, y, rowWidth, 30.0)];
+    hookInfo.text = @"";
+    hookInfo.textColor = [UIColor colorWithWhite:1.0 alpha:0.55];
+    hookInfo.font = [UIFont systemFontOfSize:10.0];
+    hookInfo.numberOfLines = 2;
+    [self.scrollView addSubview:hookInfo];
+    self.hookLabel = hookInfo;
+    y += 34.0;
 
     CGFloat buttonWidth = (rowWidth - 8.0 * 4) / 5.0;
     for (NSInteger i = 0; i < 5; i++) {
@@ -701,6 +831,7 @@ static void IPATQnApplyPreset(NSInteger index) {
             self.valueLabels[i].text = IPATQnParamText(param, value);
         }
     }
+    [self updateHookInfo];
 }
 
 - (void)handleToggle:(UISwitch *)sender {
@@ -768,9 +899,27 @@ static void IPATQnApplyPreset(NSInteger index) {
         self.rateLabel.text = [NSString stringWithFormat:@"实时 ↑ %.0f KB/s  ↓ %.0f KB/s",
                                upRate, downRate];
     }
+    [self updateHookInfo];
     lastUp = up;
     lastDown = down;
     lastTime = now;
+}
+
+/// 「到底拦没拦到」——参数不生效时先看这一行：
+/// 拦截次数不涨 = 这个 App 的网络没走我们插桩的函数；次数一直涨但速率是 0 = 真的没流量
+- (void)updateHookInfo {
+    uint64_t calls = 0;
+    uint64_t socketCalls = 0;
+    uint64_t dropped = 0;
+    IPATQnHookStats(&calls, &socketCalls, &dropped);
+    if (IPATQnHookState() < 0) {
+        self.hookLabel.text = @"注意：符号插入没生效，弱网对当前 App 不起作用";
+        self.hookLabel.textColor = [UIColor orangeColor];
+        return;
+    }
+    self.hookLabel.textColor = [UIColor colorWithWhite:1.0 alpha:0.55];
+    self.hookLabel.text = [NSString stringWithFormat:@"拦截 %llu 次（网络 %llu 次，丢包 %llu）",
+                           calls, socketCalls, dropped];
 }
 
 @end
@@ -1103,6 +1252,20 @@ static void IPATQnApplyPreset(NSInteger index) {
 __attribute__((constructor)) static void IPATQNetInit(void) {
     // 早点把配置装好：网络可能在 UI 起来之前就开始跑了
     IPATQnReloadConfig();
+    // 自检：故意拿一个无效 fd 调一次 send，看有没有被自己的 hook 拦到。
+    // 拦到了就说明 dyld 的符号插入生效，弱网才真的起作用；拦不到的话，
+    // 弹窗里会直接写清楚，免得参数调了半天没反应还不知道为什么。
+    uint64_t before = 0;
+    uint64_t after = 0;
+    IPATQnHookStats(&before, NULL, NULL);
+    send(-1, NULL, 0, 0);   // 必然失败（EBADF），只是借它走一遍 hook
+    IPATQnHookStats(&after, NULL, NULL);
+    pthread_mutex_lock(&gQnLock);
+    gQnHookVerified = (after > before) ? 1 : -1;
+    pthread_mutex_unlock(&gQnLock);
+    IPATQnLog(@"hook 自检：%@（拦截计数 %llu → %llu）",
+              after > before ? @"符号插入生效" : @"符号插入没生效，弱网不会起作用",
+              before, after);
     dispatch_async(dispatch_get_main_queue(), ^{
         [[IPATQnBridge shared] start];
     });
