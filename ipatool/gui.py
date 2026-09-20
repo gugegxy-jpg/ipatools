@@ -373,11 +373,48 @@ class IpatoolGui:
         bar_y.grid(row=0, column=1, sticky="ns")
         self.info_detail.configure(yscrollcommand=bar_y.set)
 
+    def _scroll_page(self, title: str) -> ttk.Frame:
+        """
+        一个可以滚动的页签：内容比窗口高时出现竖向滚动条，而不是被裁掉。
+        返回内层 Frame，往里加控件即可（用法和普通页签一样）。
+        """
+        outer = ttk.Frame(self.nb)
+        self.nb.add(outer, text=title)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(outer, background=BG, highlightthickness=0, borderwidth=0)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        vbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        vbar.grid(row=0, column=1, sticky="ns")
+        canvas.configure(yscrollcommand=vbar.set)
+
+        inner = ttk.Frame(canvas, padding=(10, 8, 10, 8))
+        window = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window, width=e.width))
+
+        def _wheel(event):
+            # 多行文本 / 列表自己会滚，别抢它们的滚轮
+            if isinstance(event.widget, (tk.Text, tk.Listbox)):
+                return None
+            delta = getattr(event, "delta", 0)
+            if not delta:
+                return None
+            step = int(-delta / 120) if abs(delta) >= 120 else (-1 if delta > 0 else 1)
+            canvas.yview_scroll(step or 1, "units")
+            return "break"
+
+        # 子控件会吃掉滚轮事件，所以鼠标进本页时临时挂个全局绑定，离开就摘掉
+        canvas.bind("<MouseWheel>", _wheel)
+        outer.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _wheel))
+        outer.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+        return inner
+
     # ---- 修改 --------------------------------------------------------- #
     def _build_modify_tab(self) -> None:
-        page = ttk.Frame(self.nb, padding=10)
-        self.nb.add(page, text="  改 ID / 名称  ")
-        page.columnconfigure(0, weight=1)
+        page = self._scroll_page("  改 ID / 名称  ")
 
         box = self._group(page, "新的标识", 0)
         self._entry(box, 0, "Bundle Identifier", self.v_bundle_id, "如 com.company.newapp（留空表示不改）")
@@ -403,9 +440,7 @@ class IpatoolGui:
 
     # ---- 注入 --------------------------------------------------------- #
     def _build_inject_tab(self) -> None:
-        page = ttk.Frame(self.nb, padding=12)
-        self.nb.add(page, text="  注入 dylib  ")
-        page.columnconfigure(0, weight=1)
+        page = self._scroll_page("  注入 dylib  ")
 
         box = self._group(page, "要注入的 dylib", 0)
         wrap = ttk.Frame(box)
@@ -459,9 +494,7 @@ class IpatoolGui:
 
     # ---- 签名 --------------------------------------------------------- #
     def _build_sign_tab(self) -> None:
-        page = ttk.Frame(self.nb, padding=10)
-        self.nb.add(page, text="  签名  ")
-        page.columnconfigure(0, weight=1)
+        page = self._scroll_page("  签名  ")
 
         box = self._group(page, "签名方式（二选一，都不给则 ad-hoc 签名，真机装不上）", 0)
         ttk.Label(box, text="后端").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=3)
@@ -470,8 +503,9 @@ class IpatoolGui:
             state="readonly", width=14,
         ).grid(row=0, column=1, sticky="w", pady=3)
         ttk.Label(
-            box, style="Muted.TLabel",
-            text="auto：macOS 用 codesign，否则用 zsign；none 只重打包不签名",
+            box, style="Muted.TLabel", justify="left", wraplength=420,
+            text="auto：macOS 用 codesign，非 macOS 用 zsign（要装；也可用环境变量 "
+                 "IPATOOL_ZSIGN 指路径）；none 只重打包不签名",
         ).grid(row=0, column=2, sticky="w", padx=(10, 0), pady=3)
 
         ttk.Label(box, text="ID 签名").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=3)
@@ -501,8 +535,9 @@ class IpatoolGui:
             values=["auto", "0", "1", "3", "6", "9"],
         ).grid(row=3, column=1, sticky="w", padx=(0, 8), pady=(6, 3))
         ttk.Label(
-            opt, style="Muted.TLabel",
-            text="auto：已压缩资源直接存储；0 全部存储最快；1-9 deflate，越小越快",
+            opt, style="Muted.TLabel", justify="left", wraplength=420,
+            text="auto：已压缩资源直接存储；0 全部存储最快；1-9 deflate，越小越快。"
+                 "注入和签名本来就是同一次里做完的，不用再跑第二个工具",
         ).grid(row=3, column=2, sticky="w", pady=(6, 3))
 
     # ------------------------------------------------------------------ #
@@ -532,7 +567,7 @@ class IpatoolGui:
         log_box.columnconfigure(0, weight=1)
         log_box.rowconfigure(0, weight=1)
         self.log = tk.Text(
-            log_box, height=12, wrap="word", state="disabled", font=("Consolas", 9),
+            log_box, height=9, wrap="word", state="disabled", font=("Consolas", 9),
             background=CARD, foreground=TEXT, relief="solid", borderwidth=1,
             highlightthickness=1, highlightcolor=BORDER, highlightbackground=BORDER,
             insertbackground=TEXT,
