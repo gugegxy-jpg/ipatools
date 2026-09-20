@@ -7,8 +7,13 @@
 //       （send / sendto / recv / recvfrom / read / write），系统设置、Wi-Fi、
 //       其它 App 的网络完全不受影响，也不用装描述文件 / VPN / 代理。
 //    2. 拦截方式用 dyld 的 __DATA,__interpose（系统自带的符号插入，不需要第三方库）：
-//       我们只替换 libc 的 socket 读写函数。原函数一律用 syscall() 直接调内核，
-//       不走 libc 符号，所以不会递归回自己的实现。
+//       替换 libc 的 socket 读写函数（send / sendto / sendmsg / recv / recvfrom /
+//       recvmsg / read / write / readv / writev / close）。原函数一律用 syscall()
+//       直接调内核，不走 libc 符号，所以不会递归回自己的实现。
+//       两个必须知道的边界：符号插入对「声明它的镜像自己」不生效（dyld 防递归），
+//       所以别用「在自己 dylib 里调 send 看计数」来判断有没有生效；插入表也不回溯
+//       已经绑定好的指针，来自 CFNetwork 这类共享缓存库里、启动早期就绑完的调用点
+//       可能拦不到（那种情况只能靠运行时重绑定，见 IPATQnInterposeEntryCount 附近）。
 //    3. 四类参数，全部可以在游戏里的弹窗中实时调：
 //         下行带宽 / 上行带宽（KB/s，0 = 不限，令牌桶限速）
 //         延迟（ms，单向附加延迟）+ 抖动（ms，在延迟上随机 ±抖动）
@@ -23,9 +28,12 @@
 //    5. 实时速率：统计上下行字节数，弹窗里每 0.5 秒刷一次，方便对照限速有没有生效。
 //
 //  已知边界（说在前面，免得到时候当成 bug）：
-//    - 只对「被注入的进程里、跑在 libc 之上的 socket 调用」生效。游戏自己用
-//      NSURLSession / 引擎自带网络库的，最终一般都会走到 send/recv；个别引擎
-//      用 sendmsg / recvmsg 的直接调用不受影响。
+//    - 只对「被注入的进程里、经过 dyld 绑定的 socket 调用」生效。引擎自带网络库
+//      （Unity / UE 那套）一般走 send / recv / sendmsg，都插到了；但 NSURLSession
+//      这类走 CFNetwork（在 dyld 共享缓存里、启动早期就绑定完）的调用点可能拦不到，
+//      面板上会显示「hook 已装载，但没拦到网络调用」。
+//    - Interpose 段被裁掉（-dead_strip 之类）时不会自动报错，启动日志里会打印
+//      「hook 段自检：N 条 __interpose 条目」，N 为 0 就是注入的包不对。
 //    - 符号插入对「已经绑定过的调用」不追溯：第一次调用时才生效，
 //      所以启动瞬间建立的连接可能不受限，之后新建的连接一定生效。
 //    - 丢包会让游戏自己的重传/超时逻辑跑起来，这正是弱网测试要看的东西。
@@ -42,7 +50,9 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #include <dispatch/dispatch.h>
+#include <dlfcn.h>
 #include <errno.h>
+#include <mach-o/loader.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdlib.h>
@@ -113,7 +123,9 @@ static uint64_t gQnUpBytes = 0;
 static uint64_t gQnHookCalls = 0;    // 进 hook 的总次数（含文件读写）
 static uint64_t gQnSockCalls = 0;    // 其中确实是 socket 的次数
 static uint64_t gQnDropped = 0;      // 被丢掉的包数
-// 0 = 还没自检，1 = 符号插入生效，-1 = 没生效（弱网一定不起作用）
+// 0 = 还没自检，1 = 本 dylib 里有 __interpose 段（hook 随镜像装好了），
+// -1 = 段不存在（注入的是旧包 / 段被裁掉，弱网一定不起作用）。
+// 注意这不是「拦到过调用」的证明：那要看下面的拦截计数。
 static int gQnHookVerified = 0;
 // 0 = 还没问过内核，1 = 是 socket，2 = 不是 socket（文件 / pipe 之类）
 static int8_t gQnFdKind[IPAT_QN_FD_MAX];
@@ -193,6 +205,25 @@ static ssize_t IPATQnRawSend(int fd, const void *buf, size_t nbytes, int flags,
 static ssize_t IPATQnRawRecv(int fd, void *buf, size_t nbytes, int flags,
                              struct sockaddr *addr, socklen_t *addrlen) {
     return (ssize_t)syscall(SYS_recvfrom, fd, buf, nbytes, flags, addr, addrlen);
+}
+
+/// 下面几个入口我们也插了桩，所以「原函数」一律走 syscall 直接进内核，
+/// 否则在我们的实现里再调一次 libc 就会绕回自己（递归）。
+
+static ssize_t IPATQnRawSendMsg(int fd, const struct msghdr *msg, int flags) {
+    return (ssize_t)syscall(SYS_sendmsg, fd, msg, flags);
+}
+
+static ssize_t IPATQnRawRecvMsg(int fd, struct msghdr *msg, int flags) {
+    return (ssize_t)syscall(SYS_recvmsg, fd, msg, flags);
+}
+
+static ssize_t IPATQnRawWriteV(int fd, const struct iovec *iov, int iovcnt) {
+    return (ssize_t)syscall(SYS_writev, fd, iov, iovcnt);
+}
+
+static ssize_t IPATQnRawReadV(int fd, const struct iovec *iov, int iovcnt) {
+    return (ssize_t)syscall(SYS_readv, fd, iov, iovcnt);
 }
 
 static void IPATQnBucketReset(IPATQnBucket *bucket, double bytesPerSec) {
@@ -440,22 +471,23 @@ static ssize_t ipat_qn_write(int fd, const void *buf, size_t nbytes) {
     return IPATQnSendHook(fd, buf, nbytes, 0, NULL, 0);
 }
 
-/// 不少网络库（尤其引擎自带的那套）走的是 sendmsg / writev，不是 send，
+/// 不少网络库（尤其引擎自带的那套、以及走了 sendmsg 的 CFNetwork/libnetwork）
+/// 走的是 sendmsg / recvmsg / writev / readv，不是 send/recv，
 /// 只插 send/recv 就会「参数调了但完全没感觉」。这几个入口一并补上。
-/// 保守的地方：带控制消息、一次收多段的，一律交回原函数——宁可不限速，
-/// 也不能为了限速把数据弄丢。
+/// 保守的地方：带控制消息（SCM_* 辅助数据）、一次收多段的，一律交回原函数——
+/// 宁可不限速，也不能为了限速把数据弄丢或把控制消息吃掉。
 static ssize_t ipat_qn_sendmsg(int fd, const struct msghdr *msg, int flags) {
     if (!msg || !msg->msg_iov || msg->msg_iovlen <= 0 || msg->msg_control) {
-        return sendmsg(fd, msg, flags);
+        return IPATQnRawSendMsg(fd, msg, flags);
     }
     BOOL isSocket = IPATQnIsSocketFd(fd);
     IPATQnNoteCall(isSocket);
-    if (!isSocket) return sendmsg(fd, msg, flags);
+    if (!isSocket) return IPATQnRawSendMsg(fd, msg, flags);
 
     size_t total = 0;
     for (int i = 0; i < msg->msg_iovlen; i++) total += msg->msg_iov[i].iov_len;
     void *buf = total > 0 ? malloc(total) : NULL;
-    if (!buf) return sendmsg(fd, msg, flags);
+    if (!buf) return IPATQnRawSendMsg(fd, msg, flags);
     size_t off = 0;
     for (int i = 0; i < msg->msg_iovlen; i++) {
         if (msg->msg_iov[i].iov_len > 0 && msg->msg_iov[i].iov_base) {
@@ -463,7 +495,6 @@ static ssize_t ipat_qn_sendmsg(int fd, const struct msghdr *msg, int flags) {
             off += msg->msg_iov[i].iov_len;
         }
     }
-    // sendmsg / recvmsg / writev / readv 我们不插桩，所以这里直接调 libc 就是原函数
     ssize_t sent = IPATQnSendHook(fd, buf, total, flags,
                                   (const struct sockaddr *)msg->msg_name, msg->msg_namelen);
     free(buf);
@@ -471,10 +502,12 @@ static ssize_t ipat_qn_sendmsg(int fd, const struct msghdr *msg, int flags) {
 }
 
 static ssize_t ipat_qn_recvmsg(int fd, struct msghdr *msg, int flags) {
-    if (!msg || !msg->msg_iov || msg->msg_iovlen != 1) return recvmsg(fd, msg, flags);
+    if (!msg || !msg->msg_iov || msg->msg_iovlen != 1 || msg->msg_control) {
+        return IPATQnRawRecvMsg(fd, msg, flags);
+    }
     BOOL isSocket = IPATQnIsSocketFd(fd);
     IPATQnNoteCall(isSocket);
-    if (!isSocket) return recvmsg(fd, msg, flags);
+    if (!isSocket) return IPATQnRawRecvMsg(fd, msg, flags);
 
     struct iovec *iov = msg->msg_iov;
     ssize_t got = IPATQnRecvHook(fd, iov[0].iov_base, iov[0].iov_len, flags,
@@ -487,15 +520,15 @@ static ssize_t ipat_qn_recvmsg(int fd, struct msghdr *msg, int flags) {
 }
 
 static ssize_t ipat_qn_writev(int fd, const struct iovec *iov, int iovcnt) {
-    if (!iov || iovcnt <= 0) return writev(fd, iov, iovcnt);
+    if (!iov || iovcnt <= 0) return IPATQnRawWriteV(fd, iov, iovcnt);
     BOOL isSocket = IPATQnIsSocketFd(fd);
     IPATQnNoteCall(isSocket);
-    if (!isSocket) return writev(fd, iov, iovcnt);
+    if (!isSocket) return IPATQnRawWriteV(fd, iov, iovcnt);
 
     size_t total = 0;
     for (int i = 0; i < iovcnt; i++) total += iov[i].iov_len;
     void *buf = total > 0 ? malloc(total) : NULL;
-    if (!buf) return writev(fd, iov, iovcnt);
+    if (!buf) return IPATQnRawWriteV(fd, iov, iovcnt);
     size_t off = 0;
     for (int i = 0; i < iovcnt; i++) {
         if (iov[i].iov_len > 0 && iov[i].iov_base) {
@@ -509,10 +542,12 @@ static ssize_t ipat_qn_writev(int fd, const struct iovec *iov, int iovcnt) {
 }
 
 static ssize_t ipat_qn_readv(int fd, const struct iovec *iov, int iovcnt) {
-    if (!iov || iovcnt != 1 || !iov[0].iov_base) return readv(fd, iov, iovcnt);
+    if (!iov || iovcnt != 1 || !iov[0].iov_base || !iov[0].iov_len) {
+        return IPATQnRawReadV(fd, iov, iovcnt);
+    }
     BOOL isSocket = IPATQnIsSocketFd(fd);
     IPATQnNoteCall(isSocket);
-    if (!isSocket) return readv(fd, iov, iovcnt);
+    if (!isSocket) return IPATQnRawReadV(fd, iov, iovcnt);
     return IPATQnRecvHook(fd, iov[0].iov_base, iov[0].iov_len, 0, NULL, NULL);
 }
 
@@ -526,7 +561,15 @@ static int ipat_qn_close(int fd) {
     return (int)syscall(SYS_close, fd);
 }
 
-/// dyld 的符号插入：{新函数, 被替换的函数}。系统自带的机制，不需要 fishhook
+/// dyld 的符号插入：{新函数, 被替换的函数}。系统自带的机制，不需要 fishhook。
+/// 三个必须知道的边界：
+///   1) 插入**对声明它的镜像自己不生效**（dyld 的 InterposeTupleSpecific 里带
+///      onlyImage = this，防止 hook 实现递归）。所以「在自己 dylib 里调一次 send
+///      看计数涨没涨」这种自检永远得到"没生效"，是误报，别拿它当判据。
+///   2) 插入表只管「绑定动作发生在它建立之后」的调用，不回溯已绑好的指针。
+///   3) 调用点在系统库（CFNetwork / libnetwork，它们在 dyld 共享缓存里，
+///      启动早期就绑定完了）里的，可能压根拦不到——这类只能靠运行时重绑定。
+/// 判断有没有真的拦到，只看运行期的拦截计数（见弹窗那行）。
 #define IPAT_QN_INTERPOSE(replacement, target) \
     __attribute__((used, section("__DATA,__interpose"))) \
     static struct { const void *replacement; const void *replacee; } \
@@ -534,11 +577,44 @@ static int ipat_qn_close(int fd) {
 
 IPAT_QN_INTERPOSE(ipat_qn_send, send)
 IPAT_QN_INTERPOSE(ipat_qn_sendto, sendto)
+IPAT_QN_INTERPOSE(ipat_qn_sendmsg, sendmsg)
 IPAT_QN_INTERPOSE(ipat_qn_recv, recv)
 IPAT_QN_INTERPOSE(ipat_qn_recvfrom, recvfrom)
+IPAT_QN_INTERPOSE(ipat_qn_recvmsg, recvmsg)
 IPAT_QN_INTERPOSE(ipat_qn_read, read)
 IPAT_QN_INTERPOSE(ipat_qn_write, write)
+IPAT_QN_INTERPOSE(ipat_qn_readv, readv)
+IPAT_QN_INTERPOSE(ipat_qn_writev, writev)
 IPAT_QN_INTERPOSE(ipat_qn_close, close)
+
+/// 数一下本 dylib 里 __interpose 段有几个条目（0 = 段没了，注入的多半是旧包）。
+/// 段名会以字面量出现在 section header 里，所以这里直接翻自己的 Mach-O 头。
+static int IPATQnInterposeEntryCount(void) {
+    Dl_info info;
+    if (dladdr((const void *)&IPATQnInterposeEntryCount, &info) == 0 || info.dli_fbase == NULL) {
+        return -1;
+    }
+    const struct mach_header_64 *header = (const struct mach_header_64 *)info.dli_fbase;
+    if (header->magic != MH_MAGIC_64) return -1;
+    const uint8_t *cursor = (const uint8_t *)header + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < header->ncmds; i++) {
+        const struct load_command *cmd = (const struct load_command *)cursor;
+        if (cmd->cmdsize < sizeof(struct load_command)) break;
+        if (cmd->cmd == LC_SEGMENT_64 &&
+            cmd->cmdsize >= sizeof(struct segment_command_64)) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)cmd;
+            const struct section_64 *sect = (const struct section_64 *)(seg + 1);
+            for (uint32_t s = 0; s < seg->nsects; s++, sect++) {
+                if (strncmp(sect->sectname, "__interpose", sizeof(sect->sectname)) == 0) {
+                    // 一条条目是 {replacement, replacee} 两个指针
+                    return (int)(sect->size / (2 * sizeof(void *)));
+                }
+            }
+        }
+        cursor += cmd->cmdsize;
+    }
+    return 0;
+}
 
 #pragma mark - 参数定义
 
@@ -1241,21 +1317,31 @@ static NSString *IPATQnPresetSummary(IPATQnPresetItem *item) {
     lastTime = now;
 }
 
-/// 「到底拦没拦到」——参数不生效时先看这一行：
-/// 拦截次数不涨 = 这个 App 的网络没走我们插桩的函数；次数一直涨但速率是 0 = 真的没流量
+/// 「到底拦没拦到」——参数不生效时先看这一行。三种状态：
+///   段没了        → 注入的是旧包 / QNet 没编进去
+///   拦到 0 次网络 → hook 装好了，但这个 App 的流量不走这些函数（引擎用别的入口，
+///                   或调用点在 CFNetwork 这类启动早期就绑定好的系统库里）
+///   拦到 N 次网络 → hook 真的在工作，这时再不生效就看参数 / 开关
 - (void)updateHookInfo {
     uint64_t calls = 0;
     uint64_t socketCalls = 0;
     uint64_t dropped = 0;
     IPATQnHookStats(&calls, &socketCalls, &dropped);
+
     if (IPATQnHookState() < 0) {
-        self.hookLabel.text = @"注意：符号插入没生效，弱网对当前 App 不起作用";
         self.hookLabel.textColor = [UIColor orangeColor];
+        self.hookLabel.text = @"本 dylib 没有 __interpose 段，弱网不会生效（注入的是旧包？）";
+        return;
+    }
+    if (socketCalls == 0) {
+        self.hookLabel.textColor = [UIColor orangeColor];
+        self.hookLabel.text = [NSString stringWithFormat:
+            @"hook 已装载，但没拦到网络调用（已放行 %llu 次文件读写）", calls];
         return;
     }
     self.hookLabel.textColor = [UIColor colorWithWhite:1.0 alpha:0.55];
-    self.hookLabel.text = [NSString stringWithFormat:@"拦截 %llu 次（网络 %llu 次，丢包 %llu）",
-                           calls, socketCalls, dropped];
+    self.hookLabel.text = [NSString stringWithFormat:@"已拦到 %llu 次网络调用（丢包 %llu）",
+                           socketCalls, dropped];
 }
 
 @end
@@ -1595,20 +1681,31 @@ static NSString *IPATQnPresetSummary(IPATQnPresetItem *item) {
 __attribute__((constructor)) static void IPATQNetInit(void) {
     // 早点把配置装好：网络可能在 UI 起来之前就开始跑了
     IPATQnReloadConfig();
-    // 自检：故意拿一个无效 fd 调一次 send，看有没有被自己的 hook 拦到。
-    // 拦到了就说明 dyld 的符号插入生效，弱网才真的起作用；拦不到的话，
-    // 弹窗里会直接写清楚，免得参数调了半天没反应还不知道为什么。
-    uint64_t before = 0;
-    uint64_t after = 0;
-    IPATQnHookStats(&before, NULL, NULL);
-    send(-1, NULL, 0, 0);   // 必然失败（EBADF），只是借它走一遍 hook
-    IPATQnHookStats(&after, NULL, NULL);
+
+    // 自检只看一件事：本 dylib 里 __interpose 段在不在（在 = hook 随镜像一起装好了）。
+    // 以前是「在本镜像里调一次 send(-1,…) 看计数涨没涨」——那是错的：
+    // dyld 的符号插入对声明它的镜像自己刻意不生效（防递归），所以那种自检
+    // 永远报"没生效"，纯属误报。真正的判据是运行期的拦截计数：
+    // 计数一直不涨，说明这个 App 的网络没走我们插桩的入口（引擎用别的函数、
+    // 或者调用点在 CFNetwork 这类启动早期就绑定好的系统库里）。
+    int entries = IPATQnInterposeEntryCount();
     pthread_mutex_lock(&gQnLock);
-    gQnHookVerified = (after > before) ? 1 : -1;
+    gQnHookVerified = entries > 0 ? 1 : -1;
     pthread_mutex_unlock(&gQnLock);
-    IPATQnLog(@"hook 自检：%@（拦截计数 %llu → %llu）",
-              after > before ? @"符号插入生效" : @"符号插入没生效，弱网不会起作用",
-              before, after);
+
+    IPATQnConfig cfg = IPATQnSnapshot();
+    NSDictionary *plistCfg = IPATQnPlistConfig();
+    IPATQnLog(@"hook 段自检：%d 条 __interpose 条目%@", entries,
+              entries > 0 ? @"" : @"（可疑：注入的是旧包，或段被裁掉了）");
+    // 下面几行是给「换过宿主」的场景看的（比如 LiveContainer / 别的启动器）：
+    // 一眼能看出 plist 和 NSUserDefaults 到底读到了什么、进程是谁。
+    IPATQnLog(@"进程：bundle=%@ exe=%@",
+              [[NSBundle mainBundle] bundleIdentifier] ?: @"(nil)",
+              [[NSBundle mainBundle] executablePath] ?: @"(nil)");
+    IPATQnLog(@"配置来源：Info.plist 的 IPAToolQNet %@；最终生效值 enabled=%d 下行=%d 上行=%d 延迟=%d 抖动=%d 丢包=%d",
+              plistCfg.count > 0 ? @"找到了" : @"没找到",
+              cfg.enabled, cfg.downKbps, cfg.upKbps, cfg.delayMs, cfg.jitterMs, cfg.lossPct);
+
     dispatch_async(dispatch_get_main_queue(), ^{
         [[IPATQnBridge shared] start];
     });
