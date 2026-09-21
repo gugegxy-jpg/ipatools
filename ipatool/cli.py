@@ -234,11 +234,23 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "给插件 dylib 单独签名。iOS 的 library validation 要求插件和主 App 同一个 Team ID，\n"
             "所以插件必须用签主 App 的那把证书签，否则 dlopen 会报 code signature invalid。\n"
-            "只能走 codesign 后端（macOS）：zsign 只能签整个 IPA。"
+            "后端 --sign auto：macOS 上用 codesign，其他平台用项目自带的 zsign；\n"
+            "zsign 需要 --p12 证书（可选 --provision 描述文件），无法用系统证书身份。"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     psd.add_argument("dylib", help="要签名的 .dylib 文件")
+    psd.add_argument(
+        "-o", "--output",
+        help="签名后输出路径；省略则就地签名（会先签到临时文件再写回，避免读写同一文件）",
+    )
+    psd.add_argument(
+        "--sign", default="auto", choices=("auto", "codesign", "zsign"),
+        help="签名后端：auto / codesign（macOS） / zsign（跨平台，需 --p12）",
+    )
+    psd.add_argument(
+        "--provision", help="描述文件 .mobileprovision（zsign 签 dylib 建议带，确保 Team ID 一致）",
+    )
     psd.add_argument(
         "--identity",
         help="证书名称或 SHA-1，和重签 App 时用的那把一致（如 'Apple Development: x (TEAMID)'）",
@@ -472,20 +484,43 @@ def cmd_signdylib(args) -> int:
 
     运行时 dlopen 的库必须自带有效签名，而且和主 App 同一个 Team ID
     （iOS 的 library validation），所以插件要用签 App 的那把证书签。
+    后端 --sign auto：macOS 走 codesign，其他平台走 zsign（需 --p12）。
     """
     path = os.path.abspath(args.dylib)
     if not os.path.isfile(path):
         print(f"错误：找不到文件 {path}", file=sys.stderr)
         return 2
     if not ipa_mod.is_macho(path):
-        print(f"警告：{path} 不是 Mach-O 文件，codesign 多半会失败", file=sys.stderr)
+        print(f"警告：{path} 不是 Mach-O 文件，签名多半会失败", file=sys.stderr)
 
     try:
-        signer.resolve_backend("codesign")
+        backend = signer.resolve_backend(args.sign)
     except signer.SignError as e:
         print(f"失败: {e}", file=sys.stderr)
-        print("提示：给单个 dylib 签名只能用 codesign（macOS），zsign 只能签整个 IPA", file=sys.stderr)
         return 1
+    if backend == "none":
+        print("警告：--sign none 不会给 dylib 签名（无意义），已跳过")
+        return 0
+
+    out_path = os.path.abspath(args.output) if args.output else path
+    inplace = (out_path == path)
+    orig_mode = os.stat(path).st_mode if inplace else None
+
+    # 就地签名统一签到临时文件：原文件全程不被动，签名成功并校验后才替换，
+    # 防止 codesign/zsign 中途失败（或输出为空）把原 dylib 弄成 0KB。
+    if inplace:
+        fd, tmp = tempfile.mkstemp(suffix=".dylib", dir=os.path.dirname(path))
+        os.close(fd)
+        real_dst = tmp
+    else:
+        real_dst = out_path
+        # codesign 是原地改文件：非就地时先把原文件拷到目标位置再签
+        if backend == "codesign":
+            try:
+                shutil.copyfile(path, real_dst)
+            except OSError as e:
+                print(f"失败: 无法写入输出 {real_dst}：{e}", file=sys.stderr)
+                return 1
 
     want_identity = args.identity if args.identity not in (None, "", "-") else None
     if want_identity is None and not args.p12:
@@ -493,25 +528,75 @@ def cmd_signdylib(args) -> int:
               "iOS 上基本加载不了（除非主 App 也是 ad-hoc 签的）")
 
     try:
-        with keystore.IdentitySession(
-            identity=want_identity,
-            p12=args.p12,
-            p12_password=args.p12_password,
-            backend="codesign",
-        ) as ident:
-            signer.codesign_one(
-                path,
-                identity=ident.value,
-                entitlements=args.entitlements,
-                hardened_runtime=args.hardened_runtime,
-                keychain=ident.keychain,
-                log=lambda m: print(f"  {m}"),
-            )
+        if backend == "codesign":
+            with keystore.IdentitySession(
+                identity=want_identity,
+                p12=args.p12,
+                p12_password=args.p12_password,
+                backend="codesign",
+            ) as ident:
+                signer.codesign_one(
+                    real_dst,
+                    identity=ident.value,
+                    entitlements=args.entitlements,
+                    hardened_runtime=args.hardened_runtime,
+                    keychain=ident.keychain,
+                    log=lambda m: print(f"  {m}"),
+                )
+        else:  # zsign
+            if not args.p12:
+                print("失败：zsign 签 dylib 必须有 --p12 证书（zsign 不支持系统证书身份）",
+                      file=sys.stderr)
+                return 1
+            with keystore.IdentitySession(
+                identity=want_identity,
+                p12=args.p12,
+                p12_password=args.p12_password,
+                backend="zsign",
+            ) as ident:
+                signer.zsign_one(
+                    path, real_dst,
+                    p12=ident.p12_path,
+                    p12_password=ident.p12_password,
+                    provision=args.provision,
+                    entitlements=args.entitlements,
+                    log=lambda m: print(f"  {m}"),
+                )
     except (signer.SignError, RuntimeError, OSError, ValueError) as e:
         print(f"失败: {e}", file=sys.stderr)
+        if inplace and os.path.exists(real_dst):
+            try:
+                os.remove(real_dst)
+            except OSError:
+                pass
         return 1
 
-    print(f"已签名插件  : {path}")
+    # 就地签名：校验输出有效后再替换原文件，任何一步失败都保留原文件不动
+    if inplace:
+        if not os.path.isfile(real_dst) or os.path.getsize(real_dst) == 0:
+            print("失败: 签名输出为空，原文件未改动（请检查证书 / p12 / 描述文件）",
+                  file=sys.stderr)
+            try:
+                os.remove(real_dst)
+            except OSError:
+                pass
+            return 1
+        if not ipa_mod.is_macho(real_dst):
+            print("失败: 签名输出不是有效的 Mach-O，原文件未改动", file=sys.stderr)
+            try:
+                os.remove(real_dst)
+            except OSError:
+                pass
+            return 1
+        try:
+            shutil.move(real_dst, path)
+            if orig_mode is not None:
+                os.chmod(path, orig_mode)
+        except OSError as e:
+            print(f"失败: 无法写回原文件 {path}：{e}", file=sys.stderr)
+            return 1
+
+    print(f"已签名插件  : {out_path}")
     print("  放进 App 的 Documents（用悬浮窗的「文件导入导出」导入），"
           "再到「插件加载 → 浏览并加载插件…」里点一下就能加载")
     return 0
