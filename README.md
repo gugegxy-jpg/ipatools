@@ -454,14 +454,14 @@ ipatool signdylib MyPlugin.dylib --identity "Apple Development: you (TEAMID)"
 
 ### 编译内置 tweak
 
-四个内置功能（悬浮窗 / 文件导入导出 / 弱网测试 / 插件加载）的源码是分开的，但**默认合编成一个 `IPATool.dylib`**：
-注入一次就够，开哪些功能由 `Info.plist` 里 `IPAToolControl` / `IPAToolFiles` / `IPAToolQNet` / `IPAToolPlugins`
-的 `Enabled` 决定（`ipatool inject` 会把没用到的功能自动写成 `Enabled=NO`）。
-四者之间只用「通知 + NSUserDefaults」通信（见 `tweak/IPATControlShared.h`），
+四个内置功能（悬浮窗 / 文件导入导出 / 弱网测试 / 插件加载）的源码是分开的。
+默认编出两个 dylib：**`IPATool.dylib`**（悬浮窗 + 文件导入导出 + 插件加载合编）和 **`QNet.dylib`**（弱网测试单独一个）。
+`QNet.dylib` 靠 `ipatool inject --qnet` 注入 `Frameworks/` 或运行时当插件加载，加载后自己 `post IPATControlRegister` 注册到面板，
+所以改弱网测试不用重编主 dylib。四者之间只用「通知 + NSUserDefaults」通信（见 `tweak/IPATControlShared.h`），
 顶层函数全是 `static`、类名前缀各不相同，所以合编不会撞符号。
 
 ```bash
-./tweak/build.sh                                       # 产物：tweak/build/IPATool.dylib
+./tweak/build.sh                                       # 产物：tweak/build/IPATool.dylib + QNet.dylib
 IPATOOL_TARGETS=FileBridge ./tweak/build.sh            # 只编译文件功能（单独出一个 dylib）
 IPATOOL_TARGETS="ControlPanel FileBridge" ./tweak/build.sh  # 一次编译多个目标
 IPATOOL_ARCHS="arm64 arm64e" ./tweak/build.sh
@@ -503,7 +503,7 @@ tweak/
   QNet.m                弱网测试：拦截 socket 读写做限速 / 延迟 / 抖动 / 丢包 + 参数弹窗
   PluginLoader.m        运行时插件加载：扫描沙盒里的 dylib 并 dlopen（不用重打包）+ 插件窗口
   IPATControlShared.h   面板与各功能 dylib 之间的约定（通知名 / 配置键）
-  build.sh              编译脚本（需要 macOS + Xcode，默认把三个功能合编成一个 IPATool.dylib）
+  build.sh              编译脚本（需要 macOS + Xcode，默认编出 IPATool.dylib 和单独的 QNet.dylib）
 zsign/
   zsign.exe    Windows 版 zsign（签名用，程序会自动找到它；换平台就放对应版本进来）
 ```
