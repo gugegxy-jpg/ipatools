@@ -1,4 +1,4 @@
-# 在 GitHub 官方的 macOS 云主机上编译注入用 dylib（三个功能合编成一个 IPATool.dylib）。
+# 在 GitHub 官方的 macOS 云主机上编译注入用 dylib（IPATool.dylib 合编 + QNet.dylib 单独出包）。
 #
 # 用法：把仓库推到 GitHub 后，Actions → Build iOS Tweaks → Run workflow，
 # 跑完在页面底部的 Artifacts 里下载 ipatool-tweaks.zip（内含 *.dylib）。
@@ -46,8 +46,8 @@ jobs:
         env:
           IPATOOL_MIN_IOS: ${{ inputs.min_ios || '14.0' }}
           IPATOOL_ARCHS: ${{ inputs.archs || 'arm64' }}
-          # 保活 / 悬浮窗 / 文件导入导出合编成一个 IPATool.dylib
-          IPATOOL_TARGETS: IPATool
+          # 悬浮窗 / 文件导入导出 / 插件加载合编成一个 IPATool.dylib；弱网测试单独出 QNet.dylib
+          IPATOOL_TARGETS: IPATool QNet
         run: |
           mkdir -p tweak/build
           chmod +x tweak/build.sh
