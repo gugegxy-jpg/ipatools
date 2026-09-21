@@ -9,6 +9,12 @@
 - **图形界面**：`python -m ipatool gui` 打开窗口操作（tkinter，无第三方依赖）
 - 查看 IPA 信息（`info`，支持 `--json`，含内嵌 bundle、后台模式、已注入 dylib）
 - 列出可用签名证书（`certs`，支持 `--json`）
+- **列出连着的设备**（`devices`，支持 `--json`）：装 IPA 前先看装到哪台
+- **安装到设备**（`install`）：把签好名的 IPA 装到连着的 iPhone / iPad 上（走设备上的 `installation_proxy`），只连一台时不用选设备，失败时把原始报错翻成「下一步做什么」
+  - 安装过程实时显示**百分比 / 速度 / 剩余时间**：pymobiledevice3 那条命令行**不接进度回调**（只有一个心跳），所以默认改走它的 Python API 自己接回调；拿不到百分比时退化为「已用时间」心跳 + 结束时的平均速度
+  - 想强制走命令行（例如 API 版本不匹配）：设 `IPATOOL_INSTALL_CLI=1`
+  - 设备上已经装了**同一个 App**（同 bundle id）时会先问一句，提示里显示的是**设备上那个 App 的名字**（不是 bundle id）：`y` 卸载后重装 / `n` 不卸载直接装 / `q` 取消；已取消不算失败（退出码 3）
+  - `--reinstall` 不问直接卸载重装（脚本 / 自动化用）；`--no-uninstall-check` 跳过这个检查，保持老行为；非交互环境默认按「不卸载直接装」继续
 - **ID 签名**：用系统已安装的证书身份签名（`--identity`，macOS 钥匙串名称/SHA-1，Windows 证书指纹）
 - **证书签名**：直接提供 p12/pfx 文件签名（`--p12`，macOS 会导入到临时钥匙串，用完即删）
 - 修改主 App 的 `CFBundleIdentifier`、`CFBundleDisplayName`、`CFBundleName`
@@ -29,8 +35,13 @@
 - Python >= 3.8，无第三方依赖（Mach-O 解析/改写是纯 Python 实现的）
 - 签名工具（二选一，可选）：
   - macOS：系统自带 `codesign`
-  - 任意平台：`zsign` <https://github.com/zhlynn/zsign>
+  - 任意平台：`zsign` —— **项目里已经放了一份**（Windows：`zsign/zsign.exe`），直接就能签，不用配任何环境变量
+  - 换平台时把对应版本的 zsign 丢进 `zsign/` 即可（文件名保持 `zsign` 或 `zsign.exe`）；装进 PATH 也认。下载：<https://github.com/zhlynn/zsign>
 - 编译注入用的 dylib **必须 macOS + Xcode 命令行工具**（iOS SDK 只在 macOS 上有）
+- 装到设备（可选，`devices` / `install` 用）：二选一
+  - `pymobiledevice3`：`pip install pymobiledevice3`（纯 Python，三平台通用，推荐）
+  - `ideviceinstaller`：libimobiledevice 那套（macOS `brew install libimobiledevice ideviceinstaller`）
+  - Windows 上两者都需要 Apple 的 usbmuxd 驱动（装 iTunes 或 Apple Mobile Device Support），设备要解锁并在弹窗点「信任」
 
 ## 用法
 
@@ -71,6 +82,17 @@ python -m ipatool sign app.ipa \
 
 # 先看看会改什么，不落盘
 python -m ipatool modify app.ipa -i com.company.newapp -n "新名称" --dry-run
+
+# 列出连着的设备（拿 UDID）
+python -m ipatool devices
+python -m ipatool devices --json
+
+# 把签好名的产物装到设备上（只连一台时可以不给 --udid）
+python -m ipatool install out.ipa
+python -m ipatool install out.ipa --udid 00008110-000A1B2C3D4E5F6G
+
+# 设备上已有同名 App 时：不询问，直接卸载后重装
+python -m ipatool install out.ipa --reinstall
 ```
 
 ## 图形界面
@@ -85,15 +107,19 @@ python -m ipatool.gui
 
 | 页签 | 对应子命令 | 内容 |
 | --- | --- | --- |
+| 改 ID · 注入 · 签名 | `modify` + `inject` + `sign` + `install` | Bundle Identifier / 显示名称、要注入的 dylib 列表、签名参数（后端 / p12 与密码 / 描述文件）、安装到设备、记住设置 |
 | 信息 | `info --json` | Bundle ID / 名称 / 版本 / 后台模式 / 内嵌 bundle / 已注入 dylib |
-| 改 ID · 注入 · 签名 | `modify` + `inject` | Bundle Identifier / 显示名称、要注入的 dylib 列表、签名参数（后端 / `--identity` / p12 与密码 / 描述文件）、记住设置、执行按钮 |
 
 用法要点：
 
 - 顶部选输入（`.ipa` 或已解包且含 `Payload` 的目录）和输出路径；**选中输入不会自动解析**，要看包内信息就点「读取信息」。
-- 合并页底部有三个按钮：「改 ID / 名称（含签名）」「注入 dylib（含签名）」「只重新签名」。三个操作各自要解包打包一次，点哪个就只做哪个。
+- **「输出」留空不用管**：产物会生成在**输入包旁边**，文件名按做的事区分——注入 `-injected.ipa`、改 ID `-modified.ipa`、只签名 `-signed.ipa`（命令行同理，不再落到"敲命令时所在目录"）。下面那行摘要会实时显示这个默认路径。
+- 底部只有「开始执行 / 预览（dry-run）」两个按钮，按当前填写自动决定做哪件事（见下条），不用先挑模式。
 - 底部的「开始执行」按当前填写自动选：列表里有 dylib 就注入 → 填了 ID / 名称就改名 → 什么都没填就只重新打包 + 签名（所以「不改 ID、不注入，只签一下」直接点它就行）。
-- 签名参数两个操作共用，配一次就行；「读取系统证书」列出可用身份并填进下拉框（同 `certs`）。
+- 签名参数两个操作共用，配一次就行；证书用「添加证书…」导入 p12（系统证书那一堆大多和苹果签名无关，已去掉）。
+- 「安装到设备」在签名区下面：**「安装包」留空就用「输出」里的产物，也可以点「选择…」指定任意一个 IPA**（选过之后不再跟随「输出」，点「清除」回到自动）；旁边还有「打开产物文件夹 / 复制路径」，方便把产物交给爱思之类的工具。下面那行摘要随时显示「装到哪台 + 装哪个包」，包不存在会直接标出来。日志和命令行完全一致（等价于 `install` 子命令）。
+- 设备列表**不用手点**：打开界面就读一次，之后空闲时每 30 秒静默刷新——插上 / 拔掉手机会自动反映，只连一台还会自动选中；列表没变化时不写日志。「刷新设备」按钮留着需要立刻刷的时候用。
+- 点「安装到设备」时，如果设备上已经有**同一个 App**，会弹一个三选一：**是 = 卸载后重装 / 否 = 不卸载直接装 / 取消 = 什么都不做**（弹窗里写的是设备上那个 App 的名字）。
 - 证书 / 密码 / ID 签名会被记住，下次打开自动填好；明文存在本机配置文件里，界面上可以取消勾选或一键清除。
 - 「预览（dry-run）」= 在当前参数上追加 `--dry-run`，先看会改什么；「开始执行」才真正落盘。
 - 日志区实时滚动命令输出（等价于把拼出来的命令行贴进终端），证书密码在回显里打码。
@@ -101,6 +127,8 @@ python -m ipatool.gui
 - 界面不重复实现业务逻辑：它只是把控件上的值拼成一份 argv 再交给 `cli.main()`，所以提示、警告、退出码和命令行完全一致。
 - 内置的文件导入导出 / 弱网测试 / 插件加载 / 悬浮窗只在命令行提供：`python -m ipatool inject <包> --files --qnet --plugins`。
 
+> 界面是**深色主题**（近黑蓝底 + 青色主色，卡片式排版）。配色和字体都集中在 `ipatool/gui.py` 顶部的常量里（`BG` / `CARD` / `BORDER` / `ACCENT` / `FONT`…），想换风格改那一块即可整体生效。
+>
 > 界面依赖 Python 自带的 tkinter（Windows / macOS 官方安装包都自带；Linux 上需装 `python3-tk`）。
 
 ### 证书签名 vs ID 签名
@@ -113,6 +141,18 @@ python -m ipatool.gui
 - 两者可同时给：`--p12` 导入后按 `--identity` 匹配其中某个身份（匹配不到会列出证书内所有身份）。
 - 都不给时退化为 ad-hoc 签名（`--identity -`），真机无法安装。
 - `--p12-password` 缺省时会交互输入，也可放到环境变量 `IPATOOL_P12_PASSWORD`。
+- 图形界面只走「p12 证书文件」这一条路（系统证书列表里绝大多数和苹果签名无关，已去掉；命令行 `certs` / `--identity` 还在）。
+
+### 手里没有证书？（交给爱思 / Sideloadly 签）
+
+Apple ID 签名（免费账号 7 天证书）这件事，**交给爱思助手 / Sideloadly 这类现成工具最省事**——它们自带 Apple ID 认证（含 6 位验证码），
+不需要额外装命令行工具。本工具负责前半段（改 ID / 注入 dylib / 出 IPA）：
+
+1. 在本工具里填好 ID、dylib、签名参数（`--sign none` 也行），点「开始执行」生成 IPA
+2. 点「**打开产物文件夹**」——会直接打开资源管理器并**选中那个 IPA**，拖进爱思 / Sideloadly 即可
+3. 在那边用 Apple ID 签名并安装（免费账号同样 7 天有效）
+
+「复制路径」按钮是给只能粘贴路径、不能拖文件的工具用的。
 
 ### modify 主要参数
 
@@ -437,7 +477,8 @@ IPATOOL_MIN_IOS=15.0 ./tweak/build.sh
 
 ## 签名说明
 
-- **auto**：macOS 上用 `codesign`，否则若 PATH 中有 `zsign` 就用 zsign，都不满足则只重打包并给出警告。
+- **auto**：macOS 上用 `codesign`；其他平台用项目自带的 `zsign`（`zsign/zsign.exe`，没有就看 PATH）。两者都没有时只重打包并给出警告。
+- zsign 签名**必须带证书**：给了 zsign 但没给 `--p12` / `--identity` 时，不会报错，而是退回「只打包不签名」并说明原因（日志里会写清楚）。
 - `codesign` 后端会：按「由深到浅」的顺序签名 dylib、Framework、Extension，最后签主 App；并自动从原签名里导出 entitlements 重新注入，避免丢权限。
 - 没有 `codesign` / `zsign` 时输出的 IPA **未签名**，真机无法安装，仅供越狱设备或后续用其它工具签名。
 - 若旧描述文件不是通配符 App ID，改 Bundle ID 后必须配合 `--provision` 提供匹配的描述文件。
@@ -446,7 +487,7 @@ IPATOOL_MIN_IOS=15.0 ./tweak/build.sh
 
 ```
 ipatool/
-  cli.py       命令行入口（info / certs / modify / inject / gui）
+  cli.py       命令行入口（info / certs / devices / install / sign / modify / inject / signdylib / gui）
   gui.py       图形界面（tkinter，把控件拼成命令行再交给 cli）
   ipa.py       解包 / 打包，权限位处理
   plistutil.py plist 与 InfoPlist.strings 读写
@@ -455,6 +496,7 @@ ipatool/
   inject.py    dylib 落位、Info.plist 注入配置（文件导入导出 / 弱网测试 / 后台模式 / ATS）
   keystore.py  签名身份管理：身份列举 / p12 导入钥匙串 / Windows 证书导出
   signer.py    codesign / zsign 重签名
+  device.py    连设备：列设备 / 装 IPA（pymobiledevice3 或 ideviceinstaller）
 tweak/
   ControlPanel.m        应用内悬浮控制面板（悬浮按钮 + 开关小窗口）
   FileBridge.m          沙盒文件浏览 / 导出到「文件」App / 从「文件」App 导入
@@ -462,4 +504,6 @@ tweak/
   PluginLoader.m        运行时插件加载：扫描沙盒里的 dylib 并 dlopen（不用重打包）+ 插件窗口
   IPATControlShared.h   面板与各功能 dylib 之间的约定（通知名 / 配置键）
   build.sh              编译脚本（需要 macOS + Xcode，默认把三个功能合编成一个 IPATool.dylib）
+zsign/
+  zsign.exe    Windows 版 zsign（签名用，程序会自动找到它；换平台就放对应版本进来）
 ```
