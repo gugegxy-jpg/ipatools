@@ -11,6 +11,7 @@ import tempfile
 import time
 
 from . import bundle as bundle_mod
+from . import device as device_mod
 from . import inject as inject_mod
 from . import ipa as ipa_mod
 from . import keystore
@@ -24,7 +25,7 @@ def _add_output_args(p: argparse.ArgumentParser) -> None:
     """输出、签名相关的公共参数（modify / inject 共用）。"""
     p.add_argument(
         "-o", "--output",
-        help="输出 IPA 路径；modify 默认 <原名>-modified.ipa，inject 默认 <原名>-injected.ipa",
+        help="输出 IPA 路径；留空则跟输入包同目录，文件名 add -modified / -injected / -signed",
     )
     p.add_argument("--in-place", action="store_true", help="直接覆盖输入文件")
     p.add_argument("--sign", choices=list(signer.BACKENDS), default="auto", help="重签名后端，默认 auto")
@@ -56,6 +57,21 @@ def _add_output_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("-v", "--verbose", action="store_true")
 
 
+def _add_device_args(p: argparse.ArgumentParser) -> None:
+    """devices / install 共用的「用哪个工具连设备」。"""
+    p.add_argument(
+        "--backend",
+        choices=list(device_mod.BACKENDS),
+        default="auto",
+        help="连设备用的后端，默认 auto（先 pymobiledevice3，再 ideviceinstaller）",
+    )
+    p.add_argument(
+        "--tool",
+        metavar="PATH",
+        help="直接指定可执行文件（pymobiledevice3 或 ideviceinstaller 的完整路径）",
+    )
+
+
 def _zip_level(args) -> int | None:
     """解析 --zip-level：auto -> None（智能），0 -> 全存储，1-9 -> deflate 等级。"""
     raw = str(getattr(args, "zip_level", "auto") or "auto").strip().lower()
@@ -70,19 +86,31 @@ def _zip_level(args) -> int | None:
     return level
 
 
-def _zip_level_text(level: int | None) -> str:
-    if level is None:
-        return "auto（已压缩资源直接存储，其余 deflate）"
-    if level == 0:
-        return "0（全部存储，最快，体积最大）"
-    return f"{level}（deflate）"
-
-
 def _timed(fn, *args, **kwargs):
     """跑一个步骤并返回 (结果, 用了多少秒)。"""
     start = time.perf_counter()
     result = fn(*args, **kwargs)
     return result, time.perf_counter() - start
+
+
+def _cleanup_workdir(workdir: str, started: float | None = None) -> None:
+    """删掉解包出来的临时目录，并把这段时间显式打出来。
+
+    以前这里是静默的：日志打完「阶段耗时 / 输出」就不动了，而删一个几 GB、
+    几万个文件的解包目录在 Windows 上要几十秒到几分钟（还要过一遍杀毒），
+    看着就像卡死——「总耗时」后面到底在等什么，谁也看不出来。
+    现在先说一句在删，删完报耗时，最后才打「总耗时」（= 真的全部结束）。
+    """
+    exists = os.path.isdir(workdir)
+    if exists:
+        print("清理临时文件: 正在删除解包目录…", flush=True)
+    begin = time.perf_counter()
+    shutil.rmtree(workdir, ignore_errors=True)
+    seconds = time.perf_counter() - begin
+    if exists and seconds >= 1.0:
+        print(f"清理耗时    : {seconds:.1f}s", flush=True)
+    if started is not None:
+        print(f"总耗时      : {time.perf_counter() - started:.1f}s")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -98,6 +126,20 @@ def _build_parser() -> argparse.ArgumentParser:
 
     pc = sub.add_parser("certs", help="列出可用于签名的证书身份（ID 签名用）")
     pc.add_argument("--json", action="store_true", help="以 JSON 输出")
+
+    pd = sub.add_parser(
+        "devices",
+        help="列出已连接的 iOS 设备（装 IPA 前先看装到哪台）",
+        description=(
+            "列出当前连着的 iOS 设备（USB / Wi-Fi）。\n"
+            "后端自动选: pymobiledevice3（pip install pymobiledevice3）→ "
+            "ideviceinstaller（libimobiledevice）。\n"
+            "Windows 上两个后端都要有 Apple 的 usbmuxd 驱动（iTunes / Apple Mobile Device Support）。"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    pd.add_argument("--json", action="store_true", help="以 JSON 输出")
+    _add_device_args(pd)
 
     pm = sub.add_parser("modify", help="修改 Bundle ID 与名称")
     pm.add_argument("input", help="IPA 文件路径，或已解包且含 Payload 的目录")
@@ -221,6 +263,37 @@ def _build_parser() -> argparse.ArgumentParser:
     psg.add_argument("input", help="IPA 文件路径，或已解包且含 Payload 的目录")
     _add_output_args(psg)
 
+    pin = sub.add_parser(
+        "install",
+        help="把签好名的 IPA 装到已连接的 iOS 设备",
+        description=(
+            "把签好名的 IPA 装到连着的那台设备上（走设备上的 installation_proxy）。\n"
+            "只连一台设备时不用给 --udid；连着多台必须指定，先跑 ipatool devices 看列表。\n"
+            "安装失败时会把原始报错翻译成「下一步做什么」。"
+        ),
+        epilog="连不上设备时按这个顺序查:\n" + device_mod.no_device_hint(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    pin.add_argument("input", help="要安装的 IPA 文件（签好名的产物）")
+    pin.add_argument("--udid", help="目标设备 UDID；省略时用唯一连着的那台")
+    pin.add_argument(
+        "--developer",
+        action="store_true",
+        help="按开发者包安装（对应 pymobiledevice3 的 apps install --developer）",
+    )
+    pin.add_argument(
+        "--reinstall",
+        action="store_true",
+        help="设备上已有同一个 App（同 bundle id）时不再询问，直接卸载后重装",
+    )
+    pin.add_argument(
+        "--no-uninstall-check",
+        dest="no_uninstall_check",
+        action="store_true",
+        help="不检查设备上是否已装同一个 App（保持老行为：直接装，可能被系统拒绝）",
+    )
+    _add_device_args(pin)
+
     sub.add_parser(
         "gui",
         help="打开图形界面（tkinter），功能与本命令行一致",
@@ -321,7 +394,7 @@ def cmd_info(args) -> int:
                     print(f"  - {n['path']}  [{n['kind']}]  {n['bundle_id']}")
         return 0
     finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+        _cleanup_workdir(workdir)
 
 
 def cmd_certs(args) -> int:
@@ -341,6 +414,40 @@ def cmd_certs(args) -> int:
     for n, i in enumerate(ids, 1):
         print(f"  {n:>2}) {i}")
     print("\n用法示例: --identity <上面的 ID 或名称>")
+
+
+def cmd_devices(args) -> int:
+    """列出连着的设备。装 IPA 前先看这台是不是要装的那台。"""
+    try:
+        backend = device_mod.resolve_backend(args.backend, args.tool)
+        devices = device_mod.list_devices(backend)
+    except device_mod.DeviceError as e:
+        print(f"失败: {e}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        _utf8_stdout()
+        print(json.dumps(
+            {
+                "backend": backend.name,
+                "detail": backend.detail,
+                "devices": [d.as_dict() for d in devices],
+            },
+            ensure_ascii=False, indent=2,
+        ))
+        return 0
+
+    print(f"设备后端    : {backend.name}（{backend.detail}）")
+    if not devices:
+        print("没识别到设备。按顺序检查：")
+        print(device_mod.no_device_hint())
+        return 0
+    print(f"已连接设备 ({len(devices)}):")
+    for n, d in enumerate(devices, 1):
+        print(f"  {n:>2}) {d.label}")
+        print(f"      UDID: {d.udid}")
+    print("\n用法示例: ipatool install 产物.ipa --udid <上面的 UDID>")
+    return 0
 
     # 有证书但本机没有签名工具时，下一步必然踩坑（--sign auto 会落到 none），提前说清楚
     try:
@@ -415,9 +522,11 @@ def _output_path(args, workdir: str) -> str:
         return os.path.join(workdir, "out.ipa")
     if args.output:
         return os.path.abspath(args.output)
-    stem = os.path.splitext(os.path.basename(os.path.normpath(args.input)))[0]
-    suffix = "-injected.ipa" if args.cmd == "inject" else "-modified.ipa"
-    return os.path.abspath(f"{stem}{suffix}")
+    src = os.path.abspath(args.input)
+    stem = os.path.splitext(os.path.basename(os.path.normpath(src)))[0]
+    suffix = {"inject": "-injected.ipa", "sign": "-signed.ipa"}.get(args.cmd, "-modified.ipa")
+    # 默认跟输入包放在同一个目录（不是「敲命令时所在的目录」），省得满世界找产物
+    return os.path.join(os.path.dirname(src), f"{stem}{suffix}")
 
 
 def _package_and_sign(args, root: str, payload: str, app, workdir: str,
@@ -431,20 +540,28 @@ def _package_and_sign(args, root: str, payload: str, app, workdir: str,
     out = _output_path(args, workdir)
     backend = signer.resolve_backend(args.sign)
     level = _zip_level(args)
-    print(f"重签名后端  : {backend}")
-    print(f"打包压缩    : {_zip_level_text(level)}")
-
     want_identity = args.identity if args.identity not in (None, "", "-") else None
+    # zsign 必须有证书才能签：找得到 zsign 但没给证书时，退回「只打包」而不是报错
+    no_certificate = not (args.p12 or want_identity)
+    keep_unsigned = backend == "zsign" and no_certificate
+    if keep_unsigned:
+        backend = "none"
+    print(f"重签名后端  : {backend}")
+
     if backend == "none":
-        # 光说「没有可用的签名工具」没用，把原因和两条出路一起打出来
-        if args.sign == "auto":
-            print("  说明: --sign auto 没找到可用的签名工具，本次只注入、不签名")
-            for line in signer.auto_backend_hint().splitlines():
-                print(f"        {line}")
-        if args.p12 or want_identity:
-            print("  警告: 证书参数被忽略（本机没有可用的签名工具），输出的是未签名 IPA")
-        elif unsigned_warning:
-            print(f"  警告: {unsigned_warning}")
+        if keep_unsigned:
+            print("  说明: 本机有 zsign，但 zsign 签名必须有证书，本次只打包不签名"
+                  "（要签就加 --p12 cert.p12，或 --identity <指纹>）")
+        else:
+            if args.sign == "auto":
+                # 光说「没有可用的签名工具」没用，把原因和两条出路一起打出来
+                print("  说明: --sign auto 没找到可用的签名工具，本次只注入、不签名")
+                for line in signer.auto_backend_hint().splitlines():
+                    print(f"        {line}")
+            if args.p12 or want_identity:
+                print("  警告: 证书参数被忽略（本机没有可用的签名工具），输出的是未签名 IPA")
+            elif unsigned_warning:
+                print(f"  警告: {unsigned_warning}")
 
     sign_seconds = 0.0
     archive_seconds = 0.0
@@ -483,8 +600,8 @@ def _package_and_sign(args, root: str, payload: str, app, workdir: str,
             )
         else:
             _, archive_seconds = _timed(ipa_mod.archive, root, out, level)
-            # 显式 --sign none 是用户自己的选择，别再说「未找到可用的签名工具」
-            if args.sign != "none":
+            # 显式 --sign none 是用户自己的选择，上面也解释过原因了，都别再说「没有签名工具」
+            if args.sign != "none" and not keep_unsigned:
                 print("  警告: 未找到可用的签名工具，输出的是未签名 IPA，设备无法直接安装")
 
     if backend == "none":
@@ -535,13 +652,60 @@ def cmd_sign(args) -> int:
         )
         if not args.provision:
             print("提示: 未指定 --provision，若证书与描述文件不匹配将无法安装")
-        print(f"总耗时      : {time.perf_counter() - started:.1f}s")
         return code
     except (signer.SignError, inject_mod.InjectError) as e:
         print(f"失败: {e}", file=sys.stderr)
         return 1
     finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+        _cleanup_workdir(workdir, started)
+
+
+def _pick_single_device(backend: device_mod.Backend) -> str | None:
+    """没给 --udid 时的选法：只连一台就用它，多台列出来让用户自己指定。"""
+    try:
+        devices = device_mod.list_devices(backend)
+    except device_mod.DeviceError as exc:
+        print(f"提示        : 列不出设备（{exc}），交给 {backend.name} 自己挑")
+        return None
+    if len(devices) == 1:
+        print(f"目标设备    : {devices[0].label}")
+        return devices[0].udid
+    if not devices:
+        print("提示        : 没列出设备，仍交给后端尝试装（可能只是列不出来）")
+        return None
+    lines = "\n".join(f"  - {d.label}  {d.udid}" for d in devices)
+    raise device_mod.DeviceError(f"连着 {len(devices)} 台设备，用 --udid 指定装哪台：\n{lines}")
+
+
+def cmd_install(args) -> int:
+    """把已经签好名的 IPA 装到设备上（打包和签名在别的子命令里做）。"""
+    ipa = os.path.abspath(args.input)
+    if not os.path.isfile(ipa):
+        print(f"错误：找不到要安装的文件 {args.input}", file=sys.stderr)
+        return 2
+    note = device_mod.ipa_signature_note(ipa)
+    if note:
+        print(f"提示        : {note}")
+
+    try:
+        backend = device_mod.resolve_backend(args.backend, args.tool)
+        udid = args.udid or os.environ.get(device_mod.DEVICE_ENV, "").strip() or None
+        if not udid:
+            udid = _pick_single_device(backend)
+        print(f"安装包      : {ipa}")
+        device_mod.install(
+            ipa, udid=udid, backend=backend, developer=args.developer,
+            force=args.reinstall, check_existing=not args.no_uninstall_check,
+            log=lambda m: print(f"  {m}"),
+        )
+    except device_mod.InstallCancelled as e:
+        print(f"已取消      : {e}；设备上未做任何改动")
+        return 3
+    except device_mod.DeviceError as e:
+        print(f"失败: {e}", file=sys.stderr)
+        return 1
+    print("安装完成    : 请查看设备APP")
+    return 0
 
 
 def cmd_modify(args) -> int:
@@ -604,13 +768,12 @@ def cmd_modify(args) -> int:
         )
         if not args.provision:
             print("提示: 未指定 --provision，原描述文件与新 Bundle ID 可能不匹配（通配符描述文件除外）")
-        print(f"总耗时      : {time.perf_counter() - started:.1f}s")
         return code
     except (signer.SignError, inject_mod.InjectError) as e:
         print(f"失败: {e}", file=sys.stderr)
         return 1
     finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+        _cleanup_workdir(workdir, started)
 
 
 def cmd_inject(args) -> int:
@@ -835,13 +998,12 @@ def cmd_inject(args) -> int:
         if not args.provision:
             print("提示: 未指定 --provision，若证书与描述文件不匹配将无法安装；"
                   "注入 dylib 会让原签名失效，必须重签")
-        print(f"总耗时      : {time.perf_counter() - started:.1f}s")
         return code
     except (signer.SignError, inject_mod.InjectError) as e:
         print(f"失败: {e}", file=sys.stderr)
         return 1
     finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+        _cleanup_workdir(workdir, started)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -855,6 +1017,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_info(args)
     if args.cmd == "certs":
         return cmd_certs(args)
+    if args.cmd == "devices":
+        return cmd_devices(args)
+    if args.cmd == "install":
+        return cmd_install(args)
     if args.cmd == "inject":
         return cmd_inject(args)
     if args.cmd == "signdylib":
