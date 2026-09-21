@@ -1031,6 +1031,7 @@ static NSString *IPATQnPresetSummary(IPATQnPresetItem *item) {
 @property (nonatomic, copy) void (^onClose)(void);
 @property (nonatomic, copy) void (^onChanged)(void);
 @property (nonatomic, copy) void (^onResize)(void);        // 内容变高了，让外面重新排版
+@property (nonatomic, assign) BOOL suppressKeyboard;       // 拖动窗口期间抑制键盘弹出
 
 @end
 
@@ -1223,6 +1224,11 @@ static NSString *IPATQnPresetSummary(IPATQnPresetItem *item) {
 /// 拿到输入焦点时再要一次 key：用户中途点过游戏的话 key 已经回到游戏窗口了，
 /// 那种状态下系统同样不会给键盘（键盘只跟 key window 走）
 - (void)textFieldDidBeginEditing:(UITextField *)textField {
+    // 拖动窗口期间不要抢焦点弹键盘：键盘只应在「点输入框」时弹出
+    if (self.suppressKeyboard) {
+        [textField resignFirstResponder];
+        return;
+    }
     UIWindow *window = self.window;
     if (window && !window.isKeyWindow) [window makeKeyWindow];
 }
@@ -1805,11 +1811,14 @@ static NSString *IPATQnPresetSummary(IPATQnPresetItem *item) {
 }
 
 - (void)handleDrag:(UIPanGestureRecognizer *)pan {
-    UIView *card = self.card;
+    IPATQnCard *card = self.card;
     UIView *superview = card.superview;
     if (!card || !superview) return;
 
     if (pan.state == UIGestureRecognizerStateBegan) {
+        // 拖动窗口时收起键盘、并抑制拖动过程中因输入框重获焦点而弹键盘
+        card.suppressKeyboard = YES;
+        [card endEditing:YES];
         self.dragStart = card.center;
     }
     CGPoint delta = [pan translationInView:superview];
@@ -1821,6 +1830,7 @@ static NSString *IPATQnPresetSummary(IPATQnPresetItem *item) {
     card.center = center;
 
     if (pan.state == UIGestureRecognizerStateEnded || pan.state == UIGestureRecognizerStateCancelled) {
+        card.suppressKeyboard = NO;
         self.cardFrame = card.frame;
         [self saveCardFrame];
     }
