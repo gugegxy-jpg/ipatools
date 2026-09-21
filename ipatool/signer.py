@@ -5,13 +5,14 @@ import os
 import platform
 import shutil
 import subprocess
+import sys
 import tempfile
 
 from .ipa import is_bundle_dir, is_dylib
 
 BACKENDS = ("auto", "codesign", "zsign", "none")
 
-ZSIGN_ENV = "IPATOOL_ZSIGN"          # 不在 PATH 里时可以直接指路径
+ZSIGN_DIR = "zsign"                  # 项目里放 zsign 的目录（zsign/zsign.exe）
 ZSIGN_HINT = ("https://github.com/zhlynn/zsign（跨平台，含 Windows）"
               "或 https://github.com/claration/Zsign-Package")
 
@@ -24,14 +25,101 @@ def _have(tool: str) -> bool:
     return shutil.which(tool) is not None
 
 
+def config_path() -> str:
+    """
+    ipatool 的本地配置（GUI 写、CLI 也读）。目前存签名相关的东西：上次选的证书、
+    密码等。Windows 用 %APPDATA%，macOS 用 Application Support，其它用 XDG。
+    """
+    system = platform.system()
+    if system == "Windows":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        return os.path.join(base, "ipatool", "gui.json")
+    if system == "Darwin":
+        return os.path.expanduser("~/Library/Application Support/ipatool/gui.json")
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "ipatool", "gui.json")
+
+
+def app_root() -> str:
+    """项目根目录：源码运行时是 ipatool/ 的上一级，打包成 exe 后是 exe 所在目录。"""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def zsign_dirs() -> list[str]:
+    """可能放着 zsign 的目录：打包临时目录、项目根、以及 ipatool/ 自己那一层。"""
+    roots: list[str] = []
+    meipass = getattr(sys, "_MEIPASS", "")      # PyInstaller 解包出来的临时目录
+    if meipass:
+        roots.append(str(meipass))
+    roots.append(app_root())
+    roots.append(os.path.dirname(os.path.abspath(__file__)))
+    unique: list[str] = []
+    for root in roots:
+        if root not in unique:
+            unique.append(root)
+    return unique
+
+
+def zsign_candidates() -> list[str]:
+    """本项目自带的那份 zsign 可能在哪（zsign/ 目录里，或直接扔在项目根）。"""
+    out: list[str] = []
+    for root in zsign_dirs():
+        folder = os.path.join(root, ZSIGN_DIR)
+        out += [os.path.join(folder, "zsign.exe"), os.path.join(folder, "zsign")]
+        out += [os.path.join(root, "zsign.exe"), os.path.join(root, "zsign")]
+    return out
+
+
+def _runnable(path: str) -> bool:
+    """是不是一个能直接执行的文件（Windows 上不看执行位）。"""
+    if not os.path.isfile(path):
+        return False
+    return os.name == "nt" or os.access(path, os.X_OK)
+
+
+def _scan_zsign_dir(folder: str) -> str | None:
+    """zsign/ 里文件名不标准（zsign-1.1.2.exe、zsign_macos 之类）也认。"""
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError:
+        return None
+    for name in sorted(names, key=lambda n: (not n.lower().endswith(".exe"), n.lower())):
+        base, ext = os.path.splitext(name.lower())
+        if not base.startswith("zsign") or ext in (".zip", ".md", ".txt", ".json", ".html"):
+            continue
+        path = os.path.join(folder, name)
+        if _runnable(path):
+            return os.path.abspath(path)
+    return None
+
+
 def zsign_binary() -> str | None:
-    """找 zsign：先看 IPATOOL_ZSIGN 指定的路径，再看 PATH。"""
-    explicit = os.environ.get(ZSIGN_ENV, "").strip().strip('"')
-    if explicit:
-        if os.path.isfile(explicit):
-            return explicit
-        raise SignError(f"{ZSIGN_ENV} 指向的文件不存在: {explicit}")
+    """找 zsign：项目自带的那份（zsign/zsign.exe）→ PATH 里的。
+
+    项目里已经放了一份，正常不用配任何东西；PATH 兜底是给「自己装过 zsign」的人。
+    """
+    for path in zsign_candidates():
+        if _runnable(path):
+            return os.path.abspath(path)
+    for folder in zsign_dirs():
+        found = _scan_zsign_dir(os.path.join(folder, ZSIGN_DIR))
+        if found:
+            return found
     return shutil.which("zsign")
+
+
+def zsign_report() -> str:
+    """找不到 zsign 时把「查过哪几处、各是什么结果」列出来，省得瞎猜。"""
+    lines = ["  查过这些位置:"]
+    for path in zsign_candidates():
+        lines.append(f"    [{'有' if os.path.isfile(path) else '无'}] {path}")
+    lines.append(f"  PATH 里的 zsign : {shutil.which('zsign') or '(没有)'}")
+    lines.append(f"  解决: 把 zsign(.exe) 放进 {os.path.join(app_root(), ZSIGN_DIR)} 里，"
+                 f"文件名保持 zsign.exe / zsign 即可\n"
+                 f"        下载: {ZSIGN_HINT}")
+    return "\n".join(lines)
 
 
 def resolve_backend(backend: str) -> str:
@@ -39,10 +127,7 @@ def resolve_backend(backend: str) -> str:
         if backend == "codesign" and not (platform.system() == "Darwin" and _have("codesign")):
             raise SignError("当前系统不是 macOS 或找不到 codesign，无法使用 codesign 后端")
         if backend == "zsign" and zsign_binary() is None:
-            raise SignError(
-                "找不到 zsign，无法签名。装好后让它出现在 PATH 里，"
-                f"或用 {ZSIGN_ENV}=/路径/zsign 指定可执行文件。\n下载: {ZSIGN_HINT}"
-            )
+            raise SignError("找不到 zsign，无法签名。\n" + zsign_report())
         return backend
 
     if platform.system() == "Darwin" and _have("codesign"):
@@ -61,9 +146,9 @@ def auto_backend_hint() -> str:
                      "（装了 Xcode 命令行工具吗？xcrun --find codesign）")
     else:
         lines.append(f"原因: 当前系统是 {system}，用不了 macOS 自带的 codesign；"
-                     "非 macOS 上签 IPA 只能靠 zsign，而 PATH 里找不到 zsign")
-    lines.append(f"想在本机签: 装 zsign（{ZSIGN_HINT}），"
-                 f"或用 {ZSIGN_ENV}=/路径/zsign 指定可执行文件；"
+                     "非 macOS 上签 IPA 只能靠 zsign，而项目里 / PATH 里都没有 zsign")
+    lines.append(f"想在本机签: 把 zsign(.exe) 放进 {os.path.join(app_root(), ZSIGN_DIR)}"
+                 f"（下载 {ZSIGN_HINT}）；"
                  "证书用 --p12 cert.p12，或 Windows 证书存储里的身份加 --identity <指纹>")
     lines.append("不想在本机签: 保留 --sign none，把未签名的 IPA 交给 "
                  "Sideloadly / AltStore / SideStore / LiveContainer 去签")
@@ -203,8 +288,7 @@ def zsign_ipa(
 
     binary = zsign_binary()
     if not binary:
-        raise SignError(f"找不到 zsign。装好后让它出现在 PATH 里，"
-                        f"或用 {ZSIGN_ENV}=/路径/zsign 指定。\n下载: {ZSIGN_HINT}")
+        raise SignError("找不到 zsign。\n" + zsign_report())
 
     cmd = [binary, "-k", p12]
     if p12_password:
