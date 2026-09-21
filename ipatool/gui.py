@@ -11,24 +11,33 @@
 """
 from __future__ import annotations
 
+import base64
 import contextlib
 import io
 import json
 import os
 import platform
 import queue
+import subprocess
 import sys
 import threading
+import time
 import traceback
+import uuid
+import webbrowser
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 if __package__ in (None, ""):  # 直接运行本文件：python ipatool/gui.py
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from ipatool import cli as cli_mod
+    from ipatool import cloud_build as cloud_mod
+    from ipatool import device as device_mod
     from ipatool import signer
 else:
     from . import cli as cli_mod
+    from . import cloud_build as cloud_mod
+    from . import device as device_mod
     from . import signer
 
 OPT_DEFAULT = "(默认)"
@@ -42,28 +51,33 @@ def _gui_config_path() -> str:
 
     放用户配置目录，不写在工作目录里；密码是**明文**，只为了下次不用重输，
     不想留就在「签名」页取消勾选，或点「清除已保存的证书」。
+    路径规则统一在 signer.config_path()，这样命令行也能读到同一份配置。
     """
-    system = platform.system()
-    if system == "Windows":
-        base = os.environ.get("APPDATA") or os.path.expanduser("~")
-        return os.path.join(base, "ipatool", "gui.json")
-    if system == "Darwin":
-        return os.path.expanduser("~/Library/Application Support/ipatool/gui.json")
-    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
-    return os.path.join(base, "ipatool", "gui.json")
-APP_SUBTITLE = "修改 IPA 的 Bundle ID / 名称，注入 dylib 并重新签名"
-CAPTURE_TASKS = ("info", "certs")
+    return signer.config_path()
 
-# 配色（ttk 的 clam 主题可以改这些值，界面风格统一从这里调）
-BG = "#f4f6f9"          # 窗口底色
-CARD = "#ffffff"        # 输入控件底色
-BORDER = "#d5dae3"      # 分隔线 / 边框
-TEXT = "#1f2937"        # 正文
-MUTED = "#6b7280"       # 次要说明
-ACCENT = "#2563eb"      # 主色（按钮 / 选中态）
-ACCENT_ACTIVE = "#1d4ed8"
-OK = "#0f766e"          # 成功的提示色
-DANGER = "#b3261e"      # 出错的提示色
+
+CAPTURE_TASKS = ("info", "devices")
+DEVICE_POLL_MS = 30_000        # 设备列表静默刷新间隔（插入手机后不用手点「刷新设备」）
+
+# 配色 / 字体：深色 + 青色强调的「科技感」风格。
+# 所有控件颜色都从这一块取（ttk 样式在 _configure_style 里统一配），想换肤只改这里。
+BG = "#0b0f17"          # 页面底色（近黑蓝）
+CARD = "#141a24"        # 卡片底色（卡片里的文字默认按它配）
+CARD_ALT = "#1b2431"    # 输入框 / 次级按钮底色
+BORDER = "#28313f"      # 边框
+BORDER_SOFT = "#1e2632"  # 更淡的分隔线
+TEXT = "#e6edf3"        # 正文
+MUTED = "#8b98ab"       # 次要说明
+BORDER_CONTROL = "#3b4b60"  # 复选框这类小控件的边框（比卡片边框亮一档，不然看不出是个控件）
+ACCENT = "#22d3ee"      # 主色（青）
+ACCENT_ACTIVE = "#0ea5b7"   # 主色按下 / 悬停
+ACCENT_SOFT = "#0f2f3a"     # 主色淡底（选中态）
+HOVER = "#243040"       # 次级按钮悬停
+OK = "#34d399"          # 成功的提示色
+DANGER = "#f87171"      # 出错的提示色
+
+FONT = "Microsoft YaHei UI" if sys.platform == "win32" else "PingFang SC"
+MONO = "Consolas" if sys.platform == "win32" else "Menlo"
 
 
 # --------------------------------------------------------------------------- #
@@ -143,6 +157,75 @@ def _enable_dpi_awareness() -> None:
         pass
 
 
+class DarkCheck(tk.Frame):
+    """深色界面下的复选框：自己画，两种状态一眼分得清。
+
+    Tk 自带的那两种在这套深色配色下都不能用 ——
+      tk.Checkbutton：Windows 上把 selectcolor 当成指示器**两种状态**的填充色，
+        未选中就已经是一整块实心主色，跟选中只差「里面有没有对勾」；
+      ttk.Checkbutton：clam 主题下是白底黑叉，跟整体配色更不搭。
+    所以这里用 Canvas 自己画 15x15 小方块：
+      未选中 = 深色底 + 灰边框，选中 = 主色实心 + 深色对勾，
+      鼠标移上去描边和文字变主色；点方块或点文字都能切，变量变了自动重画（双向同步）。
+    """
+
+    SIZE = 15
+    GAP = 7
+
+    def __init__(self, parent, text: str, variable, command=None, **kwargs) -> None:
+        super().__init__(parent, background=CARD, cursor="hand2", **kwargs)
+        self.var = variable
+        self.command = command
+        self._hover = False
+        self.canvas = tk.Canvas(self, width=self.SIZE, height=self.SIZE, background=CARD,
+                                highlightthickness=0, borderwidth=0, takefocus=1)
+        self.canvas.pack(side="left")
+        self.label = tk.Label(self, text=text, background=CARD, foreground=TEXT,
+                              font=(FONT, 10), cursor="hand2", anchor="w", justify="left")
+        self.label.pack(side="left", padx=(self.GAP, 0))
+        for widget in (self.canvas, self.label):
+            widget.bind("<Button-1>", self._toggle)
+            widget.bind("<Enter>", self._enter)
+            widget.bind("<Leave>", self._leave)
+        self.canvas.bind("<space>", self._toggle)
+        self._trace = variable.trace_add("write", lambda *_: self._draw())
+        self._draw()
+
+    def _enter(self, _event=None) -> None:
+        self._hover = True
+        self.label.configure(foreground=ACCENT)
+        self._draw()
+
+    def _leave(self, _event=None) -> None:
+        self._hover = False
+        self.label.configure(foreground=TEXT)
+        self._draw()
+
+    def _toggle(self, _event=None) -> str:
+        self.var.set(not self.var.get())      # 变量一变就重画，不用自己刷新
+        if self.command:
+            self.command()
+        return "break"
+
+    def _draw(self) -> None:
+        checked = bool(self.var.get())
+        if checked:
+            fill, edge = ACCENT, ACCENT
+        elif self._hover:
+            fill, edge = ACCENT_SOFT, ACCENT
+        else:
+            fill, edge = CARD_ALT, BORDER_CONTROL
+        self.canvas.delete("all")
+        self.canvas.create_rectangle(0, 0, self.SIZE - 1, self.SIZE - 1,
+                                     fill=fill, outline=edge)
+        if checked:
+            # 对勾用卡片底色画，压在主色块上，对比度够高
+            self.canvas.create_line(3, 8, 6, 11, fill=CARD, width=2,
+                                    capstyle="round", joinstyle="round")
+            self.canvas.create_line(6, 11, 12, 4, fill=CARD, width=2,
+                                    capstyle="round", joinstyle="round")
+
+
 # --------------------------------------------------------------------------- #
 # 主窗口
 # --------------------------------------------------------------------------- #
@@ -154,7 +237,7 @@ class IpatoolGui:
         self.root.minsize(940, 660)
         self.root.configure(background=BG)
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(3, weight=1)
+        self.root.rowconfigure(2, weight=1)
 
         self.q: "queue.Queue[tuple[str, object]]" = queue.Queue()
         self.busy = False
@@ -163,87 +246,98 @@ class IpatoolGui:
 
         self._configure_style()
         self._make_vars()
-        self._build_header()
+        self._restore_gh_config()
         self._build_inputs()
         self._build_tabs()
         self._build_bottom()
 
         self.root.after(80, self._poll)
+        # 开机就读一次设备，之后空闲时定时静默刷新（插上手机不用手点「刷新设备」）
+        self.root.after(1200, self._auto_refresh_devices)
+        # 工作线程里那句「已有同名 App，要不要卸载重装」接到界面弹窗上
+        device_mod.set_confirm_hook(self._ask_confirm)
 
     # ------------------------------------------------------------------ #
     # 界面风格
     # ------------------------------------------------------------------ #
     def _configure_style(self) -> None:
-        """统一换一套更干净的 ttk 外观（clam 主题下这些选项都能改）。"""
+        """统一一套深色「科技感」外观：颜色取自上面的配色常量，字体取 FONT / MONO。
+
+        约定：卡片里的控件默认按 CARD 底配（TLabel 就是 CARD 底），
+        页面底色上直接放的少量控件用 Page*.TLabel。
+        """
         style = ttk.Style(self.root)
         if "clam" in style.theme_names():
             style.theme_use("clam")
 
-        family = "Microsoft YaHei UI" if sys.platform == "win32" else "Helvetica"
-        self.root.option_add("*Font", (family, 9))
+        self.root.option_add("*Font", (FONT, 10))
+        # 下拉框弹出列表是 Tk 原生 Listbox，样式得单独喂
+        self.root.option_add("*TCombobox*Listbox.background", CARD_ALT)
+        self.root.option_add("*TCombobox*Listbox.foreground", TEXT)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", ACCENT_SOFT)
+        self.root.option_add("*TCombobox*Listbox.selectForeground", TEXT)
+        self.root.option_add("*TCombobox*Listbox.borderWidth", 0)
 
-        style.configure(".", background=BG, foreground=TEXT, fieldbackground=CARD, bordercolor=BORDER)
+        style.configure(".", background=BG, foreground=TEXT, fieldbackground=CARD_ALT,
+                        bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER,
+                        troughcolor=BG, focuscolor=ACCENT, font=(FONT, 10))
+
         style.configure("TFrame", background=BG)
-        style.configure("TLabel", background=BG, foreground=TEXT)
-        style.configure("Muted.TLabel", foreground=MUTED)
-        style.configure("Title.TLabel", font=(family, 15, "bold"), foreground="#111827")
-        style.configure("Sub.TLabel", foreground=MUTED)
+        style.configure("Card.TFrame", background=CARD)
+        style.configure("CardRow.TFrame", background=CARD)
 
-        style.configure("TLabelframe", background=BG, bordercolor=BORDER, lightcolor=BG, darkcolor=BORDER)
-        style.configure("TLabelframe.Label", background=BG, foreground="#111827", font=(family, 9, "bold"))
+        style.configure("TLabel", background=CARD, foreground=TEXT)
+        style.configure("Page.TLabel", background=BG, foreground=TEXT)
+        style.configure("Muted.TLabel", background=CARD, foreground=MUTED)
+        style.configure("PageMuted.TLabel", background=BG, foreground=MUTED)
+        style.configure("Section.TLabel", background=CARD, foreground=TEXT,
+                        font=(FONT, 10, "bold"))
+        style.configure("Status.TLabel", background=BG, foreground=OK)
 
-        style.configure("TButton", background=CARD, foreground=TEXT, bordercolor=BORDER,
-                        padding=(10, 5), relief="flat", focuscolor=ACCENT)
+        style.configure("TButton", background=CARD_ALT, foreground=TEXT, bordercolor=BORDER,
+                        padding=(14, 7), relief="flat", focuscolor=ACCENT, font=(FONT, 10))
         style.map("TButton",
-                  background=[("active", "#eef2ff"), ("disabled", "#f1f3f7")],
-                  bordercolor=[("focus", ACCENT)])
-        style.configure("Accent.TButton", background=ACCENT, foreground="#ffffff",
-                        bordercolor=ACCENT, padding=(14, 6))
+                  background=[("active", HOVER), ("pressed", HOVER), ("disabled", "#161d27")],
+                  foreground=[("disabled", "#5b6675")],
+                  bordercolor=[("focus", ACCENT), ("active", ACCENT)])
+        style.configure("Accent.TButton", background=ACCENT, foreground="#04212a",
+                        bordercolor=ACCENT, padding=(20, 8), font=(FONT, 10, "bold"))
         style.map("Accent.TButton",
-                  background=[("active", ACCENT_ACTIVE), ("disabled", "#a5c0f5")],
-                  foreground=[("disabled", "#ffffff")])
+                  background=[("active", ACCENT_ACTIVE), ("pressed", ACCENT_ACTIVE),
+                              ("disabled", "#14424d")],
+                  foreground=[("disabled", "#6d8087")],
+                  bordercolor=[("disabled", "#14424d")])
 
-        style.configure("TCheckbutton", background=BG, foreground=TEXT, indicatorcolor=CARD)
-        style.map("TCheckbutton",
-                  background=[("active", BG)],
-                  indicatorcolor=[("selected", ACCENT), ("active", "#eef2ff")])
-
-        style.configure("TEntry", fieldbackground=CARD, bordercolor=BORDER, padding=(6, 4),
+        style.configure("TEntry", fieldbackground=CARD_ALT, foreground=TEXT, bordercolor=BORDER,
+                        padding=(8, 6), insertcolor=ACCENT, lightcolor=BORDER, darkcolor=BORDER)
+        style.map("TEntry",
+                  bordercolor=[("focus", ACCENT)],
+                  lightcolor=[("focus", ACCENT)], darkcolor=[("focus", ACCENT)],
+                  fieldbackground=[("disabled", "#12181f")],
+                  foreground=[("disabled", MUTED)])
+        style.configure("TCombobox", fieldbackground=CARD_ALT, background=CARD_ALT, foreground=TEXT,
+                        bordercolor=BORDER, arrowcolor=MUTED, padding=(8, 6),
                         lightcolor=BORDER, darkcolor=BORDER)
-        style.map("TEntry", bordercolor=[("focus", ACCENT)],
-                  lightcolor=[("focus", ACCENT)], darkcolor=[("focus", ACCENT)])
-        style.configure("TCombobox", fieldbackground=CARD, bordercolor=BORDER, padding=(6, 4))
-        style.map("TCombobox", bordercolor=[("focus", ACCENT)],
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", CARD_ALT), ("disabled", "#12181f")],
+                  foreground=[("readonly", TEXT)],
+                  arrowcolor=[("active", ACCENT)],
+                  bordercolor=[("focus", ACCENT), ("active", ACCENT)],
                   lightcolor=[("focus", ACCENT)], darkcolor=[("focus", ACCENT)])
 
-        style.configure("TNotebook", background=BG, bordercolor=BORDER, tabmargins=(2, 4, 2, 0))
-        style.configure("TNotebook.Tab", background="#e6e9ef", foreground=TEXT,
-                        bordercolor=BORDER, padding=(16, 7), font=(family, 9, "bold"), focuscolor=BG)
-        style.map("TNotebook.Tab",
-                  background=[("selected", CARD), ("active", "#eef2ff")],
-                  foreground=[("selected", ACCENT)])
-
-        style.configure("Treeview", background=CARD, fieldbackground=CARD, bordercolor=BORDER,
-                        rowheight=26)
-        style.configure("Treeview.Heading", background="#e9edf4", foreground=TEXT, relief="flat")
+        style.configure("Treeview", background=CARD, fieldbackground=CARD, foreground=TEXT,
+                        bordercolor=BORDER, rowheight=28, font=(FONT, 10))
+        style.configure("Treeview.Heading", background=CARD_ALT, foreground=MUTED,
+                        relief="flat", font=(FONT, 10, "bold"))
         style.map("Treeview",
-                  background=[("selected", "#dbeafe")],
-                  foreground=[("selected", "#111827")])
+                  background=[("selected", ACCENT_SOFT)],
+                  foreground=[("selected", TEXT)])
+        style.map("Treeview.Heading", background=[("active", HOVER)])
 
-        style.configure("TSeparator", background=BORDER)
-        style.configure("Vertical.TScrollbar", background="#e9edf4", bordercolor=BORDER,
-                        troughcolor=BG, arrowcolor=TEXT)
-
-    # ------------------------------------------------------------------ #
-    # 顶部标题
-    # ------------------------------------------------------------------ #
-    def _build_header(self) -> None:
-        head = ttk.Frame(self.root, padding=(14, 10, 14, 8))
-        head.grid(row=0, column=0, sticky="ew")
-        head.columnconfigure(0, weight=1)
-        ttk.Label(head, text=APP_TITLE, style="Title.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(head, text=APP_SUBTITLE, style="Sub.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 0))
-        ttk.Separator(self.root, orient="horizontal").grid(row=1, column=0, sticky="ew")
+        style.configure("Vertical.TScrollbar", background=CARD_ALT, bordercolor=BG,
+                        troughcolor=BG, arrowcolor=MUTED, relief="flat", width=12)
+        style.map("Vertical.TScrollbar", background=[("active", HOVER)])
+        style.configure("TSeparator", background=BORDER_SOFT)
 
     # ------------------------------------------------------------------ #
     # 变量
@@ -269,6 +363,27 @@ class IpatoolGui:
         self.v_entitlements = tk.StringVar()
         self.v_zip_level = tk.StringVar(value="auto")
         self.v_remember = tk.BooleanVar(value=True)
+
+        # 证书列表「选择」用（像爱思那样：存下来 → 下拉里选一个，不用每次填路径密码）
+        self.v_cert = tk.StringVar()            # 「使用证书」下拉里显示的文本
+        self.v_cert_summary = tk.StringVar()    # 下拉下面那行：到底会用哪个
+        self.certs: list[dict] = []             # 保存的证书：{id, name, p12, password, provision}
+        self._cert_keys: list[str] = []         # 下拉文本 → 键（'' / 'p12:id'）
+        self._cert_texts: list[str] = []
+
+        # 安装到设备：装哪个包（留空 = 自动用「输出」）+ 下拉里选一台连着的设备
+        self.v_install_ipa = tk.StringVar()
+        self.v_device = tk.StringVar()
+        self.v_device_summary = tk.StringVar()
+        self._device_keys: list[str] = []       # 下拉文本 → UDID（'' = 交给后端自己挑）
+        self._device_texts: list[str] = ["（未读取）"]
+
+        # 设备自动刷新用：上次读到的设备集合（没变就不刷日志）、上次的报错（同一段只贴一次）
+        self._device_sig: tuple[str, ...] | None = None
+        self._device_err = ""
+
+        self.answer_q: "queue.Queue[str]" = queue.Queue()   # 工作线程 ← 界面线程 的答案
+
         self.v_hardened = tk.BooleanVar(value=False)
         self.v_dry_run = tk.BooleanVar(value=False)
         self.v_verbose = tk.BooleanVar(value=False)
@@ -276,20 +391,59 @@ class IpatoolGui:
         # 状态
         self.v_status = tk.StringVar(value="就绪")
 
+        # —— GitHub 导入 / Codemagic 构建 / GitHub Actions 编译（B 项本地注入签名本工具自带，不整合）——
+        self.v_gh_token = tk.StringVar()
+        self.v_owner = tk.StringVar(value=cloud_mod.OWNER)
+        self.v_repo = tk.StringVar(value=cloud_mod.REPO)
+        self.v_branch = tk.StringVar(value="main")
+        self.v_local = tk.StringVar(value=r"d:\Microsoft VS Code\qnet\ios_demo")
+        self.v_target = tk.StringVar(value="")
+        self.v_visibility = tk.StringVar(value="公开")
+        self.v_auto_create = tk.BooleanVar(value=False)
+        self.v_cm_token = tk.StringVar()
+        self.v_cm_app = tk.StringVar()
+        self.v_sign_mode = tk.StringVar(value="ad-hoc(付费账号)")
+        self.v_apple_team_id = tk.StringVar()
+        self.v_workflow_file = tk.StringVar(value="build-tweak.yml")
+        self.v_dylib_path = tk.StringVar()
+        self.v_ipa_path = tk.StringVar()
+        # 页面内部状态（下拉选项 / 最近运行等）
+        self._repo_full: dict[str, str] = {}
+        self.repo_cb = None
+        self.repo_cb2 = None
+        self.wf_cb = None
+        self.cm_app_cb = None
+        self._repo_info = tk.StringVar(value="")
+        self.app_map: dict[str, str] = {}
+        self.last_run_id = None
+        self.last_build_id = None
+        self.last_artifacts: list = []
+        self._restore_gh_config()
+        # GitHub 配置：改动即自动保存（token / 仓库等），避免只靠「导入」才落盘
+        for var in (self.v_gh_token, self.v_cm_token, self.v_owner, self.v_repo,
+                    self.v_branch, self.v_local, self.v_target, self.v_sign_mode,
+                    self.v_apple_team_id, self.v_auto_create, self.v_visibility,
+                    self.v_workflow_file, self.v_dylib_path, self.v_ipa_path):
+            var.trace_add("write", self._schedule_save_gh)
+
         # 上次的签名设置（证书 / 密码）：启动时恢复，之后改动自动保存
         self._save_job: str | None = None
+        self._gh_save_job: str | None = None
         self._restore_settings()
         for var in (self.v_sign, self.v_identity, self.v_p12, self.v_p12_password,
-                    self.v_provision, self.v_entitlements, self.v_zip_level,
-                    self.v_remember):
+                    self.v_provision, self.v_entitlements,
+                    self.v_zip_level, self.v_remember):
             var.trace_add("write", self._schedule_save)
+        # 「安装包 / 输出 / 输入 / 就地覆盖」任一变化，都把那行摘要刷新一下
+        for var in (self.v_install_ipa, self.v_output, self.v_input, self.v_inplace):
+            var.trace_add("write", lambda *_a: self._refresh_install_summary())
 
     # ------------------------------------------------------------------ #
     # 顶部：输入 / 输出
     # ------------------------------------------------------------------ #
     def _build_inputs(self) -> None:
-        box = ttk.LabelFrame(self.root, text="IPA 文件", padding=(10, 6))
-        box.grid(row=2, column=0, sticky="ew", padx=12, pady=(10, 6))
+        card, box = self._card(self.root, "IPA 文件")
+        card.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 8))
         box.columnconfigure(1, weight=1)
         box.columnconfigure(4, weight=1)
 
@@ -304,15 +458,15 @@ class IpatoolGui:
 
         hint = ttk.Label(
             box,
-            text="输入可以是 .ipa，也可以是已解包且含 Payload 的目录；输出留空则按默认名字生成（覆盖原文件时忽略此项）。"
-                 "选中后不会自动解析，需要包内信息时点「读取信息」。",
+            text="输入支持 .ipa 或含 Payload 的目录；输出留空则自动命名。"
+                 "选中后不解析，要看包内信息点「读取信息」。",
             style="Muted.TLabel", justify="left", wraplength=940,
         )
         hint.grid(row=1, column=0, columnspan=6, sticky="w", pady=(6, 0))
 
-        ttk.Checkbutton(
-            box, text="直接覆盖输入文件（--in-place）", variable=self.v_inplace, command=self._sync_inplace,
-        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        self._check(box, "直接覆盖输入文件（--in-place）", self.v_inplace,
+                    command=self._sync_inplace).grid(
+            row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         self.msg_io = ttk.Label(box, text="", foreground=DANGER)
         self.msg_io.grid(row=2, column=3, columnspan=3, sticky="w")
@@ -340,11 +494,7 @@ class IpatoolGui:
         根本不需要这一步。要看 Bundle ID / 名称时，点「读取信息」再读。
         """
         self.v_input.set(path)
-        self._append(
-            f"[输入] {path}\n"
-            "        已选中，未解析（只想注入 / 签名可以直接开始执行）。\n"
-            "        需要包内的 Bundle ID / 名称 / 内嵌 bundle 时，点「读取信息」。\n"
-        )
+        self._append(f"[输入] {path}（未解析，可直接执行）\n")
         self._set_status("已选择输入（未解析）")
 
     def _pick_output(self) -> None:
@@ -362,140 +512,236 @@ class IpatoolGui:
     # 页签
     # ------------------------------------------------------------------ #
     def _build_tabs(self) -> None:
-        self.nb = ttk.Notebook(self.root)
-        self.nb.grid(row=3, column=0, sticky="nsew", padx=12)
-        self._build_info_tab()
+        # 自定义页签栏：用固定 padx/pady 的标签当按钮，选中只换颜色，
+        # 不会被 ttk 主题把选中态画小。
+        self.tabbar = tk.Frame(self.root, bg=BG)
+        self.tabbar.grid(row=1, column=0, sticky="ew", padx=12)
+
+        self.page_area = tk.Frame(self.root, bg=BG)
+        self.page_area.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        self.page_area.columnconfigure(0, weight=1)
+        self.page_area.rowconfigure(0, weight=1)
+
+        self._tab_buttons: dict[str, tk.Label] = {}
+        self._pages: dict[str, ttk.Frame] = {}
+        self._active_tab: str | None = None
+
         self._build_pack_tab()
+        self.info_page = self._build_info_tab()
+        self.github_page = self._build_github_tab()
+        self.codemagic_page = self._build_codemagic_tab()
+        self.compile_page = self._build_compile_tab()
+
+        self._add_tab("pack", "  改 ID · 注入 · 签名  ", self.pack_page)
+        self._add_tab("info", "  信息  ", self.info_page)
+        self._add_tab("github", "  GitHub 导入  ", self.github_page)
+        self._add_tab("codemagic", "  Codemagic 构建  ", self.codemagic_page)
+        self._add_tab("compile", "  编译打包  ", self.compile_page)
+
+        # 页签栏底下的分隔线，铺满整行
+        sep = tk.Frame(self.tabbar, bg=BORDER, height=1)
+        sep.pack(side="bottom", fill="x")
+
+        # 全局滚轮：悬浮在输入框等单行控件上 → 整页滚动；多行文本/列表/树自己滚
+        self.root.bind_all("<MouseWheel>", self._on_page_wheel)
+
+        self._select_tab("pack")
+
+    def _add_tab(self, key: str, label: str, page: ttk.Frame) -> None:
+        btn = tk.Label(
+            self.tabbar, text=label, bg=BG, fg=MUTED,
+            font=(FONT, 10, "bold"), padx=20, pady=9, cursor="hand2",
+        )
+        btn.pack(side="left")
+        btn.bind("<Button-1>", lambda _e, k=key: self._select_tab(k))
+        btn.bind("<Enter>", lambda _e, k=key: (
+            btn.config(fg=TEXT if self._active_tab != k else ACCENT)))
+        btn.bind("<Leave>", lambda _e, k=key: (
+            btn.config(fg=ACCENT if self._active_tab == k else MUTED)))
+        self._tab_buttons[key] = btn
+        self._pages[key] = page
+
+    def _select_tab(self, key: str) -> None:
+        if self._active_tab == key:
+            return
+        self._active_tab = key
+        for k, btn in self._tab_buttons.items():
+            active = (k == key)
+            btn.config(bg=(CARD if active else BG), fg=(ACCENT if active else MUTED))
+        for k, page in self._pages.items():
+            if k == key:
+                page.grid(row=0, column=0, sticky="nsew")
+                page.lift()
+            else:
+                page.grid_remove()
 
     # ---- 改 ID · 注入 · 签名（合并页） -------------------------------- #
     def _build_pack_tab(self) -> None:
-        page = self._scroll_page("  改 ID · 注入 · 签名  ")
+        page = self._scroll_page()
         self._build_pack_identity(page, 0)
         self._build_pack_dylib(page, 1)
         self._build_pack_sign(page, 2)
-        self._build_pack_keep(page, 3)
-        self._build_pack_run(page, 4)
+        self._build_pack_install(page, 3)
+        self._build_pack_keep(page, 4)
 
     # ---- 信息 --------------------------------------------------------- #
     def _build_info_tab(self) -> None:
-        page = ttk.Frame(self.nb, padding=10)
-        self.nb.add(page, text="  信息  ")
+        # 也用可滚动页：内容高时整页滚，底部不会被裁掉
+        outer, page = self._make_scroll(self.page_area)
+        self.info_page = outer
         page.columnconfigure(0, weight=1)
-        page.rowconfigure(1, weight=1)
-        page.rowconfigure(3, weight=1)
 
         bar = ttk.Frame(page)
         bar.grid(row=0, column=0, sticky="ew")
         ttk.Button(bar, text="读取信息", command=self._load_info).pack(side="left")
-        ttk.Button(bar, text="选择目录…", command=self._pick_input_dir).pack(side="left", padx=6)
+        ttk.Button(bar, text="选择目录…", command=self._pick_input_dir).pack(side="left", padx=8)
         ttk.Label(
-            bar, text="  解析包内的 Bundle ID / 名称 / 内嵌 bundle / 已注入 dylib",
-            style="Muted.TLabel",
+            bar, text="解包后读取，包大时稍慢",
+            style="PageMuted.TLabel",
         ).pack(side="left")
 
         self.info_tree = ttk.Treeview(page, columns=("k", "v"), show="headings", height=9)
         self.info_tree.heading("k", text="属性")
         self.info_tree.heading("v", text="值")
-        self.info_tree.column("k", width=140, stretch=False)
+        self.info_tree.column("k", width=150, stretch=False)
         self.info_tree.column("v", width=700)
-        self.info_tree.grid(row=1, column=0, sticky="nsew", pady=(8, 8))
+        self.info_tree.grid(row=1, column=0, sticky="ew", pady=(10, 10))
 
-        ttk.Label(page, text="内嵌 bundle / 已注入 dylib").grid(row=2, column=0, sticky="w")
-        detail_box = ttk.Frame(page)
-        detail_box.grid(row=3, column=0, sticky="nsew", pady=(4, 0))
-        detail_box.columnconfigure(0, weight=1)
+        card, detail_box = self._card(page, "内嵌 bundle / 已注入 dylib")
+        card.grid(row=2, column=0, sticky="ew")
+        detail_box.columnconfigure(0, weight=1, minsize=0)
+        detail_box.columnconfigure(1, weight=0)   # 同上：滚动条列别抢宽度
         detail_box.rowconfigure(0, weight=1)
         self.info_detail = tk.Text(
-            detail_box, height=8, wrap="none", state="disabled", font=("Consolas", 9),
-            background=CARD, foreground=TEXT, relief="solid", borderwidth=1,
-            highlightthickness=1, highlightcolor=BORDER, highlightbackground=BORDER,
+            detail_box, height=8, wrap="none", state="disabled", font=(MONO, 9),
+            background=CARD_ALT, foreground=TEXT, relief="flat", borderwidth=0,
+            highlightthickness=1, highlightcolor=ACCENT, highlightbackground=BORDER,
+            padx=8, pady=6,
         )
         self.info_detail.grid(row=0, column=0, sticky="nsew")
         bar_y = ttk.Scrollbar(detail_box, orient="vertical", command=self.info_detail.yview)
-        bar_y.grid(row=0, column=1, sticky="ns")
-        self.info_detail.configure(yscrollcommand=bar_y.set)
+        bar_y.grid(row=0, column=1, sticky="ns", padx=(2, 0))
+        self.info_detail.configure(yscrollcommand=self._fade_scrollbar(bar_y))
+        return outer
 
-    def _scroll_page(self, title: str) -> ttk.Frame:
+    def _make_scroll(self, parent) -> tuple[ttk.Frame, ttk.Frame]:
+        """造一个可竖向滚动的页：返回（外层页框, 内层内容 Frame）。
+
+        外层用 grid 放进页面区，内层像普通 Frame 一样往里加控件。
+        内容比窗口高时整页滚动，绝不裁掉底部。
         """
-        一个可以滚动的页签：内容比窗口高时出现竖向滚动条，而不是被裁掉。
-        返回内层 Frame，往里加控件即可（用法和普通页签一样）。
-        """
-        outer = ttk.Frame(self.nb)
-        self.nb.add(outer, text=title)
+        outer = ttk.Frame(parent)
         outer.columnconfigure(0, weight=1)
         outer.rowconfigure(0, weight=1)
 
         canvas = tk.Canvas(outer, background=BG, highlightthickness=0, borderwidth=0)
         canvas.grid(row=0, column=0, sticky="nsew")
+        canvas._page_scroll = True
         vbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
         vbar.grid(row=0, column=1, sticky="ns")
-        canvas.configure(yscrollcommand=vbar.set)
+        canvas.configure(yscrollcommand=self._fade_scrollbar(vbar))
 
         inner = ttk.Frame(canvas, padding=(10, 8, 10, 8))
+        inner.columnconfigure(0, weight=1)
         window = canvas.create_window((0, 0), window=inner, anchor="nw")
 
         inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window, width=e.width))
+        return outer, inner
 
-        def _wheel(event):
-            # 多行文本 / 列表自己会滚，别抢它们的滚轮
-            if isinstance(event.widget, (tk.Text, tk.Listbox)):
-                return None
+    def _on_page_wheel(self, event):
+        """鼠标在页面上滚：只要悬停在某个可滚页面里（输入框 / 信息框 / 列表 /
+        树都算），就滚动整页；只有不在页面里的自带滚动控件（如底部日志）才自己滚。"""
+        w = event.widget
+        cv = self._find_page_canvas(w)
+        if cv is not None:
             delta = getattr(event, "delta", 0)
-            if not delta:
-                return None
-            step = int(-delta / 120) if abs(delta) >= 120 else (-1 if delta > 0 else 1)
-            canvas.yview_scroll(step or 1, "units")
+            if delta:
+                step = int(-delta / 120) if abs(delta) >= 120 else (-1 if delta > 0 else 1)
+                cv.yview_scroll(step or 1, "units")
             return "break"
+        # 不在可滚页面里（如底部日志框）：交给自带滚动条的控件自己滚
+        if isinstance(w, (tk.Text, tk.Listbox, ttk.Treeview)) and self._can_self_scroll(w):
+            delta = getattr(event, "delta", 0)
+            if delta:
+                step = int(-delta / 120) if abs(delta) >= 120 else (-1 if delta > 0 else 1)
+                w.yview_scroll(step or 1, "units")
+            return "break"
+        return None
 
-        # 子控件会吃掉滚轮事件，所以鼠标进本页时临时挂个全局绑定，离开就摘掉
-        canvas.bind("<MouseWheel>", _wheel)
-        outer.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _wheel))
-        outer.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+    @staticmethod
+    def _can_self_scroll(w) -> bool:
+        """控件自己能不能滚：有竖向滚动条、且内容确实超出可视区才自己滚。"""
+        try:
+            if not w.cget("yscrollcommand"):
+                return False
+            first, last = w.yview()
+        except Exception:
+            return False
+        return not (first <= 0.0 and last >= 1.0)
+
+    @staticmethod
+    def _find_page_canvas(w):
+        while w is not None and not isinstance(w, tk.Tk):
+            if getattr(w, "_page_scroll", False):
+                return w
+            w = w.master
+        return None
+
+    def _scroll_page(self) -> ttk.Frame:
+        """
+        一个可以滚动的页面：内容比窗口高时出现竖向滚动条，而不是被裁掉。
+        返回内层 Frame，往里加控件即可（用法和普通页面一样）。
+        """
+        outer, inner = self._make_scroll(self.page_area)
+        self.pack_page = outer
         return inner
 
     # ---- 改 ID / 名称 -------------------------------------------------- #
     def _build_pack_identity(self, page, row: int) -> None:
-        box = self._group(page, "改 Bundle ID / 名称（留空表示不改）", row)
+        box = self._group(page, "改 ID / 名称（留空不改）", row)
         self._entry(box, 0, "Bundle Identifier", self.v_bundle_id, "如 com.company.newapp")
-        self._entry(box, 1, "显示名称", self.v_name, "CFBundleDisplayName（桌面图标下的名字）")
-        ttk.Checkbutton(
-            box, text="不同步修改本地化名称（InfoPlist.strings / --no-localized）",
-            variable=self.v_no_localized,
-        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        self._entry(box, 1, "显示名称", self.v_name, "桌面图标下的名字")
+        self._check(box, "不改本地化名称（--no-localized）", self.v_no_localized).grid(
+            row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
     # ---- 注入 dylib ---------------------------------------------------- #
     def _build_pack_dylib(self, page, row: int) -> None:
-        box = self._group(page, "注入 dylib（不注入就留空）", row)
-        wrap = ttk.Frame(box)
-        wrap.grid(row=0, column=0, columnspan=2, sticky="ew")
+        box = self._group(page, "注入 dylib", row)
+        wrap = ttk.Frame(box, style="Card.TFrame")
+        wrap.grid(row=0, column=0, columnspan=4, sticky="ew")
         wrap.columnconfigure(0, weight=1)
         self.list_dylibs = tk.Listbox(
-            wrap, height=6, selectmode="extended", font=("Consolas", 9),
-            background=CARD, foreground=TEXT, relief="solid", borderwidth=1,
-            highlightthickness=1, highlightcolor=BORDER, highlightbackground=BORDER,
-            activestyle="none",
+            wrap, height=5, selectmode="extended", font=(MONO, 9),
+            background=CARD_ALT, foreground=TEXT, activestyle="none",
+            relief="flat", borderwidth=0, highlightthickness=1,
+            highlightcolor=ACCENT, highlightbackground=BORDER,
+            selectbackground=ACCENT_SOFT, selectforeground=TEXT,
         )
         self.list_dylibs.grid(row=0, column=0, sticky="ew")
         bar_y = ttk.Scrollbar(wrap, orient="vertical", command=self.list_dylibs.yview)
-        bar_y.grid(row=0, column=1, sticky="ns")
-        self.list_dylibs.configure(yscrollcommand=bar_y.set)
+        bar_y.grid(row=0, column=1, sticky="ns", padx=(2, 0))
+        self.list_dylibs.configure(yscrollcommand=self._fade_scrollbar(bar_y))
 
-        btns = ttk.Frame(box)
-        btns.grid(row=0, column=2, sticky="nw", padx=(10, 0))
-        ttk.Button(btns, text="添加…", width=10, command=self._add_dylib).pack()
-        ttk.Button(btns, text="移除", width=10, command=self._remove_dylib).pack(pady=4)
-        ttk.Button(btns, text="清空", width=10, command=self._clear_dylib).pack(pady=4)
-        ttk.Button(btns, text="核对产物", width=10, command=self._list_injected).pack()
+        btns = ttk.Frame(box, style="Card.TFrame")
+        btns.grid(row=1, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        for index, (label, command) in enumerate((
+            ("添加 dylib…", self._add_dylib),
+            ("移除所选", self._remove_dylib),
+            ("清空", self._clear_dylib),
+            ("核对产物", self._list_injected),
+        )):
+            ttk.Button(btns, text=label, command=command).pack(
+                side="left", padx=(0 if index == 0 else 8, 0))
 
         ttk.Label(
             box, style="Muted.TLabel", justify="left",
-            text="dylib 会被放进 App 的 Frameworks/，并写入主可执行文件的 LC_LOAD_DYLIB；列表顺序即加载顺序。",
-        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
+            text="放进 Frameworks/ 并写入 LC_LOAD_DYLIB；列表顺序＝加载顺序。",
+        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
     # ---- 签名 ---------------------------------------------------------- #
     def _build_pack_sign(self, page, row: int) -> None:
-        box = self._group(page, "签名（改 ID / 注入共用，二选一，都不给则 ad-hoc 签名，真机装不上）", row)
+        box = self._group(page, "签名（不选证书则 ad-hoc，真机装不上）", row)
         ttk.Label(box, text="后端").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=3)
         ttk.Combobox(
             box, textvariable=self.v_sign, values=list(signer.BACKENDS),
@@ -503,110 +749,166 @@ class IpatoolGui:
         ).grid(row=0, column=1, sticky="w", pady=3)
         ttk.Label(
             box, style="Muted.TLabel", justify="left", wraplength=420,
-            text="auto：macOS 用 codesign，非 macOS 用 zsign（要装；也可用环境变量 "
-                 "IPATOOL_ZSIGN 指路径）；none 只重打包不签名",
+            text="auto：macOS 用 codesign，其他平台用项目自带的 zsign；none＝只打包不签名",
         ).grid(row=0, column=2, sticky="w", padx=(10, 0), pady=3)
 
-        ttk.Label(box, text="ID 签名").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=3)
-        self.cb_identity = ttk.Combobox(box, textvariable=self.v_identity, values=[], width=46)
-        self.cb_identity.grid(row=1, column=1, columnspan=2, sticky="ew", pady=3)
-        ttk.Button(box, text="读取系统证书", command=self._load_certs).grid(row=1, column=3, sticky="w", padx=(10, 0), pady=3)
+        ttk.Label(box, text="使用证书").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=3)
+        self.cb_cert = ttk.Combobox(box, textvariable=self.v_cert, values=[], state="readonly", width=46)
+        self.cb_cert.grid(row=1, column=1, columnspan=3, sticky="ew", pady=3)
+        self.cb_cert.bind("<<ComboboxSelected>>", self._apply_cert_choice)
 
-        self._entry(box, 2, "证书文件", self.v_p12, "p12 / pfx（证书签名）", browse=lambda: self._pick_file(self.v_p12, [("证书", "*.p12 *.pfx"), ("所有文件", "*.*")]))
-        ttk.Label(box, text="证书密码").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=3)
-        ttk.Entry(box, textvariable=self.v_p12_password, show="*", width=30).grid(row=3, column=1, sticky="w", pady=3)
-        ttk.Label(box, text="也可留空，用环境变量 IPATOOL_P12_PASSWORD", style="Muted.TLabel").grid(
-            row=3, column=2, columnspan=2, sticky="w", padx=(10, 0), pady=3,
-        )
+        certbtns = ttk.Frame(box)
+        certbtns.grid(row=2, column=1, columnspan=3, sticky="w")
+        ttk.Button(certbtns, text="添加证书…", command=self._open_cert_dialog).pack(side="left")
+        ttk.Button(certbtns, text="编辑…", command=self._edit_cert).pack(side="left", padx=(6, 0))
+        ttk.Button(certbtns, text="删除", command=self._delete_cert).pack(side="left", padx=(6, 0))
 
-        self._entry(box, 4, "描述文件", self.v_provision, "embedded.mobileprovision，改过 Bundle ID 时必须匹配", browse=lambda: self._pick_file(self.v_provision, [("描述文件", "*.mobileprovision"), ("所有文件", "*.*")]))
+        ttk.Label(
+            box, style="Muted.TLabel", justify="left", wraplength=680,
+            textvariable=self.v_cert_summary,
+        ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(2, 3))
+
+        self._entry(box, 4, "描述文件", self.v_provision, "改过 Bundle ID 需匹配", browse=lambda: self._pick_file(self.v_provision, [("描述文件", "*.mobileprovision"), ("所有文件", "*.*")]))
+
+    # ---- 安装到设备 ---------------------------------------------------- #
+    def _build_pack_install(self, page, row: int) -> None:
+        box = self._group(page, "安装到设备", row)
+        # 装哪个包：留空 = 自动用「输出」（就地覆盖时用「输入」），也可以自己挑一个
+        ttk.Label(box, text="安装包").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=3)
+        ttk.Entry(box, textvariable=self.v_install_ipa).grid(
+            row=0, column=1, columnspan=2, sticky="ew", pady=3)
+        ipabtns = ttk.Frame(box)
+        ipabtns.grid(row=0, column=3, sticky="w", padx=(10, 0))
+        ttk.Button(ipabtns, text="选择…", width=8, command=self._pick_install_ipa).pack(side="left")
+        ttk.Button(ipabtns, text="清除", width=6, command=self._clear_install_ipa).pack(
+            side="left", padx=(6, 0))
+
+        ttk.Label(box, text="设备").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=3)
+        self.cb_device = ttk.Combobox(box, textvariable=self.v_device, values=[],
+                                      state="readonly", width=46)
+        self.cb_device.grid(row=1, column=1, columnspan=2, sticky="ew", pady=3)
+        ttk.Button(box, text="刷新设备", command=self._load_devices).grid(
+            row=1, column=3, sticky="w", padx=(10, 0), pady=3)
+        self.cb_device.bind("<<ComboboxSelected>>", lambda _e: self._refresh_install_summary())
+
+        acts = ttk.Frame(box)
+        acts.grid(row=2, column=1, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Button(acts, text="安装到设备", command=self._install_to_device).pack(side="left")
+        ttk.Button(acts, text="打开产物文件夹", command=self._reveal_output).pack(
+            side="left", padx=(6, 0))
+        ttk.Button(acts, text="复制路径", command=self._copy_output_path).pack(
+            side="left", padx=(6, 0))
+        ttk.Label(
+            box, style="Muted.TLabel", justify="left", wraplength=680,
+            textvariable=self.v_device_summary,
+        ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        ttk.Label(
+            box, style="Muted.TLabel", justify="left", wraplength=680,
+            text="没有证书时：把产物拖给爱思 / Sideloadly 之类去签，它们自带 Apple ID 认证",
+        ).grid(row=4, column=0, columnspan=4, sticky="w", pady=(0, 2))
+        self._refresh_install_summary()
 
     # ---- 记住设置 ------------------------------------------------------ #
     def _build_pack_keep(self, page, row: int) -> None:
         # 证书 / 密码存下来，下次打开自动填好
         keep = self._group(page, "记住设置", row)
-        ttk.Checkbutton(
-            keep, text="记住证书 / 密码 / ID 签名，下次打开自动填好",
-            variable=self.v_remember,
-        ).grid(row=0, column=0, columnspan=3, sticky="w")
+        self._check(keep, "记住证书 / 密码，下次自动填好", self.v_remember).grid(
+            row=0, column=0, columnspan=3, sticky="w")
         ttk.Label(
             keep, style="Muted.TLabel", justify="left", wraplength=620,
-            text=f"保存在本机配置文件里（明文）：{_gui_config_path()}\n"
-                 "不想留就取消勾选；也可以点右边按钮把已保存的清掉（不影响证书文件本身）。",
+            text=f"明文保存在 {_gui_config_path()}；取消勾选即不再保存",
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
         ttk.Button(
             keep, text="清除已保存的证书", command=self._clear_settings,
         ).grid(row=1, column=2, sticky="e", padx=(10, 0))
-
-    # ---- 执行 ---------------------------------------------------------- #
-    def _build_pack_run(self, page, row: int) -> None:
-        run = self._group(page, "执行", row)
-        ttk.Button(
-            run, text="改 ID / 名称（含签名）", width=20,
-            command=lambda: self._run_modify(False),
-        ).grid(row=0, column=0, sticky="w")
-        ttk.Button(
-            run, text="注入 dylib（含签名）", width=20,
-            command=lambda: self._run_inject(False),
-        ).grid(row=0, column=1, sticky="w", padx=(8, 0))
-        ttk.Button(
-            run, text="只重新签名", width=20,
-            command=lambda: self._run_sign(False),
-        ).grid(row=0, column=2, sticky="w", padx=(8, 0))
-        ttk.Label(
-            run, style="Muted.TLabel", justify="left", wraplength=620,
-            text="三个操作各自要解包打包一次，点哪个就只做哪个。\n"
-                 "底部「开始执行」按当前填写自动选：列表里有 dylib 就注入，填了 ID / 名称就改名，"
-                 "什么都没填就只重新打包 + 签名。「预览（dry-run）」只打印会改什么，不写文件。",
-        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
     # ------------------------------------------------------------------ #
     # 底部：日志 + 操作
     # ------------------------------------------------------------------ #
     def _build_bottom(self) -> None:
         area = ttk.Frame(self.root)
-        area.grid(row=4, column=0, sticky="nsew", padx=12, pady=(6, 12))
+        area.grid(row=3, column=0, sticky="nsew", padx=12, pady=(6, 12))
         area.columnconfigure(0, weight=1)
         area.rowconfigure(1, weight=1)
 
         bar = ttk.Frame(area)
         bar.grid(row=0, column=0, sticky="ew")
-        b_info = ttk.Button(bar, text="读取信息", command=self._load_info)
-        b_dry = ttk.Button(bar, text="预览（dry-run）", command=lambda: self._run_current(dry_run=True))
         b_go = ttk.Button(bar, text="开始执行", style="Accent.TButton",
                           command=lambda: self._run_current(dry_run=False))
-        for btn in (b_info, b_dry, b_go):
-            btn.pack(side="left", padx=(0, 8))
-        self.action_buttons = [b_info, b_dry, b_go]
-        ttk.Button(bar, text="清空日志", command=lambda: self._set_text(self.log, "")).pack(side="left")
-        self.lbl_status = ttk.Label(bar, textvariable=self.v_status, foreground=OK)
+        b_go.pack(side="left")
+        self.action_buttons = [b_go]
+        self.lbl_status = ttk.Label(bar, textvariable=self.v_status, style="Status.TLabel")
         self.lbl_status.pack(side="right")
+        ttk.Button(bar, text="清空日志",
+                   command=lambda: self._set_text(self.log, "")).pack(side="right", padx=(0, 14))
 
-        log_box = ttk.LabelFrame(area, text=" 输出 ", padding=(6, 4))
-        log_box.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
-        log_box.columnconfigure(0, weight=1)
+        card, log_box = self._card(area, "运行日志")
+        card.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        card.rowconfigure(1, weight=1)
+        log_box.grid_configure(sticky="nsew")    # 卡片拉高了，日志就跟着长（不再空在底部）
+        log_box.columnconfigure(0, weight=1, minsize=0)
+        log_box.columnconfigure(1, weight=0)     # 滚动条那列不参与分宽度，否则被推得老远
         log_box.rowconfigure(0, weight=1)
         self.log = tk.Text(
-            log_box, height=9, wrap="word", state="disabled", font=("Consolas", 9),
-            background=CARD, foreground=TEXT, relief="solid", borderwidth=1,
-            highlightthickness=1, highlightcolor=BORDER, highlightbackground=BORDER,
-            insertbackground=TEXT,
+            log_box, height=9, wrap="word", state="disabled", font=(MONO, 9),
+            background=CARD_ALT, foreground=TEXT, relief="flat", borderwidth=0,
+            highlightthickness=1, highlightcolor=ACCENT, highlightbackground=BORDER,
+            insertbackground=ACCENT, padx=8, pady=6,
         )
         self.log.grid(row=0, column=0, sticky="nsew")
         bar_y = ttk.Scrollbar(log_box, orient="vertical", command=self.log.yview)
-        bar_y.grid(row=0, column=1, sticky="ns")
-        self.log.configure(yscrollcommand=bar_y.set)
+        bar_y.grid(row=0, column=1, sticky="ns", padx=(2, 0))
+        self.log.configure(yscrollcommand=self._fade_scrollbar(bar_y))
         self.log.tag_configure("err", foreground=DANGER)
+
+        # 一开机就把「zsign 用的哪一份」写在日志里，省得回头猜它到底找没找到
+        zsign = signer.zsign_binary()
+        if zsign:
+            self._append(f"[签名] zsign  : {zsign}\n")
 
     # ------------------------------------------------------------------ #
     # 布局小助手
     # ------------------------------------------------------------------ #
-    def _group(self, parent, title: str, row: int) -> ttk.LabelFrame:
-        box = ttk.LabelFrame(parent, text=f" {title} ", padding=(10, 6))
-        box.grid(row=row, column=0, sticky="new", pady=(0, 8))
-        box.columnconfigure(1, weight=1)
+    def _fade_scrollbar(self, bar: ttk.Scrollbar):
+        """没东西可滚的时候把滚动条收起来（否则它只是一条动不了的灰块）。
+
+        返回的闭包直接当 yscrollcommand 用：内容或窗口一变，Tk 就会调它，
+        看到范围是整段（0.0 ~ 1.0）就藏，能滚了再放回来。
+        """
+        def _sync(first, last):
+            if float(first) <= 0.0 and float(last) >= 1.0:
+                bar.grid_remove()
+            else:
+                bar.grid()
+            bar.set(first, last)
+        return _sync
+
+    def _card(self, parent, title: str) -> tuple[tk.Frame, ttk.Frame]:
+        """画一张卡片（左侧主色竖条 + 标题 + 内容区），返回 (卡片, 内容区)。
+
+        内容区的第 0 列有最小宽度，各行的字段名能对齐；往里加控件和普通 Frame 一样。
+        """
+        card = tk.Frame(parent, background=CARD, highlightthickness=1,
+                        highlightbackground=BORDER, highlightcolor=BORDER)
+        card.columnconfigure(0, weight=1)
+        head = tk.Frame(card, background=CARD)
+        head.grid(row=0, column=0, sticky="ew", padx=14, pady=(11, 0))
+        tk.Frame(head, background=ACCENT, width=3, height=15).pack(side="left", padx=(0, 9))
+        tk.Label(head, text=title, background=CARD, foreground=TEXT,
+                 font=(FONT, 10, "bold")).pack(side="left")
+
+        body = ttk.Frame(card, style="Card.TFrame", padding=(14, 10, 14, 12))
+        body.grid(row=1, column=0, sticky="ew")
+        body.columnconfigure(1, weight=1)
+        body.columnconfigure(0, minsize=88)
+        return card, body
+
+    def _group(self, parent, title: str, row: int) -> ttk.Frame:
+        """页签里的一块卡片（自动占一行）。返回内容区。"""
+        card, body = self._card(parent, title)
+        card.grid(row=row, column=0, sticky="new", pady=(0, 10))
         parent.columnconfigure(0, weight=1)
-        return box
+        return body
 
     # ------------------------------------------------------------------ #
     # 记住上次的签名设置（证书 / 密码）
@@ -633,8 +935,36 @@ class IpatoolGui:
         self.v_remember.set(bool(data.get("remember", True)))
         if self.v_remember.get():
             self.v_p12_password.set(str(data.get("p12_password") or ""))
+
+        # 证书列表：存下来的 p12 证书 + 上次选的是哪一个
+        raw_certs = data.get("certs")
+        self.certs = ([c for c in raw_certs if isinstance(c, dict) and c.get("p12")]
+                      if isinstance(raw_certs, list) else [])
+        choice = str(data.get("cert_choice") or "")
+        legacy_p12 = str(data.get("p12") or "")
+        if not self.certs and legacy_p12 and os.path.isfile(legacy_p12):
+            # 老配置里只存了一个 p12 路径：自动转成一条证书记录，不用重新填
+            entry = {
+                "id": uuid.uuid4().hex[:8],
+                "name": os.path.basename(legacy_p12),
+                "p12": legacy_p12,
+                "password": str(data.get("p12_password") or ""),
+                "provision": str(data.get("provision") or ""),
+            }
+            self.certs = [entry]
+            choice = f"p12:{entry['id']}"
+            notes_prefix = "已把上次的证书收进证书列表"
+        else:
+            notes_prefix = ""
+        self._rebuild_cert_choices(select=choice)
+
+        notes = []
+        if notes_prefix:
+            notes.append(notes_prefix)
         if self.v_p12.get() or self.v_identity.get():
-            self.v_status.set("已载入上次的签名设置")
+            notes.append("已载入上次的签名设置")
+        if notes:
+            self.v_status.set("，".join(notes))
 
     def _write_settings(self) -> None:
         self._save_job = None
@@ -645,6 +975,8 @@ class IpatoolGui:
             "p12": self.v_p12.get(),
             "provision": self.v_provision.get(),
             "entitlements": self.v_entitlements.get(),
+            "certs": self.certs,
+            "cert_choice": self._current_cert_key(),
             "zip_level": self.v_zip_level.get(),
             "remember": bool(self.v_remember.get()),
             # 明文保存：图的是下次不用重输。不想留就取消勾选，或点「清除已保存的证书」
@@ -670,10 +1002,18 @@ class IpatoolGui:
                 pass
         self._save_job = self.root.after(500, self._write_settings)
 
+    def _schedule_save_gh(self, *_args) -> None:
+        """GitHub 配置变量一变就排队保存；防抖 500ms，避免每敲一字写一次盘。"""
+        if self._gh_save_job:
+            try:
+                self.root.after_cancel(self._gh_save_job)
+            except Exception:
+                pass
+        self._gh_save_job = self.root.after(500, self._save_gh_config)
+
     def _clear_settings(self) -> None:
         if not messagebox.askyesno("清除已保存的证书",
-                                   "确定要删掉已保存的证书路径和密码吗？\n"
-                                   "（不影响证书文件本身，只是不再自动填）"):
+                                   "删掉已保存的证书路径和密码？（证书文件本身不动）"):
             return
         try:
             os.remove(_gui_config_path())
@@ -682,18 +1022,206 @@ class IpatoolGui:
         self.v_p12_password.set("")
         self.v_p12.set("")
         self.v_identity.set("")
+        self.certs = []                      # 证书列表也一起清掉，否则下次保存又写回去
+        self._rebuild_cert_choices(select="")
         self._append("[设置] 已清除保存的证书信息\n")
 
+    # ------------------------------------------------------------------ #
+    # 证书列表：存下来 + 下拉里选一个（像爱思的证书管理）
+    # ------------------------------------------------------------------ #
+    def _cert_choices(self) -> list[tuple[str, str]]:
+        """(下拉显示文本, 键)。键：''=不用证书，'p12:<id>'=保存的证书文件。"""
+        choices: list[tuple[str, str]] = [("不使用证书（通常 ad-hoc）", "")]
+        for cert in self.certs:
+            choices.append((f"证书文件：{cert.get('name', '')}", f"p12:{cert.get('id', '')}"))
+        return choices
+
+    def _current_cert_key(self) -> str:
+        text = self.v_cert.get()
+        if text in self._cert_texts:
+            return self._cert_keys[self._cert_texts.index(text)]
+        # 界面还没建好（启动恢复阶段）时，按已解析出来的值反推
+        if self.v_p12.get().strip():
+            return "p12:"
+        return ""
+
+    def _cert_of_key(self, key: str) -> dict | None:
+        cert_id = key[4:] if key.startswith("p12:") else ""
+        if not cert_id:
+            return None
+        return next((c for c in self.certs if c.get("id") == cert_id), None)
+
+    def _rebuild_cert_choices(self, select: str | None = None) -> None:
+        """按当前证书列表刷新下拉；select 给定时选中对应项。"""
+        choices = self._cert_choices()
+        self._cert_keys = [key for _text, key in choices]
+        self._cert_texts = [text for text, _key in choices]
+        if hasattr(self, "cb_cert"):
+            self.cb_cert.configure(values=self._cert_texts)
+        want = self._current_cert_key() if select is None else select
+        if want not in self._cert_keys:
+            want = ""
+        self.v_cert.set(self._cert_texts[self._cert_keys.index(want)])
+        self._apply_cert_choice()
+
+    def _apply_cert_choice(self, *_args) -> None:
+        """
+        把「使用证书」的选择翻译成实际参数：选哪个就只带那一种参数，
+        所以不会再出现「ID 签名和证书签名都填了，不知道实际用哪个」。
+        """
+        key = self._current_cert_key()
+        if key.startswith("p12:"):
+            cert = self._cert_of_key(key)
+            if cert is not None:
+                self.v_p12.set(str(cert.get("p12", "")))
+                self.v_p12_password.set(str(cert.get("password", "")))
+                self.v_identity.set("")
+                if cert.get("provision") and not self.v_provision.get().strip():
+                    self.v_provision.set(str(cert["provision"]))
+                tail = "有密码" if cert.get("password") else "无密码（可用 IPATOOL_P12_PASSWORD）"
+                self.v_cert_summary.set(f"→ 证书文件：{cert.get('p12', '')}（{tail}）")
+                self._schedule_save()
+                return
+        self.v_identity.set("")
+        self.v_p12.set("")
+        self.v_p12_password.set("")
+        self.v_cert_summary.set("→ 不带证书，结果是 ad-hoc（真机装不上）")
+        self._schedule_save()
+
+    def _pick_into(self, var: tk.StringVar, filetypes) -> None:
+        path = filedialog.askopenfilename(filetypes=filetypes)
+        if path:
+            var.set(path)
+
+    def _upsert_cert(self, entry: dict) -> None:
+        self.certs = [c for c in self.certs if c.get("id") != entry.get("id")]
+        self.certs.append(entry)
+        self.certs.sort(key=lambda c: str(c.get("name", "")))
+
+    def _open_cert_dialog(self, cert: dict | None = None) -> None:
+        """
+        添加 / 编辑一张证书：p12 路径 + 密码（描述文件可选）存下来，
+        以后直接从「使用证书」下拉里选，不用每次重新填。
+        """
+        editing = bool(cert)
+        dlg = tk.Toplevel(self.root)
+        dlg.title("编辑证书" if editing else "添加证书")
+        dlg.configure(background=CARD)
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+
+        name = tk.StringVar(value=str((cert or {}).get("name", "")))
+        p12 = tk.StringVar(value=str((cert or {}).get("p12", "")))
+        pwd = tk.StringVar(value=str((cert or {}).get("password", "")))
+        prov = tk.StringVar(value=str((cert or {}).get("provision", "")))
+
+        frame = ttk.Frame(dlg, style="Card.TFrame", padding=14)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.columnconfigure(1, weight=1)
+
+        ttk.Label(frame, text="名称").grid(row=0, column=0, sticky="w", pady=3)
+        ttk.Entry(frame, textvariable=name, width=34).grid(row=0, column=1, columnspan=2, sticky="ew", pady=3)
+
+        ttk.Label(frame, text="证书文件").grid(row=1, column=0, sticky="w", pady=3)
+        ttk.Entry(frame, textvariable=p12, width=34).grid(row=1, column=1, sticky="ew", pady=3)
+        ttk.Button(
+            frame, text="选择…", width=8,
+            command=lambda: self._pick_into(p12, [("证书", "*.p12 *.pfx"), ("所有文件", "*.*")]),
+        ).grid(row=1, column=2, padx=(6, 0), pady=3)
+
+        ttk.Label(frame, text="证书密码").grid(row=2, column=0, sticky="w", pady=3)
+        ttk.Entry(frame, textvariable=pwd, show="*", width=34).grid(
+            row=2, column=1, columnspan=2, sticky="ew", pady=3)
+
+        ttk.Label(frame, text="描述文件").grid(row=3, column=0, sticky="w", pady=3)
+        ttk.Entry(frame, textvariable=prov, width=34).grid(row=3, column=1, sticky="ew", pady=3)
+        ttk.Button(
+            frame, text="选择…", width=8,
+            command=lambda: self._pick_into(prov, [("描述文件", "*.mobileprovision"), ("所有文件", "*.*")]),
+        ).grid(row=3, column=2, padx=(6, 0), pady=3)
+
+        ttk.Label(
+            frame, style="Muted.TLabel", justify="left", wraplength=430,
+            text="密码明文保存（可留空）；描述文件留空则用「签名」区那一栏",
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=5, column=0, columnspan=3, sticky="e", pady=(10, 0))
+
+        def on_ok() -> None:
+            cert_p12 = p12.get().strip().strip('"')
+            if not cert_p12 or not os.path.isfile(cert_p12):
+                messagebox.showwarning("证书文件", "请选择一个存在的 p12 / pfx 文件。", parent=dlg)
+                return
+            entry = {
+                "id": str((cert or {}).get("id") or uuid.uuid4().hex[:8]),
+                "name": name.get().strip() or os.path.basename(cert_p12),
+                "p12": cert_p12,
+                "password": pwd.get(),
+                "provision": prov.get().strip(),
+            }
+            self._upsert_cert(entry)
+            self._schedule_save()
+            dlg.destroy()
+            self._rebuild_cert_choices(select=f"p12:{entry['id']}")
+            self._append(f"[证书] 已保存「{entry['name']}」：{entry['p12']}\n")
+
+        ttk.Button(buttons, text="取消", command=dlg.destroy).pack(side="left", padx=(0, 6))
+        ttk.Button(buttons, text="确定", style="Accent.TButton", command=on_ok).pack(side="left")
+
+        dlg.bind("<Return>", lambda _e: on_ok())
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+        dlg.grab_set()      # 模态：别让主窗口同时被点
+        dlg.focus_force()
+        self._center_window(dlg, self.root)
+
+    def _center_window(self, win: tk.Toplevel, parent: tk.Misc) -> None:
+        win.update_idletasks()
+        px, py = parent.winfo_rootx(), parent.winfo_rooty()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        win.geometry(f"+{px + max(0, (pw - win.winfo_width()) // 2)}"
+                     f"+{py + max(0, (ph - win.winfo_height()) // 3)}")
+
+    def _edit_cert(self) -> None:
+        cert = self._cert_of_key(self._current_cert_key())
+        if cert is None:
+            messagebox.showinfo("编辑证书", "先在「使用证书」里选一张，再点编辑。")
+            return
+        self._open_cert_dialog(cert)
+
+    def _delete_cert(self) -> None:
+        cert = self._cert_of_key(self._current_cert_key())
+        if cert is None:
+            messagebox.showinfo("删除证书", "先在「使用证书」里选一张，再点删除。")
+            return
+        if not messagebox.askyesno("删除证书",
+                                   f"把「{cert.get('name', '')}」从列表里删掉？（证书文件不动）"):
+            return
+        self.certs = [c for c in self.certs if c.get("id") != cert.get("id")]
+        self._schedule_save()
+        self._append(f"[证书] 已删除「{cert.get('name', '')}」\n")
+        self._rebuild_cert_choices(select="")
+
+    def _check(self, parent, text: str, var: tk.BooleanVar, command=None) -> DarkCheck:
+        """页面里加一个复选框（自己画的那种，见 DarkCheck）。"""
+        return DarkCheck(parent, text, var, command)
+
     def _entry(self, box, row, label, var, hint=None, browse=None, width=36):
-        ttk.Label(box, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=3)
-        ttk.Entry(box, textvariable=var, width=width).grid(row=row, column=1, sticky="ew", pady=3)
+        """一行「字段名 + 输入框 (+ 浏览按钮 / 提示)」。
+
+        按钮和提示打包在输入框右边紧跟的位置：不然它们会被同一个网格里跨列的控件
+        （比如证书下拉框）带歪，提示文字被挤到很右边、看着像没对齐。
+        """
+        ttk.Label(box, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(box, textvariable=var, width=width).grid(row=row, column=1, sticky="ew", pady=4)
         box.columnconfigure(1, weight=1)
-        col = 2
-        if browse:
-            ttk.Button(box, text="浏览…", width=8, command=browse).grid(row=row, column=col, padx=(6, 0), pady=3)
-            col += 1
-        if hint:
-            ttk.Label(box, text=hint, style="Muted.TLabel").grid(row=row, column=col, sticky="w", padx=(8, 0), pady=3)
+        if browse or hint:
+            tail = ttk.Frame(box, style="Card.TFrame")
+            tail.grid(row=row, column=2, sticky="w", padx=(8, 0), pady=4)
+            if browse:
+                ttk.Button(tail, text="浏览…", width=8, command=browse).pack(side="left")
+            if hint:
+                ttk.Label(tail, text=hint, style="Muted.TLabel").pack(side="left", padx=(8, 0))
 
     def _combo(self, box, row, label, var, values):
         ttk.Label(box, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=3)
@@ -754,8 +1282,13 @@ class IpatoolGui:
                 kind, payload = self.q.get_nowait()
                 if kind == "log":
                     self._append(str(payload))
-                elif kind == "info" or kind == "certs":
+                elif kind == "status":
+                    text, color = payload  # type: ignore[misc]
+                    self._set_status(str(text), str(color))
+                elif kind in ("info", "devices"):
                     self._render(kind, str(payload))
+                elif kind == "ask":
+                    self.answer_q.put(self._prompt_answer(payload))
                 elif kind == "done":
                     task, code = payload  # type: ignore[misc]
                     self._finish(str(task), int(code))
@@ -765,25 +1298,29 @@ class IpatoolGui:
             self._append(traceback.format_exc(), "err")
         self.root.after(80, self._poll)
 
-    def _start(self, argv: list[str], task: str) -> None:
+    def _start(self, argv: list[str], task: str, quiet: bool = False) -> None:
+        """quiet=True 用于自动刷新：不弹「请稍候」、也不把命令行回显到日志里。"""
         if self.busy:
-            messagebox.showinfo("请稍候", "已有任务在运行，请等它结束。")
+            if not quiet:
+                messagebox.showinfo("请稍候", "已有任务在运行，请等它结束。")
             return
         self.busy = True
         for btn in self.action_buttons:
             btn.configure(state="disabled")
         self._set_status("运行中…", "run")
-        self._append(f"\n$ {_format_argv(argv)}\n")
+        if not quiet:
+            self._append(f"\n$ {_format_argv(argv)}\n")
         threading.Thread(target=self._work, args=(argv, task), daemon=True).start()
 
     def _work(self, argv: list[str], task: str) -> None:
         code, text = 0, ""
+        out = io.StringIO()      # 捕获任务里只拿 stdout 当数据（纯 JSON）
+        err = io.StringIO()
         try:
             if task in CAPTURE_TASKS:
-                buf = io.StringIO()
-                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                     code = cli_mod.main(argv)
-                text = buf.getvalue()
+                text = out.getvalue()
             else:
                 stream = _Stream(self.q)
                 with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
@@ -793,6 +1330,8 @@ class IpatoolGui:
         except BaseException:
             code = 1
             text += "\n" + traceback.format_exc()
+        if err.getvalue().strip():
+            self.q.put(("log", err.getvalue()))
         if text:
             self.q.put((task, text))
         self.q.put(("done", (task, code)))
@@ -801,10 +1340,23 @@ class IpatoolGui:
         self.busy = False
         for btn in self.action_buttons:
             btn.configure(state="normal")
+        if task in ("inject", "modify", "sign", "install"):
+            self._refresh_devices_silent()   # 跑完顺手静默刷新（可能刚插上手机）
         if code == 0:
             self._set_status("完成")
+            if task == "install":
+                messagebox.showinfo("完成", "安装完成。")
+                return
             if task in ("inject", "modify", "sign"):
-                messagebox.showinfo("完成", "处理完成，输出文件已生成。")
+                # 产物刚生成：把路径自动填进「安装到设备」的「安装包」栏，
+                # 顺手刷新摘要，签完名下一秒就能直接点「安装到设备」，不用手动选包。
+                self.v_install_ipa.set(self._install_target())
+                self._refresh_install_summary()
+                messagebox.showinfo("完成", "处理完成。")
+            return
+        if code == 3:          # 用户在「已有同名 App」那步选了取消
+            self._set_status("已取消")
+            messagebox.showinfo("已取消", "已取消安装")
             return
         self._set_status(f"失败（退出码 {code}）", "err")
         self._append(f"任务失败，退出码 {code}\n", "err")
@@ -812,15 +1364,59 @@ class IpatoolGui:
             messagebox.showerror("执行失败", f"任务未能完成，退出码 {code}。\n详情见下方日志。")
 
     def _render(self, kind: str, text: str) -> None:
-        try:
-            data = json.loads(text)
-        except Exception:
+        data = self._parse_json(text)
+        if data is None:
+            # 失败时 cli 打的是人话不是 JSON：照原样贴到日志里
+            if kind == "devices":
+                # 自动刷新会反复失败，同一段报错只贴一次，别刷屏
+                if getattr(self, "_device_err", None) != text:
+                    self._device_err = text
+                    self._append(text)
+                self.v_device_summary.set("→ 未识别到设备（原因见下方日志）")
+                return
             self._append(text)
             return
         if kind == "info":
             self._render_info(data)
         else:
-            self._render_certs(data)
+            self._render_devices(data)
+
+    @staticmethod
+    def _parse_json(text: str):
+        """解析 JSON；容忍前后被状态/清理信息污染（如 `--json` 后跟的
+        “清理临时文件…”）。先整体解析，失败再按括号匹配抠出 JSON 对象。"""
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+        start = text.find("{")
+        if start == -1:
+            return None
+        depth = 0
+        in_str = False
+        esc = False
+        for i in range(start, len(text)):
+            c = text[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == '"':
+                    in_str = False
+            else:
+                if c == '"':
+                    in_str = True
+                elif c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            return json.loads(text[start:i + 1])
+                        except Exception:
+                            return None
+        return None
 
     def _render_info(self, data: dict) -> None:
         for item in self.info_tree.get_children():
@@ -855,9 +1451,8 @@ class IpatoolGui:
             lines.append("  （无）")
         self._set_text(self.info_detail, "\n".join(lines))
         self._append(
-            f"\n已读取：{_txt(data.get('bundle_id'))} / {_txt(data.get('display_name'))}，"
-            f"内嵌 bundle {len(nested)} 个，已注入 dylib {len(injected)} 个"
-            f"（读的是「输入」框里的包，不是产物）\n"
+            f"\n已读取：{_txt(data.get('bundle_id'))} / {_txt(data.get('display_name'))}"
+            f"（内嵌 bundle {len(nested)}，已注入 dylib {len(injected)}）\n"
         )
 
         # 顺手把当前值填进「改 ID / 名称」页，少打一次字
@@ -865,16 +1460,6 @@ class IpatoolGui:
             self.v_bundle_id.set(data["bundle_id"])
         if data.get("display_name") and not self.v_name.get().strip():
             self.v_name.set(data["display_name"])
-
-    def _render_certs(self, data: dict) -> None:
-        identities = data.get("identities") or []
-        values = [f"{i.get('name', '')} | {i.get('id', '')}".strip(" |") for i in identities]
-        self.cb_identity.configure(values=values)
-        self._append(f"证书来源: {data.get('source', '')}\n")
-        if not values:
-            self._append("未找到可用身份。可改用证书文件（p12），或在 macOS 上把证书装进钥匙串。\n")
-        for value in values:
-            self._append(f"  · {value}\n")
 
     # ------------------------------------------------------------------ #
     # 组装 argv
@@ -904,10 +1489,10 @@ class IpatoolGui:
     def _modify_argv(self) -> list[str] | None:
         src = self.v_input.get().strip()
         if not src:
-            messagebox.showwarning("缺少输入", "请先选择要处理的 IPA 文件或已解包目录。")
+            messagebox.showwarning("缺少输入", "请先选择 IPA 文件或已解包目录。")
             return None
         if not self.v_bundle_id.get().strip() and not self.v_name.get().strip():
-            messagebox.showwarning("缺少参数", "至少要填写「Bundle Identifier」或「显示名称」中的一项。")
+            messagebox.showwarning("缺少参数", "至少要填 Bundle Identifier 或显示名称。")
             return None
         argv = ["modify", src]
         _add(argv, "-i", self.v_bundle_id.get())
@@ -919,7 +1504,7 @@ class IpatoolGui:
     def _inject_argv(self) -> list[str] | None:
         src = self.v_input.get().strip()
         if not src:
-            messagebox.showwarning("缺少输入", "请先选择要处理的 IPA 文件或已解包目录。")
+            messagebox.showwarning("缺少输入", "请先选择 IPA 文件或已解包目录。")
             return None
         argv = ["inject", src]
         for path in self.custom_dylibs:
@@ -935,7 +1520,7 @@ class IpatoolGui:
         """只重新打包 + 签名：不改 ID、不注入。"""
         src = self.v_input.get().strip()
         if not src:
-            messagebox.showwarning("缺少输入", "请先选择要处理的 IPA 文件或已解包目录。")
+            messagebox.showwarning("缺少输入", "请先选择 IPA 文件或已解包目录。")
             return None
         return ["sign", src] + self._common_args()
 
@@ -948,8 +1533,196 @@ class IpatoolGui:
             return
         self._start(self._info_argv(), "info")
 
-    def _load_certs(self) -> None:
-        self._start(["certs", "--json"], "certs")
+    def _load_devices(self, quiet: bool = False) -> None:
+        """读一遍连着的设备填进下拉（走 devices 子命令的 JSON 输出）。"""
+        self._start(["devices", "--json"], "devices", quiet=quiet)
+
+    def _auto_refresh_devices(self) -> None:
+        """空闲时定时静默刷新：插上 / 拔掉手机都能自动反映，不用手点「刷新设备」。"""
+        if not self.busy:
+            self._refresh_devices_silent()
+        self.root.after(DEVICE_POLL_MS, self._auto_refresh_devices)
+
+    def _refresh_devices_silent(self) -> None:
+        """后台静默读设备：只更新下拉，不占 busy、不动按钮、不闪「运行中…」。"""
+        def _run():
+            try:
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                    cli_mod.main(["devices", "--json"])
+                text = buf.getvalue()
+            except BaseException:
+                text = traceback.format_exc()
+            try:
+                data = json.loads(text)
+            except Exception:
+                data = None
+            self.root.after(0, self._apply_devices, data, text)
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _apply_devices(self, data, text) -> None:
+        if data is None:
+            if getattr(self, "_device_err", None) != text:   # 同一段报错只贴一次
+                self._device_err = text
+                self._append(text)
+            return
+        self._render_devices(data)
+
+    def _render_devices(self, data: dict) -> None:
+        devices = data.get("devices") or []
+        chosen = self._selected_udid()          # 刷新前用户选的是哪台
+        self._device_texts = ["自动选择（只连一台时用它）"]
+        self._device_keys = [""]
+        for item in devices:
+            udid = str(item.get("udid") or "")
+            if not udid:
+                continue
+            self._device_texts.append(str(item.get("label") or udid))
+            self._device_keys.append(udid)
+        if hasattr(self, "cb_device"):
+            self.cb_device.configure(values=self._device_texts)
+        # 选中的设备还在就留着；否则只连一台就自动选它
+        if chosen not in self._device_keys:
+            chosen = self._device_keys[1] if len(self._device_keys) == 2 else ""
+        self.v_device.set(self._device_texts[self._device_keys.index(chosen)])
+        self._refresh_install_summary()
+
+        signature = tuple(self._device_keys)
+        changed = signature != getattr(self, "_device_sig", None)
+        self._device_sig = signature
+        if not changed:
+            return          # 列表没变就别刷日志（每 30 秒一次会刷屏）
+
+        self._device_err = ""
+        backend = str(data.get("backend") or "?")
+        if devices:
+            self._append(f"\n设备后端: {backend}，认到 {len(devices)} 台\n")
+            self._set_status(f"已认到 {len(devices)} 台设备")
+        else:
+            self._append(f"\n无设备连接（后端 {backend}）。手机上解锁后点「信任」；")
+            self._set_status("无设备连接", "err")
+
+    def _refresh_install_summary(self) -> None:
+        """摘要行：装到哪台 + 装哪个包，点「安装到设备」之前就能看清会发生什么。"""
+        udid = self._selected_udid()
+        where = f"装到 UDID …{udid[-6:]}" if udid else "设备：自动选择（只连一台时就是它）"
+        target = self._install_target()
+        if not target:
+            what = "安装包：还没得选（在「IPA 文件」里选输入，或填好「输出」）"
+        else:
+            name = os.path.basename(target)
+            if not self.v_install_ipa.get().strip():
+                if self.v_inplace.get():
+                    name += "（就地覆盖输入）"
+                elif self.v_output.get().strip():
+                    name += "（取「输出」）"
+                else:
+                    name += "（输出留空：默认生成在输入包旁边）"
+            if not os.path.isfile(target):
+                name += "  ← 文件不存在"
+            what = f"安装包：{name}"
+        self.v_device_summary.set(f"→ {where}；{what}")
+
+    def _selected_udid(self) -> str:
+        text = self.v_device.get()
+        if text in self._device_texts:
+            return self._device_keys[self._device_texts.index(text)]
+        return ""
+
+    def _default_output_path(self) -> str:
+        """「输出」留空时命令行实际会生成的路径（规则和 cli._output_path 保持一致）。"""
+        src = self.v_input.get().strip()
+        if not src:
+            return ""
+        src = os.path.abspath(src)
+        stem = os.path.splitext(os.path.basename(os.path.normpath(src)))[0]
+        if self.custom_dylibs:
+            suffix = "-injected.ipa"
+        elif self.v_bundle_id.get().strip() or self.v_name.get().strip():
+            suffix = "-modified.ipa"
+        else:
+            suffix = "-signed.ipa"
+        return os.path.join(os.path.dirname(src), f"{stem}{suffix}")
+
+    def _install_target(self) -> str:
+        """装 / 交付哪个包：填了「安装包」就用它；留空 = 输出（就地覆盖时 = 输入）。"""
+        chosen = self.v_install_ipa.get().strip()
+        if chosen:
+            return chosen
+        if self.v_inplace.get():
+            return self.v_input.get().strip()
+        return self.v_output.get().strip() or self._default_output_path()
+
+    def _reveal_output(self) -> None:
+        """在资源管理器 / 访达里定位产物（顺带选中这个文件），方便拖给爱思之类。"""
+        target = self._install_target()
+        if not target or not os.path.exists(target):
+            messagebox.showwarning("找不到文件", "先「开始执行」生成产物，或把「输出」指到已有的 IPA。")
+            return
+        path = os.path.abspath(target)      # 注意顺序：空串 abspath 出来是当前目录
+        if os.name == "nt":
+            subprocess.Popen(["explorer", "/select,", path])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", path])
+        else:
+            subprocess.Popen(["xdg-open", os.path.dirname(path)])
+        self._append(f"[定位] {path}\n")
+
+    def _copy_output_path(self) -> None:
+        """把产物路径复制到剪贴板（有的工具只能粘贴路径，不能拖文件）。"""
+        path = self._install_target()
+        if not path:
+            messagebox.showwarning("没有可复制的路径", "先选一个「安装包」，或在上面填好输入 / 输出。")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(path)
+        self._append(f"[复制] 路径已复制：{path}\n")
+
+    def _pick_install_ipa(self) -> None:
+        path = filedialog.askopenfilename(
+            title="选择要安装到设备的 IPA",
+            filetypes=[("iOS 应用包", "*.ipa"), ("所有文件", "*.*")],
+        )
+        if path:
+            self.v_install_ipa.set(path)
+
+    def _clear_install_ipa(self) -> None:
+        self.v_install_ipa.set("")      # 清空 = 回到「自动用输出」
+
+    def _ask_confirm(self, message: str) -> bool | None:
+        """工作线程用：问「要不要卸载重装」。返回 True/False，None = 用户取消。"""
+        self.q.put(("ask", ("confirm", message)))
+        try:
+            answer = self.answer_q.get(timeout=600)
+        except queue.Empty:
+            return None
+        return {"uninstall": True, "install": False}.get(answer)
+
+    def _prompt_answer(self, payload) -> str:
+        """界面线程用：弹「设备上已有同名 App」的三选一，把答案交回工作线程。"""
+        message = payload[1] if isinstance(payload, tuple) and len(payload) > 1 else str(payload)
+        answer = messagebox.askyesnocancel(
+            "设备上已有同名 App",
+            f"{message}\n\n是>>卸载重装\n否>>覆盖安装\n",
+        )
+        return {True: "uninstall", False: "install"}.get(answer, "")
+
+    def _install_to_device(self) -> None:
+        target = self._install_target()
+        if not target:
+            messagebox.showwarning("没有可安装的 IPA", "先选一个「安装包」")
+            return
+        if not os.path.isfile(target):
+            messagebox.showwarning(
+                "找不到文件",
+                f"没找到 {target}\n",
+            )
+            return
+        argv = ["install", target]
+        udid = self._selected_udid()
+        if udid:
+            argv += ["--udid", udid]
+        self._start(argv, "install")
 
     def _list_injected(self) -> None:
         """核对产物：优先读输出文件，没有产物时才回退到输入包（就地修改时两者相同）。"""
@@ -957,26 +1730,35 @@ class IpatoolGui:
         if not src or not os.path.isfile(src):
             src = self.v_input.get().strip()
         if not src:
-            messagebox.showwarning("缺少输入", "请先选择要处理的 IPA 文件或已解包目录。")
+            messagebox.showwarning("缺少输入", "请先选择 IPA 文件或已解包目录。")
             return
         self._append(f"[核对] {src}\n")
         self._start(["inject", src, "--list"], "inject-list")
 
     def _run_current(self, dry_run: bool) -> None:
-        """底部「开始执行 / 预览」：信息页读信息，合并页按当前填写自动选。"""
-        if self.nb.index(self.nb.select()) == 0:
+        """
+        底部唯一的动作按钮（「开始执行」）：
+        不再让人挑按钮，按上面填的内容自动决定做什么 ——
+          列表里有 dylib  → 注入（+ 签名）
+          填了 ID / 名称  → 改 ID / 名称（+ 签名）
+          什么都没填      → 只重新打包 + 签名
+        """
+        if self._active_tab == "info":
             self._load_info()
             return
+        tag = "[预览]" if dry_run else "[执行]"
         fill_ident = bool(self.v_bundle_id.get().strip() or self.v_name.get().strip())
         if self.custom_dylibs:
+            self._append(f"{tag} 注入 {len(self.custom_dylibs)} 个 dylib + 签名\n")
             if fill_ident:
-                self._append("[执行] 本次只做「注入」。要同时改 ID / 名称，请点上面的「改 ID / 名称（含签名）」。\n")
+                self._append(f"{tag} ID / 名称已填但本次不改（要改名请先清空 dylib 列表）\n")
             self._run_inject(dry_run)
             return
         if fill_ident:
+            self._append(f"{tag} 改 ID / 名称 + 签名\n")
             self._run_modify(dry_run)
             return
-        # 什么都没填：只重新打包 + 签名（以前会被「至少填一项」挡住，跑不了）
+        self._append(f"{tag} 不改 ID、不注入，只重新打包 + 签名\n")
         self._run_sign(dry_run)
 
     def _run_modify(self, dry_run: bool = False) -> None:
@@ -1011,6 +1793,752 @@ class IpatoolGui:
         self._write_settings()
         self.root.destroy()
 
+
+    # ================================================================== #
+    # GitHub 导入 / Codemagic 构建 / 编译打包（逻辑见 cloud_build.py）
+    # ================================================================== #
+    def _clog(self, msg: str) -> None:
+        """线程安全的日志：后台线程把消息丢进队列，主循环 _poll 再写进日志框。"""
+        self.q.put(("log", (msg.rstrip("\n") + "\n")))
+
+    def _popup_geometry(self, win, w, h) -> None:
+        """弹窗跟随主窗口位置（居中于主窗口），而不是默认落到屏幕左上角。"""
+        self.root.update_idletasks()
+        mx, my = self.root.winfo_rootx(), self.root.winfo_rooty()
+        mw, mh = self.root.winfo_width(), self.root.winfo_height()
+        x = mx + max(0, (mw - w) // 2)
+        y = my + max(0, (mh - h) // 2)
+        win.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _restore_gh_config(self) -> None:
+        cfg = cloud_mod.load_config()
+        if not cfg:
+            return
+        self.v_gh_token.set(cfg.get("github_token", ""))
+        self.v_cm_token.set(cfg.get("cm_token", ""))
+        self.v_owner.set(cfg.get("owner", cloud_mod.OWNER))
+        self.v_repo.set(cfg.get("repo", cloud_mod.REPO))
+        self.v_branch.set(cfg.get("branch", "main"))
+        self.v_local.set(cfg.get("local", r"d:\Microsoft VS Code\qnet\ios_demo"))
+        self.v_target.set(cfg.get("target", ""))
+        self.v_sign_mode.set(cfg.get("sign_mode", "ad-hoc(付费账号)"))
+        self.v_apple_team_id.set(cfg.get("apple_team_id", ""))
+        self.v_auto_create.set(cfg.get("auto_create", False))
+        self.v_visibility.set(cfg.get("visibility", "公开"))
+        self.v_workflow_file.set(cfg.get("workflow_file", "build-tweak.yml"))
+        self.v_dylib_path.set(cfg.get("dylib_path", ""))
+        self.v_ipa_path.set(cfg.get("ipa_path", ""))
+
+    def _save_gh_config(self) -> None:
+        cloud_mod.save_config({
+            "github_token": self.v_gh_token.get(),
+            "cm_token": self.v_cm_token.get(),
+            "owner": self.v_owner.get(),
+            "repo": self.v_repo.get(),
+            "branch": self.v_branch.get(),
+            "local": self.v_local.get(),
+            "target": self.v_target.get(),
+            "sign_mode": self.v_sign_mode.get(),
+            "apple_team_id": self.v_apple_team_id.get(),
+            "auto_create": self.v_auto_create.get(),
+            "visibility": self.v_visibility.get(),
+            "workflow_file": self.v_workflow_file.get(),
+            "dylib_path": self.v_dylib_path.get(),
+            "ipa_path": self.v_ipa_path.get(),
+        })
+
+    def _build_github_tab(self) -> ttk.Frame:
+        outer, page = self._make_scroll(self.page_area)
+        f = ttk.Frame(page)
+        f.grid(row=0, column=0, sticky="ew")
+        f.columnconfigure(1, weight=1)
+
+        def add_row(i, lab, var, secret=False):
+            ttk.Label(f, text=lab, style="Page.TLabel").grid(row=i, column=0, sticky="w", pady=3)
+            if lab.startswith("仓库名"):
+                cb = ttk.Combobox(f, textvariable=var, width=38, state="readonly")
+                cb.grid(row=i, column=1, sticky="ew", pady=3, padx=5)
+                cb.bind("<<ComboboxSelected>>", lambda _e: self._gh_on_repo_pick())
+                self.repo_cb = cb
+                ttk.Button(f, text="刷新仓库", command=self._gh_list_repos).grid(row=i, column=2, padx=3)
+                if self.v_gh_token.get().strip():
+                    self.root.after(500, self._gh_list_repos)
+            else:
+                ent = ttk.Entry(f, textvariable=var, show=("*" if secret else ""), width=40)
+                ent.grid(row=i, column=1, sticky="ew", pady=3, padx=5)
+                if lab.startswith("GitHub Token"):
+                    ttk.Button(f, text="生成 Token", command=self._gh_show_token_help).grid(
+                        row=i, column=2, padx=3)
+                    ttk.Button(f, text="预填创建页",
+                                command=lambda: webbrowser.open(
+                                    "https://github.com/settings/tokens/new"
+                                    "?description=IPATool-importer"
+                                    "&scopes=repo,workflow&expiration=90")
+                                ).grid(row=i, column=3, padx=3)
+                elif lab.startswith("本地文件夹"):
+                    ttk.Button(f, text="浏览", command=self._gh_browse).grid(row=i, column=2, padx=3)
+
+        rows = [
+            ("GitHub Token:", self.v_gh_token, True),
+            ("仓库所有者:", self.v_owner, False),
+            ("仓库名:", self.v_repo, False),
+            ("分支:", self.v_branch, False),
+            ("本地文件夹:", self.v_local, False),
+            ("仓库内目标路径:", self.v_target, False),
+        ]
+        for i, (lab, var, secret) in enumerate(rows):
+            add_row(i, lab, var, secret)
+
+        vis_row = len(rows)
+        ttk.Label(f, text="可见性(仅创建时生效):", style="Page.TLabel").grid(
+            row=vis_row, column=0, sticky="w", pady=2)
+        ttk.Combobox(f, textvariable=self.v_visibility, width=12, state="readonly",
+                     values=["公开", "私有"]).grid(row=vis_row, column=1, sticky="w", padx=5)
+        ttk.Checkbutton(f, text="仓库不存在时自动创建", variable=self.v_auto_create).grid(
+            row=vis_row, column=1, sticky="w", padx=(150, 0), pady=2)
+        note_row = vis_row + 1
+        ttk.Label(f, text="注意: codemagic.yaml / project.yml 必须在仓库根目录, 否则云构建找不到",
+                  foreground="red").grid(row=note_row, column=0, columnspan=3, sticky="w", pady=(4, 6))
+
+        bf = ttk.Frame(f)
+        bf.grid(row=note_row + 1, column=0, columnspan=3, pady=6)
+        ttk.Button(bf, text="导入到 GitHub", command=self._gh_do_import).pack(side="left", padx=5)
+        ttk.Button(bf, text="导出 ZIP(手动上传)", command=self._gh_export_zip).pack(side="left", padx=5)
+        return outer
+
+    def _gh_list_repos(self):
+        token = self.v_gh_token.get().strip()
+        if not token:
+            messagebox.showerror("错误", "请先填写 GitHub Token")
+            return
+        self._clog("正在拉取仓库列表...")
+
+        def work():
+            try:
+                _, j = cloud_mod.api_call(
+                    "GET", "https://api.github.com/user/repos?per_page=100&affiliation=owner", token)
+                repos = j if isinstance(j, list) else j.get("repositories", [])
+                names, full = [], {}
+                for r in repos:
+                    n = r.get("name")
+                    if n:
+                        names.append(n)
+                        full[n] = r.get("full_name", n)
+                if not names:
+                    self._clog("未获取到任何仓库(确认 Token 有 repo 权限, 且账号下确有仓库)")
+                    return
+                self.root.after(0, lambda: self._gh_set_repo_options(names, full))
+                self._clog(f"已拉取 {len(names)} 个仓库, 可在『仓库名』下拉选择")
+            except RuntimeError as e:
+                self._clog("❌ 拉取仓库失败: " + str(e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _gh_set_repo_options(self, names, full):
+        self._repo_full = full
+        if self.repo_cb is not None:
+            self.repo_cb["values"] = names
+        if self.repo_cb2 is not None:
+            self.repo_cb2["values"] = names
+        if names and not self.v_repo.get():
+            self.v_repo.set(names[0])
+            self._gh_on_repo_pick()
+
+    def _gh_on_repo_pick(self):
+        name = self.v_repo.get()
+        full = self._repo_full.get(name, "")
+        if "/" in full:
+            self.v_owner.set(full.split("/", 1)[0])
+        if self.wf_cb is not None:
+            self.root.after(0, self._gh_list_workflows)
+
+
+    def _gh_list_workflows(self):
+        token = self.v_gh_token.get().strip()
+        owner, repo = self.v_owner.get().strip(), self.v_repo.get().strip()
+        if not (token and owner and repo):
+            return
+        self._clog(f"拉取 {owner}/{repo} 的 workflow 列表...")
+
+        def work():
+            try:
+                _, j = cloud_mod.api_call(
+                    "GET", f"https://api.github.com/repos/{owner}/{repo}/actions/workflows", token)
+                wfs = j.get("workflows", []) if isinstance(j, dict) else j
+                files = [w.get("path", "").split("/")[-1]
+                         for w in wfs if w.get("path", "").endswith(".yml")]
+                if files:
+                    self.root.after(0, lambda: self._gh_set_wf_options(files))
+                    self._clog(f"发现 {len(files)} 个 workflow: {', '.join(files)}")
+                else:
+                    self._clog("未找到 workflow 文件(仓库根目录需有 *.yml)")
+            except RuntimeError as e:
+                self._clog("❌ 拉取 workflow 失败: " + str(e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _gh_set_wf_options(self, files):
+        if self.wf_cb is not None:
+            self.wf_cb["values"] = files
+        if files and not self.v_workflow_file.get():
+            self.v_workflow_file.set(
+                "build-tweak.yml" if "build-tweak.yml" in files else files[0])
+
+    def _gh_repo_info_text(self, repo):
+        token = self.v_gh_token.get().strip()
+        owner = self.v_owner.get().strip()
+        try:
+            _, jb = cloud_mod.api_call(
+                "GET", f"https://api.github.com/repos/{owner}/{repo}/branches?per_page=100", token)
+            branches = [b.get("name", "") for b in (jb if isinstance(jb, list) else [])]
+        except Exception as e:
+            branches = [f"(获取失败: {e})"]
+        try:
+            _, jw = cloud_mod.api_call(
+                "GET", f"https://api.github.com/repos/{owner}/{repo}/actions/workflows", token)
+            wfs = jw.get("workflows", []) if isinstance(jw, dict) else jw
+            wf_names = [w.get("name", "") for w in wfs]
+        except Exception as e:
+            wf_names = [f"(获取失败: {e})"]
+        try:
+            _, jc = cloud_mod.api_call(
+                "GET", f"https://api.github.com/repos/{owner}/{repo}/contents/", token)
+            contents = [c.get("name", "") for c in (jc if isinstance(jc, list) else [])]
+        except Exception as e:
+            contents = [f"(获取失败: {e})"]
+        try:
+            _, ja = cloud_mod.api_call(
+                "GET", f"https://api.github.com/repos/{owner}/{repo}/actions/runs?per_page=5", token)
+            runs = ja.get("workflow_runs", []) if isinstance(ja, dict) else []
+            run_lines = [f"{r.get('display_title','')[:30]} - {r.get('status')}/{r.get('conclusion')}"
+                         for r in runs]
+        except Exception as e:
+            run_lines = [f"(获取失败: {e})"]
+        return (f"仓库: {owner}/{repo}\n"
+                f"分支({len(branches)}): {', '.join(branches) or '无'}\n"
+                f"workflow({len(wf_names)}): {', '.join(wf_names) or '无'}\n"
+                f"根目录文件: {', '.join(contents) or '无'}\n"
+                f"最近 Actions:\n" + ("\n".join(run_lines) or "  无"))
+
+    def _gh_refresh_repo_info(self):
+        token = self.v_gh_token.get().strip()
+        owner, repo = self.v_owner.get().strip(), self.v_repo.get().strip()
+        if not (token and owner and repo):
+            messagebox.showerror("错误", "请先填写 Token / 所有者 / 仓库名")
+            return
+        self._clog(f"刷新仓库信息: {owner}/{repo}...")
+
+        def work():
+            text = self._gh_repo_info_text(repo)
+            self.root.after(0, lambda: self._gh_show_repo_info_win(text))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _gh_show_repo_info_win(self, text):
+        win = tk.Toplevel(self.root)
+        win.title("仓库信息")
+        win.transient(self.root)
+        self._popup_geometry(win, 560, 360)
+        txt = tk.Text(win, wrap="word", font=(FONT, 10))
+        txt.insert("1.0", text)
+        txt.pack(fill="both", expand=True, padx=8, pady=8)
+        ttk.Button(win, text="关闭", command=win.destroy).pack(pady=(0, 8))
+
+    def _gh_browse(self):
+        d = filedialog.askdirectory(initialdir=self.v_local.get() or os.path.expanduser("~"))
+        if d:
+            self.v_local.set(d)
+
+    def _gh_collect_files(self):
+        local = self.v_local.get().strip()
+        if not local:
+            return None
+        if not os.path.isdir(local):
+            messagebox.showerror("错误", f"本地文件夹不存在: {local}")
+            return None
+        out = []
+        skipped = []
+        skip_dirs = {".git", "__pycache__"}
+        skip_dir_prefixes = ("sim_",)   # 仿真测试数据目录，仓库不需要
+        skip_file_prefixes = ("sim",)   # 仿真运行日志（如 simrun2.txt），仓库不需要
+        skip_files = {"importer_config.json"}   # 含 GitHub / Codemagic Token，禁止上传
+        # 构建产物 / 大二进制：GitHub Contents API 单文件上限 ~1MB，且仓库不需要
+        # 证书 / 私钥 / 描述文件：严禁上传（防泄露开发证书）
+        skip_ext = {".ipa", ".zip", ".exe", ".dylib", ".bin", ".pyc", ".log",
+                    ".p12", ".mobileprovision", ".provisionprofile",
+                    ".cer", ".crt", ".pem", ".key", ".pfx"}
+        MAX_BYTES = 1 * 1024 * 1024
+        for root, dirs, fns in os.walk(local):
+            dirs[:] = [d for d in dirs
+                       if d not in skip_dirs
+                       and not d.startswith(skip_dir_prefixes)]
+            for fn in fns:
+                if fn in skip_files or fn.lower().endswith(tuple(skip_ext)) \
+                        or fn.lower().startswith(skip_file_prefixes):
+                    skipped.append((fn, "忽略类型"))
+                    continue
+                full = os.path.join(root, fn)
+                try:
+                    if os.path.getsize(full) > MAX_BYTES:
+                        skipped.append((fn, "超 1MB"))
+                        continue
+                except OSError:
+                    continue
+                rel = os.path.relpath(full, local).replace(os.sep, "/")
+                out.append((rel, full))
+        for fn, why in skipped:
+            self._clog(f"跳过 {fn}（{why}，不上传）")
+        if not out:
+            messagebox.showerror("错误", f"本地文件夹没有任何文件: {local}")
+            return None
+        return out
+
+    def _gh_do_import(self):
+        self._save_gh_config()
+        files = self._gh_collect_files()
+        if files is None:
+            return
+        token = self.v_gh_token.get().strip()
+        owner, repo = self.v_owner.get().strip(), self.v_repo.get().strip()
+        branch = self.v_branch.get().strip() or "main"
+        target = self.v_target.get().strip()
+        visibility = self.v_visibility.get().strip()
+        auto_create = self.v_auto_create.get()
+        if not (token and owner and repo):
+            messagebox.showerror("错误", "请填写 GitHub Token / 所有者 / 仓库名")
+            return
+        if not target:
+            target = "/"
+        self._clog(f"开始导入 {len(files)} 个文件 到 {owner}/{repo}@{branch}:{target}")
+
+        def work():
+            try:
+                msg, created = cloud_mod.import_to_github(
+                    token, owner, repo, branch, files, target,
+                    visibility=visibility, auto_create=auto_create)
+                self._clog(msg)
+                if created:
+                    self.root.after(0, self._gh_list_repos)
+            except RuntimeError as e:
+                self._clog("❌ 导入失败: " + str(e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _gh_export_zip(self):
+        files = self._gh_collect_files()
+        if files is None:
+            return
+        dst = filedialog.asksaveasfilename(
+            defaultextension=".zip", filetypes=[("ZIP", "*.zip")],
+            initialfile="ios_source.zip")
+        if not dst:
+            return
+        import zipfile
+        with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as z:
+            for rel, full in files:
+                z.write(full, rel)
+        self._clog(f"已导出 {len(files)} 个文件 到 {dst}")
+        messagebox.showinfo("完成", f"已导出 {len(files)} 个文件:\n{dst}")
+
+    def _gh_show_token_help(self):
+        win = tk.Toplevel(self.root)
+        win.title("如何生成 GitHub Token")
+        win.transient(self.root)
+        self._popup_geometry(win, 580, 320)
+        txt = tk.Text(win, wrap="word", font=(FONT, 10))
+        txt.insert("1.0", (
+            "1. 打开 https://github.com/settings/tokens/new\n"
+            "   （也可点旁边的『预填创建页』按钮，已自动勾好权限与 90 天有效期）\n"
+            "2. Note 随便填，例如 IPATool-importer\n"
+            "3. 勾选权限：repo（全部，含 workflow 勾上，否则无法推 .yml）\n"
+            "4. 有效期选 90 天 或自定义\n"
+            "5. 拉到底点 Generate token，复制那一串 ghp_... 粘贴到『GitHub Token』\n"
+            "6. 仓库不存在时勾『自动创建』并选可见性；存在则直接导入\n"
+            "7. 注意：根目录必须放 codemagic.yaml / project.yml 才能云构建")
+        )
+        txt.pack(fill="both", expand=True, padx=8, pady=8)
+        ttk.Button(win, text="关闭", command=win.destroy).pack(pady=(0, 8))
+
+
+    def _build_codemagic_tab(self) -> ttk.Frame:
+        outer, page = self._make_scroll(self.page_area)
+        f = ttk.Frame(page)
+        f.grid(row=0, column=0, sticky="ew")
+        f.columnconfigure(1, weight=1)
+
+        ttk.Label(f, text="Codemagic Token:", style="Page.TLabel").grid(row=0, column=0, sticky="w", pady=3)
+        ttk.Entry(f, textvariable=self.v_cm_token, show="*", width=40).grid(row=0, column=1, sticky="ew", pady=3, padx=5)
+        ttk.Button(f, text="诊断连通性", command=self._cm_diag_api).grid(row=0, column=2, padx=3)
+        ttk.Button(f, text="帮助", command=self._cm_show_help).grid(row=0, column=3, padx=3)
+
+        ttk.Label(f, text="应用(App):", style="Page.TLabel").grid(row=1, column=0, sticky="w", pady=3)
+        cb = ttk.Combobox(f, textvariable=self.v_cm_app, width=38, state="readonly")
+        cb.grid(row=1, column=1, sticky="ew", pady=3, padx=5)
+        cb.bind("<<ComboboxSelected>>", lambda _e: self._cm_list_apps())
+        self.cm_app_cb = cb
+        ttk.Button(f, text="刷新应用", command=self._cm_list_apps).grid(row=1, column=2, padx=3)
+
+        ttk.Label(f, text="分支:", style="Page.TLabel").grid(row=2, column=0, sticky="w", pady=3)
+        self.cm_branch = tk.StringVar(value=cloud_mod.DEFAULT_CM_BRANCH)
+        ttk.Combobox(f, textvariable=self.cm_branch, width=14, state="readonly",
+                     values=["默认", "develop", "master"]).grid(row=2, column=1, sticky="w", padx=5)
+
+        bf = ttk.Frame(f)
+        bf.grid(row=3, column=0, columnspan=3, pady=8)
+        ttk.Button(bf, text="开始构建", command=self._cm_start_build).pack(side="left", padx=6)
+        ttk.Button(bf, text="打开控制台", command=self._cm_open_console).pack(side="left", padx=6)
+        ttk.Button(bf, text="下载构建产物", command=self._cm_download_artifacts).pack(side="left", padx=6)
+        return outer
+
+    def _cm_list_apps(self):
+        token = self.v_cm_token.get().strip()
+        if not token:
+            messagebox.showerror("错误", "请先填写 Codemagic Token")
+            return
+        self._clog("正在获取 Codemagic 应用列表...")
+
+        def work():
+            try:
+                apps = cloud_mod.list_codemagic_apps(token)
+                if not apps:
+                    self._clog("未获取到任何应用(确认 Token 正确, 且账号下已有 App)")
+                    return
+                self.app_map = apps
+                self.root.after(0, lambda: self._cm_set_app_options(list(apps.keys())))
+                self._clog(f"已获取 {len(apps)} 个应用")
+            except RuntimeError as e:
+                self._clog("❌ 获取应用失败: " + str(e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _cm_set_app_options(self, names):
+        if self.cm_app_cb is not None:
+            self.cm_app_cb["values"] = names
+        if names and not self.v_cm_app.get():
+            self.v_cm_app.set(names[0])
+
+    def _cm_start_build(self):
+        token = self.v_cm_token.get().strip()
+        app_name = self.v_cm_app.get().strip()
+        if not token:
+            messagebox.showerror("错误", "请先填写 Codemagic Token")
+            return
+        if not app_name:
+            messagebox.showerror("错误", "请先刷新并选择一个应用")
+            return
+        app_id = self.app_map.get(app_name)
+        if not app_id:
+            messagebox.showerror("错误", "应用 ID 未找到, 请重新刷新应用列表")
+            return
+        branch = self.cm_branch.get().strip()
+        branch = None if branch == "默认" else branch
+        self._clog(f"启动构建: {app_name} (branch={branch or '默认'})")
+
+        def work():
+            try:
+                build_id, url = cloud_mod.importer_start_codemagic_build(token, app_id, branch)
+                self.last_build_id = build_id
+                self._clog(f"构建已启动: {url}")
+                self.root.after(0, lambda: self._cm_open_url(url))
+                self.root.after(2000, self._cm_poll_build)
+            except RuntimeError as e:
+                self._clog("❌ 启动构建失败: " + str(e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _cm_open_url(self, url):
+        if url:
+            webbrowser.open(url)
+
+    def _cm_poll_build(self):
+        token = self.v_cm_token.get().strip()
+        if not (token and self.last_build_id):
+            return
+        self._clog(f"查询构建状态: {self.last_build_id}")
+
+        def work():
+            try:
+                status, finished, artifacts = cloud_mod.poll_codemagic_build(token, self.last_build_id)
+                self.last_artifacts = artifacts
+                if finished:
+                    self._clog(f"构建结束: {status}")
+                    if artifacts:
+                        self._clog(f"产物: {', '.join(a.get('name', '') for a in artifacts)}")
+                    else:
+                        self._clog("构建完成但未返回产物(检查 workflow 是否配置 artifacts)")
+                else:
+                    self._clog(f"构建中({status}), 10 秒后重试...")
+                    self.root.after(10000, self._cm_poll_build)
+            except RuntimeError as e:
+                self._clog("❌ 查询构建失败: " + str(e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _cm_open_console(self):
+        if not self.last_build_id:
+            messagebox.showinfo("提示", "还没有构建记录, 请先『开始构建』")
+            return
+        webbrowser.open(f"https://codemagic.io/app/build/{self.last_build_id}")
+
+    def _cm_download_artifacts(self):
+        token = self.v_cm_token.get().strip()
+        if not (token and self.last_build_id):
+            messagebox.showerror("错误", "请先构建并等待完成")
+            return
+        d = filedialog.askdirectory(title="选择下载目录")
+        if not d:
+            return
+        self._clog("下载构建产物...")
+
+        def work():
+            try:
+                saved = cloud_mod.download_codemagic_artifacts(token, self.last_build_id, d)
+                self._clog(f"已下载 {len(saved)} 个文件 到 {d}" if saved
+                           else "没有可下载的产物(构建可能未完成或未配置 artifacts)")
+                if saved:
+                    self.root.after(0, lambda: messagebox.showinfo("完成", f"已下载 {len(saved)} 个文件:\n{d}"))
+            except RuntimeError as e:
+                self._clog("❌ 下载失败: " + str(e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _cm_diag_api(self):
+        token = self.v_cm_token.get().strip()
+        if not token:
+            messagebox.showerror("错误", "请先填写 Codemagic Token")
+            return
+
+        def work():
+            try:
+                import socket as _sk
+                import ssl as _ssl
+                host = "api.codemagic.io"
+                ip = _sk.gethostbyname(host)
+                ctx = _ssl.create_default_context()
+                with _sk.create_connection((host, 443), timeout=8) as s, \
+                        ctx.wrap_socket(s, server_hostname=host) as ss:
+                    cipher = ss.cipher()
+                self._clog(f"✅ 网络可达: {host} -> {ip}, TLS: {cipher[0] if cipher else 'n/a'}")
+                code, _ = cloud_mod.api_call("GET", f"{cloud_mod.API_BASE}/builds?limit=1", token)
+                self._clog(f"✅ API 鉴权成功 (HTTP {code})")
+            except Exception as e:
+                self._clog("❌ Codemagic 连通性/鉴权失败: " + str(e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _cm_show_help(self):
+        win = tk.Toplevel(self.root)
+        win.title("Codemagic 使用帮助")
+        win.transient(self.root)
+        self._popup_geometry(win, 600, 380)
+        txt = tk.Text(win, wrap="word", font=(FONT, 10))
+        txt.insert("1.0", (
+            "1. 登录 https://codemagic.io , 右上角 User -> Personal Access Token 创建\n"
+            "2. 粘贴到『Codemagic Token』, 点『诊断连通性』确认能连上 + 鉴权通过\n"
+            "3. 点『刷新应用』, 选择要构建的 App(已接入 GitHub 仓库)\n"
+            "4. 选分支, 点『开始构建』会自动开浏览器到构建控制台\n"
+            "5. 构建完成后点『下载构建产物』, 选目录保存 dylib 等\n"
+            "6. 若长期失败: 多半是网络/代理问题, 见 README 的代理说明\n"
+            "7. 注意: 仓库根目录必须有 codemagic.yaml, 否则构建找不到 workflow")
+        )
+        txt.pack(fill="both", expand=True, padx=8, pady=8)
+        ttk.Button(win, text="关闭", command=win.destroy).pack(pady=(0, 8))
+
+
+    def _build_compile_tab(self) -> ttk.Frame:
+        outer, page = self._make_scroll(self.page_area)
+        f = ttk.Frame(page)
+        f.grid(row=0, column=0, sticky="ew")
+        f.columnconfigure(1, weight=1)
+
+        ttk.Label(f, text="仓库:", style="Page.TLabel").grid(row=0, column=0, sticky="w", pady=3)
+        cb = ttk.Combobox(f, textvariable=self.v_repo, width=34, state="readonly")
+        cb.grid(row=0, column=1, sticky="ew", pady=3, padx=5)
+        cb.bind("<<ComboboxSelected>>", lambda _e: self._gh_on_repo_pick())
+        self.repo_cb2 = cb
+        ttk.Button(f, text="刷新", command=self._gh_list_repos).grid(row=0, column=2, padx=3)
+        ttk.Button(f, text="仓库信息", command=self._gh_refresh_repo_info).grid(row=0, column=3, padx=3)
+
+        ttk.Label(f, text="所有者:", style="Page.TLabel").grid(row=1, column=0, sticky="w", pady=3)
+        ttk.Entry(f, textvariable=self.v_owner, width=36).grid(row=1, column=1, sticky="ew", pady=3, padx=5)
+
+        ttk.Label(f, text="分支:", style="Page.TLabel").grid(row=2, column=0, sticky="w", pady=3)
+        ttk.Entry(f, textvariable=self.v_branch, width=36).grid(row=2, column=1, sticky="ew", pady=3, padx=5)
+
+        ttk.Label(f, text="Workflow 文件名:", style="Page.TLabel").grid(row=3, column=0, sticky="w", pady=3)
+        wf = ttk.Combobox(f, textvariable=self.v_workflow_file, width=34, state="readonly")
+        wf.grid(row=3, column=1, sticky="ew", pady=3, padx=5)
+        self.wf_cb = wf
+        ttk.Button(f, text="刷新 Workflow", command=self._gh_list_workflows).grid(row=3, column=2, padx=3)
+
+        info = tk.Label(f, textvariable=self._repo_info, wraplength=520,
+                        foreground="blue", justify="left", font=(FONT, 9))
+        info.grid(row=4, column=0, columnspan=4, sticky="w", pady=(4, 6))
+        self._repo_info.trace_add("write", lambda *_a: info.configure(text=self._repo_info.get()))
+
+        bf = ttk.Frame(f)
+        bf.grid(row=5, column=0, columnspan=4, pady=6, sticky="w")
+        ttk.Button(bf, text="A. 编译 dylib + 下载", command=self._cmp_start_actions_build).pack(side="left", padx=6)
+        ttk.Button(bf, text="导入 GitHub", command=self._gh_do_import).pack(side="left", padx=6)
+        ttk.Button(bf, text="下载 / 拾取 dylib", command=self._cmp_download_dylib).pack(side="left", padx=6)
+        ttk.Button(bf, text="下载 / 拾取 IPA", command=self._cmp_download_ipa).pack(side="left", padx=6)
+
+        return outer
+
+    def _cmp_start_actions_build(self):
+        token = self.v_gh_token.get().strip()
+        owner, repo = self.v_owner.get().strip(), self.v_repo.get().strip()
+        branch = self.v_branch.get().strip() or "main"
+        wf = self.v_workflow_file.get().strip() or "build-tweak.yml"
+        if not (token and owner and repo):
+            messagebox.showerror("错误", "请填写 GitHub Token / 所有者 / 仓库名")
+            return
+        self._clog(f"触发 GitHub Actions: {owner}/{repo} {wf} @ {branch}")
+
+        def work():
+            try:
+                run_id, url = cloud_mod.trigger_github_actions(token, owner, repo, wf, branch)
+                self.last_run_id = run_id
+                self._clog(f"已触发 Actions run: {run_id}\n{url}")
+                self.root.after(0, lambda: webbrowser.open(url))
+                self.root.after(3000, self._cmp_poll_actions_run)
+            except RuntimeError as e:
+                self._clog("❌ 触发 Actions 失败: " + str(e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _cmp_poll_actions_run(self):
+        token = self.v_gh_token.get().strip()
+        owner, repo = self.v_owner.get().strip(), self.v_repo.get().strip()
+        if not (token and owner and repo and self.last_run_id):
+            return
+        self._clog(f"查询 Actions 状态: {self.last_run_id}")
+
+        def work():
+            try:
+                status, conclusion = cloud_mod.get_actions_run_status(
+                    token, owner, repo, self.last_run_id)
+                if status == "completed":
+                    self._clog(f"✅ Actions 完成: {conclusion}")
+                else:
+                    self._clog(f"⏳ Actions {status}, 10 秒后重试...")
+                    self.root.after(10000, self._cmp_poll_actions_run)
+            except RuntimeError as e:
+                self._clog("❌ 查询 Actions 失败: " + str(e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _cmp_download_dylib_manual(self):
+        path = filedialog.askopenfilename(
+            title="选择本地 dylib 文件",
+            filetypes=[("dylib", "*.dylib"), ("所有文件", "*.*")])
+        if not path:
+            return
+        self.v_dylib_path.set(path)
+        self._clog(f"已设置 dylib 路径: {path}")
+
+    def _cmp_download_dylib(self):
+        token = self.v_gh_token.get().strip()
+        owner, repo = self.v_owner.get().strip(), self.v_repo.get().strip()
+        branch = self.v_branch.get().strip() or "main"
+        wf = self.v_workflow_file.get().strip() or "build-tweak.yml"
+        if not (token and owner and repo):
+            messagebox.showerror("错误", "请填写 GitHub Token / 所有者 / 仓库名")
+            return
+        d = filedialog.askdirectory(title="选择 Artifacts 解压目录")
+        if not d:
+            return
+        self._clog("下载 Actions Artifacts (dylib) ...")
+
+        def work():
+            try:
+                cloud_mod.download_actions_artifact(token, owner, repo, wf, branch, d, artifact_name=None)
+                self._clog(f"已下载并解压 Artifacts 到: {d}")
+                self.root.after(0, lambda: self._cmp_pick_dylib(d))
+            except RuntimeError as e:
+                self._clog("❌ 下载 Artifacts 失败: " + str(e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _cmp_pick_dylib(self, d):
+        found = [os.path.join(dp, fn) for dp, _, fns in os.walk(d)
+                 for fn in fns if fn.endswith(".dylib")]
+        if not found:
+            self._clog(f"目录 {d} 下未找到 .dylib 文件")
+            return
+        self.v_dylib_path.set(found[0])
+        self._clog(f"自动拾取 dylib: {found[0]}")
+
+    def _cmp_download_ipa_manual(self):
+        path = filedialog.askopenfilename(
+            title="选择本地 IPA 文件",
+            filetypes=[("IPA", "*.ipa"), ("所有文件", "*.*")])
+        if not path:
+            return
+        self.v_ipa_path.set(path)
+        self._clog(f"已设置 IPA 路径: {path}")
+
+    def _cmp_download_ipa(self):
+        token = self.v_gh_token.get().strip()
+        owner, repo = self.v_owner.get().strip(), self.v_repo.get().strip()
+        if not (owner and repo):
+            messagebox.showerror("错误", "请填写 所有者 / 仓库名")
+            return
+
+        def work():
+            try:
+                url = f"https://api.github.com/repos/{owner}/{repo}/releases?per_page=10"
+                _, j = cloud_mod.api_call("GET", url, token)
+                rels = j if isinstance(j, list) else []
+                assets = []
+                for r in rels:
+                    for a in r.get("assets", []):
+                        if str(a.get("name", "")).lower().endswith(".ipa"):
+                            assets.append((a["name"], a["browser_download_url"]))
+                self.root.after(0, lambda: self._cmp_pick_ipa(assets))
+            except RuntimeError as e:
+                self._clog("❌ 获取 Releases 失败: " + str(e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _cmp_pick_ipa(self, assets):
+        if not assets:
+            self._clog("该仓库最近 Releases 里没有 .ipa 资产(可手动下载后『浏览』)")
+            messagebox.showinfo("提示", "没有找到 IPA 资产, 请手动下载后点『浏览』")
+            return
+        win = tk.Toplevel(self.root)
+        win.title("选择要下载的 IPA")
+        win.transient(self.root)
+        self._popup_geometry(win, 460, 320)
+        lb = tk.Listbox(win, font=(FONT, 10))
+        for nm, _ in assets:
+            lb.insert("end", nm)
+        lb.pack(fill="both", expand=True, padx=8, pady=8)
+
+        def choose():
+            sel = lb.curselection()
+            if not sel:
+                return
+            nm, url = assets[sel[0]]
+            d = filedialog.askdirectory(title="选择保存目录")
+            if not d:
+                return
+            token = self.v_gh_token.get().strip()
+
+            def dl():
+                try:
+                    import urllib.request as _ur
+                    dst = os.path.join(d, nm)
+                    _ur.urlretrieve(url, dst)
+                    self.v_ipa_path.set(dst)
+                    self._clog(f"已下载 IPA: {dst}")
+                except Exception as e:
+                    self._clog("❌ 下载 IPA 失败: " + str(e))
+
+            threading.Thread(target=dl, daemon=True).start()
+            win.destroy()
+
+        ttk.Button(win, text="下载", command=choose).pack(pady=(0, 8))
 
 def main(argv: list[str] | None = None) -> int:
     _enable_dpi_awareness()
