@@ -364,6 +364,11 @@ class IpatoolGui:
         self.v_zip_level = tk.StringVar(value="auto")
         self.v_remember = tk.BooleanVar(value=True)
 
+        # 签名 dylib（独立页签用）
+        self.v_dylib_sign = tk.StringVar()      # 要签名的 .dylib
+        self.v_dylib_sign_out = tk.StringVar()  # 签名后输出（留空=就地签名）
+        self.v_dylib_sign_backend = tk.StringVar(value="auto")  # auto/codesign/zsign
+
         # 证书列表「选择」用（像爱思那样：存下来 → 下拉里选一个，不用每次填路径密码）
         self.v_cert = tk.StringVar()            # 「使用证书」下拉里显示的文本
         self.v_cert_summary = tk.StringVar()    # 下拉下面那行：到底会用哪个
@@ -445,16 +450,15 @@ class IpatoolGui:
         card, box = self._card(self.root, "IPA 文件")
         card.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 8))
         box.columnconfigure(1, weight=1)
-        box.columnconfigure(4, weight=1)
 
         ttk.Label(box, text="输入").grid(row=0, column=0, sticky="w", padx=(0, 6))
         ttk.Entry(box, textvariable=self.v_input).grid(row=0, column=1, sticky="ew")
         ttk.Button(box, text="打开…", width=8, command=self._pick_input).grid(row=0, column=2, padx=6)
 
-        ttk.Label(box, text="输出").grid(row=0, column=3, sticky="w", padx=(12, 6))
+        ttk.Label(box, text="输出").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
         self.ent_output = ttk.Entry(box, textvariable=self.v_output)
-        self.ent_output.grid(row=0, column=4, sticky="ew")
-        ttk.Button(box, text="另存为…", width=8, command=self._pick_output).grid(row=0, column=5, padx=6)
+        self.ent_output.grid(row=1, column=1, sticky="ew", pady=(6, 0))
+        ttk.Button(box, text="另存为…", width=8, command=self._pick_output).grid(row=1, column=2, padx=6, pady=(6, 0))
 
         hint = ttk.Label(
             box,
@@ -462,14 +466,14 @@ class IpatoolGui:
                  "选中后不解析，要看包内信息点「读取信息」。",
             style="Muted.TLabel", justify="left", wraplength=940,
         )
-        hint.grid(row=1, column=0, columnspan=6, sticky="w", pady=(6, 0))
+        hint.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         self._check(box, "直接覆盖输入文件（--in-place）", self.v_inplace,
                     command=self._sync_inplace).grid(
-            row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+            row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         self.msg_io = ttk.Label(box, text="", foreground=DANGER)
-        self.msg_io.grid(row=2, column=3, columnspan=3, sticky="w")
+        self.msg_io.grid(row=3, column=2, sticky="w")
 
     def _sync_inplace(self) -> None:
         self.ent_output.configure(state="disabled" if self.v_inplace.get() else "normal")
@@ -531,12 +535,14 @@ class IpatoolGui:
         self.github_page = self._build_github_tab()
         self.codemagic_page = self._build_codemagic_tab()
         self.compile_page = self._build_compile_tab()
+        self.signdylib_page = self._build_signdylib_tab()
 
         self._add_tab("pack", "  改 ID · 注入 · 签名  ", self.pack_page)
         self._add_tab("info", "  信息  ", self.info_page)
         self._add_tab("github", "  GitHub 导入  ", self.github_page)
         self._add_tab("codemagic", "  Codemagic 构建  ", self.codemagic_page)
         self._add_tab("compile", "  编译打包  ", self.compile_page)
+        self._add_tab("signdylib", "  签名 dylib  ", self.signdylib_page)
 
         # 页签栏底下的分隔线，铺满整行
         sep = tk.Frame(self.tabbar, bg=BORDER, height=1)
@@ -583,6 +589,19 @@ class IpatoolGui:
         self._build_pack_sign(page, 2)
         self._build_pack_install(page, 3)
         self._build_pack_keep(page, 4)
+        self._build_pack_action(page, 5)
+
+    def _build_pack_action(self, page, row: int) -> None:
+        box = self._group(page, "操作", row)
+        b = ttk.Button(box, text="开始执行", style="Accent.TButton",
+                       command=lambda: self._run_current(dry_run=False))
+        b.grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        self.action_buttons.append(b)
+        ttk.Label(
+            box, style="Muted.TLabel", justify="left", wraplength=520,
+            text="按当前页填写内容自动执行：填了 dylib 就注入+签名，填了 ID/名称就改掉，"
+                 "都没填就只重新打包+签名。",
+        ).grid(row=0, column=1, sticky="w", pady=4)
 
     # ---- 信息 --------------------------------------------------------- #
     def _build_info_tab(self) -> None:
@@ -736,7 +755,7 @@ class IpatoolGui:
 
         ttk.Label(
             box, style="Muted.TLabel", justify="left",
-            text="放进 Frameworks/ 并写入 LC_LOAD_DYLIB；列表顺序＝加载顺序。",
+            text="放进 Frameworks/ 并写入 LC_LOAD_DYLIB；列表顺序>>加载顺序。",
         ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
     # ---- 签名 ---------------------------------------------------------- #
@@ -749,7 +768,7 @@ class IpatoolGui:
         ).grid(row=0, column=1, sticky="w", pady=3)
         ttk.Label(
             box, style="Muted.TLabel", justify="left", wraplength=420,
-            text="auto：macOS 用 codesign，其他平台用项目自带的 zsign；none＝只打包不签名",
+            text="macOS 用 codesign，其他平台用项目自带的 zsign；none>>只打包不签名",
         ).grid(row=0, column=2, sticky="w", padx=(10, 0), pady=3)
 
         ttk.Label(box, text="使用证书").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=3)
@@ -769,6 +788,7 @@ class IpatoolGui:
         ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(2, 3))
 
         self._entry(box, 4, "描述文件", self.v_provision, "改过 Bundle ID 需匹配", browse=lambda: self._pick_file(self.v_provision, [("描述文件", "*.mobileprovision"), ("所有文件", "*.*")]))
+        self._entry(box, 5, "entitlements", self.v_entitlements, "可选；从沙盒 dlopen 加载 dylib 建议加 disable-library-validation", browse=lambda: self._pick_file(self.v_entitlements, [("entitlements", "*.plist"), ("所有文件", "*.*")]))
 
     # ---- 安装到设备 ---------------------------------------------------- #
     def _build_pack_install(self, page, row: int) -> None:
@@ -804,8 +824,7 @@ class IpatoolGui:
         ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 0))
         ttk.Label(
             box, style="Muted.TLabel", justify="left", wraplength=680,
-            text="没有证书时：把产物拖给爱思 / Sideloadly 之类去签，它们自带 Apple ID 认证",
-        ).grid(row=4, column=0, columnspan=4, sticky="w", pady=(0, 2))
+            )
         self._refresh_install_summary()
 
     # ---- 记住设置 ------------------------------------------------------ #
@@ -822,6 +841,150 @@ class IpatoolGui:
             keep, text="清除已保存的证书", command=self._clear_settings,
         ).grid(row=1, column=2, sticky="e", padx=(10, 0))
 
+    # ---- 签名 dylib（独立页，复用证书管理） --------------------------- #
+    def _build_signdylib_tab(self) -> None:
+        outer, page = self._make_scroll(self.page_area)
+        page.columnconfigure(0, weight=1)
+
+        # dylib 文件
+        card, box = self._card(page, "dylib 文件")
+        card.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        box.columnconfigure(1, weight=1)
+        ttk.Label(box, text="dylib").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        ttk.Entry(box, textvariable=self.v_dylib_sign).grid(row=0, column=1, sticky="ew")
+        ttk.Button(
+            box, text="浏览…", width=8,
+            command=lambda: self._pick_file(
+                self.v_dylib_sign, [("dylib", "*.dylib"), ("所有文件", "*.*")]),
+        ).grid(row=0, column=2, padx=6)
+        ttk.Button(box, text="GitHub 下载…", width=12, command=self._signdylib_download).grid(
+            row=0, column=3, padx=6)
+
+        ttk.Label(box, text="输出").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
+        ttk.Entry(box, textvariable=self.v_dylib_sign_out).grid(row=1, column=1, sticky="ew", pady=(6, 0))
+        ttk.Button(box, text="另存为…", width=8, command=self._pick_save_dylib).grid(
+            row=1, column=2, padx=6, pady=(6, 0))
+
+        ttk.Label(
+            box, style="Muted.TLabel", justify="left", wraplength=680,
+            text="留空则就地签名（会先签到临时文件再写回，安全）；填了输出则签到新文件。"
+                 "「GitHub 下载…」会从「GitHub 导入」页配置的仓库拉取构建产物并自动填入上面的 dylib。",
+        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
+
+        # 签名：复用证书下拉 + 添加/编辑/删除
+        self._build_signdylib_sign(page, 1)
+
+        # 说明
+        note, note_box = self._card(page, "说明")
+        note.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        note_box.columnconfigure(0, weight=1)
+        ttk.Label(
+            note_box, style="Muted.TLabel", justify="left", wraplength=680,
+            text=(
+                "iOS 的 library validation 要求插件和主 App 同一个 Team ID，"
+                "所以插件要用签主 App 的那把证书签，否则 dlopen 会报 code signature invalid。\n"
+                "后端 auto：macOS 走 codesign，其他平台走项目自带的 zsign（zsign 需 --p12 证书，"
+                "建议再带 --provision 让 Team ID 一致）。\n"
+                "不选证书则为 ad-hoc，ad-hoc 没有 Team ID，未越狱设备基本加载不了。"
+            ),
+        ).grid(row=0, column=0, sticky="w")
+
+        # 操作：本页自带「开始签名」，不再依赖底部全局按钮
+        act, act_box = self._card(page, "操作")
+        act.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        act_box.columnconfigure(0, weight=1)
+        b = ttk.Button(act_box, text="开始签名", style="Accent.TButton",
+                       command=lambda: self._run_signdylib(dry_run=False))
+        b.grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        self.action_buttons.append(b)
+        ttk.Label(
+            act_box, style="Muted.TLabel", justify="left", wraplength=540,
+            text="按所选后端（auto/codesign/zsign）+ 证书对上面的 dylib 签名；"
+                 "输出留空则就地签名。",
+        ).grid(row=0, column=1, sticky="w", pady=4)
+        return outer
+
+    def _build_signdylib_sign(self, page, row: int) -> None:
+        box = self._group(page, "签名（选证书；不选则 ad-hoc）", row)
+        ttk.Label(box, text="后端").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=3)
+        ttk.Combobox(
+            box, textvariable=self.v_dylib_sign_backend,
+            values=["auto", "codesign", "zsign"], state="readonly", width=14,
+        ).grid(row=0, column=1, sticky="w", pady=3)
+        ttk.Label(
+            box, style="Muted.TLabel", justify="left", wraplength=420,
+            text="auto：macOS 用 codesign，其它用 zsign；zsign 需 p12 证书",
+        ).grid(row=0, column=2, sticky="w", padx=(10, 0), pady=3)
+
+        ttk.Label(box, text="使用证书").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=3)
+        self.cb_cert_dylib = ttk.Combobox(
+            box, textvariable=self.v_cert, values=[], state="readonly", width=46)
+        self.cb_cert_dylib.grid(row=1, column=1, columnspan=3, sticky="ew", pady=3)
+        self.cb_cert_dylib.bind("<<ComboboxSelected>>", self._apply_cert_choice)
+
+        certbtns = ttk.Frame(box)
+        certbtns.grid(row=2, column=1, columnspan=3, sticky="w")
+        ttk.Button(certbtns, text="添加证书…", command=self._open_cert_dialog).pack(side="left")
+        ttk.Button(certbtns, text="编辑…", command=self._edit_cert).pack(side="left", padx=(6, 0))
+        ttk.Button(certbtns, text="删除", command=self._delete_cert).pack(side="left", padx=(6, 0))
+
+        ttk.Label(
+            box, style="Muted.TLabel", justify="left", wraplength=680,
+            textvariable=self.v_cert_summary,
+        ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(2, 3))
+
+        self._entry(
+            box, 4, "描述文件", self.v_provision, "zsign 签 dylib 建议带，确保 Team ID 一致",
+            browse=lambda: self._pick_file(
+                self.v_provision, [("描述文件", "*.mobileprovision"), ("所有文件", "*.*")]))
+        self._entry(
+            box, 5, "entitlements", self.v_entitlements, "可选；留空则沿用 dylib 原签名里的权限",
+            browse=lambda: self._pick_file(
+                self.v_entitlements, [("entitlements", "*.plist"), ("所有文件", "*.*")]))
+
+        self._rebuild_cert_choices()
+
+    def _pick_save_dylib(self) -> None:
+        path = filedialog.asksaveasfilename(
+            defaultextension=".dylib",
+            filetypes=[("dylib", "*.dylib"), ("所有文件", "*.*")],
+        )
+        if path:
+            self.v_dylib_sign_out.set(path)
+
+    def _signdylib_download(self) -> None:
+        """从「GitHub 导入」页配置的仓库拉取构建产物（dylib）并自动填入上面的 dylib 框。"""
+        token = self.v_gh_token.get().strip()
+        owner, repo = self.v_owner.get().strip(), self.v_repo.get().strip()
+        branch = self.v_branch.get().strip() or "main"
+        wf = self.v_workflow_file.get().strip() or "build-tweak.yml"
+        if not (token and owner and repo):
+            messagebox.showerror("错误", "请先在「GitHub 导入」页填写 GitHub Token / 所有者 / 仓库名")
+            return
+        d = filedialog.askdirectory(title="选择 Artifacts 解压目录")
+        if not d:
+            return
+        self._clog("下载 Actions Artifacts (dylib) ...")
+
+        def work():
+            try:
+                cloud_mod.download_actions_artifact(token, owner, repo, wf, branch, d, artifact_name=None)
+                self._clog(f"已下载并解压 Artifacts 到: {d}")
+                self.root.after(0, lambda: self._signdylib_pick_dylib(d))
+            except RuntimeError as e:
+                self._clog("❌ 下载 Artifacts 失败: " + str(e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _signdylib_pick_dylib(self, d) -> None:
+        found = [os.path.join(dp, fn) for dp, _, fns in os.walk(d)
+                 for fn in fns if fn.endswith(".dylib")]
+        if not found:
+            self._clog(f"目录 {d} 下未找到 .dylib 文件")
+            return
+        self.v_dylib_sign.set(found[0])
+        self._clog(f"已从 GitHub 下载并自动填入 dylib: {found[0]}")
+
     # ------------------------------------------------------------------ #
     # 底部：日志 + 操作
     # ------------------------------------------------------------------ #
@@ -833,10 +996,6 @@ class IpatoolGui:
 
         bar = ttk.Frame(area)
         bar.grid(row=0, column=0, sticky="ew")
-        b_go = ttk.Button(bar, text="开始执行", style="Accent.TButton",
-                          command=lambda: self._run_current(dry_run=False))
-        b_go.pack(side="left")
-        self.action_buttons = [b_go]
         self.lbl_status = ttk.Label(bar, textvariable=self.v_status, style="Status.TLabel")
         self.lbl_status.pack(side="right")
         ttk.Button(bar, text="清空日志",
@@ -1058,6 +1217,8 @@ class IpatoolGui:
         self._cert_texts = [text for text, _key in choices]
         if hasattr(self, "cb_cert"):
             self.cb_cert.configure(values=self._cert_texts)
+        if hasattr(self, "cb_cert_dylib"):
+            self.cb_cert_dylib.configure(values=self._cert_texts)
         want = self._current_cert_key() if select is None else select
         if want not in self._cert_keys:
             want = ""
@@ -1737,15 +1898,11 @@ class IpatoolGui:
 
     def _run_current(self, dry_run: bool) -> None:
         """
-        底部唯一的动作按钮（「开始执行」）：
-        不再让人挑按钮，按上面填的内容自动决定做什么 ——
+        「开始执行」按钮（第一个页签内）：按上面填的内容自动决定做什么 ——
           列表里有 dylib  → 注入（+ 签名）
           填了 ID / 名称  → 改 ID / 名称（+ 签名）
           什么都没填      → 只重新打包 + 签名
         """
-        if self._active_tab == "info":
-            self._load_info()
-            return
         tag = "[预览]" if dry_run else "[执行]"
         fill_ident = bool(self.v_bundle_id.get().strip() or self.v_name.get().strip())
         if self.custom_dylibs:
@@ -1769,6 +1926,26 @@ class IpatoolGui:
 
     def _run_sign(self, dry_run: bool = False) -> None:
         self._start_task(self._sign_argv(), "sign", dry_run)
+
+    def _run_signdylib(self, dry_run: bool = False) -> None:
+        self._start_task(self._signdylib_argv(), "signdylib", dry_run)
+
+    def _signdylib_argv(self) -> list[str] | None:
+        src = self.v_dylib_sign.get().strip()
+        if not src:
+            messagebox.showwarning("缺少 dylib", "请先选择（或点「GitHub 下载…」）要签名的 .dylib 文件。")
+            return None
+        argv = ["signdylib", src]
+        _add(argv, "--sign", self.v_dylib_sign_backend.get())
+        _add(argv, "--identity", self.v_identity.get())
+        _add(argv, "--p12", self.v_p12.get())
+        _add(argv, "--p12-password", self.v_p12_password.get())
+        _add(argv, "--provision", self.v_provision.get())
+        _add(argv, "--entitlements", self.v_entitlements.get())
+        out = self.v_dylib_sign_out.get().strip()
+        if out:
+            _add(argv, "--output", out)
+        return argv
 
     def _start_task(self, argv: list[str] | None, task: str, dry_run: bool) -> None:
         if argv is None:
@@ -2466,8 +2643,16 @@ class IpatoolGui:
         if not found:
             self._clog(f"目录 {d} 下未找到 .dylib 文件")
             return
-        self.v_dylib_path.set(found[0])
-        self._clog(f"自动拾取 dylib: {found[0]}")
+        added = 0
+        for path in found:
+            if path not in self.custom_dylibs:
+                self.custom_dylibs.append(path)
+                self.list_dylibs.insert("end", path)
+                added += 1
+        if found:
+            self.v_dylib_path.set(found[0])
+        self._clog(f"已自动加入注入列表 {added}/{len(found)} 个 dylib: "
+                   + ", ".join(os.path.basename(p) for p in found))
 
     def _cmp_download_ipa_manual(self):
         path = filedialog.askopenfilename(
