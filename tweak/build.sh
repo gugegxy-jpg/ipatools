@@ -3,19 +3,21 @@
 # 编译注入用的 dylib（悬浮控制面板 / 文件导入导出 / 弱网测试）。需要 macOS + Xcode 命令行工具：
 #   xcode-select --install
 #
-#   ./tweak/build.sh                               默认只出 IPATool.dylib（三个功能合编在一起）
+#   ./tweak/build.sh                               默认出 IPATool.dylib + QNet.dylib
 #   IPATOOL_TARGETS="ControlPanel FileBridge QNet" ./tweak/build.sh   只编译指定目标（单独出包）
 #
-# 三个功能默认合编成一个 IPATool.dylib：注入一次就够，开哪些功能由 Info.plist 里
-# 对应的 IPAToolControl / IPAToolFiles / IPAToolQNet 的 Enabled 决定。
-# 合编是安全的：三份源码的顶层函数全是 static，类名前缀各不相同，
-# 各自的 constructor 也是 static，链接时不会撞符号。
+# 默认两个产物：
+#   - IPATool.dylib  = ControlPanel + FileBridge + PluginLoader（悬浮面板 / 文件导入导出 / 运行时插件加载）
+#   - QNet.dylib      = 弱网测试，单独一个 dylib（见下）
+# QNet 单独出包：它和面板之间只用「通知 + NSUserDefaults」通信（IPATControlShared.h），
+# 不链接彼此符号，所以单独编成 QNet.dylib、靠 --qnet 注入 Frameworks 或运行时当插件加载都行，
+# 加载后自己 post IPATControlRegister，面板就会多出弱网那一节。这样改 QNet 不用重编主 dylib。
 #
 # 可通过环境变量调整：
 #   IPATOOL_MIN_IOS   最低系统版本，默认 14.0
 #   IPATOOL_ARCHS     架构列表，默认 "arm64"（可写 "arm64 arm64e"）
 #   IPATOOL_OUT_DIR   产物目录，默认 tweak/build
-#   IPATOOL_TARGETS   目标列表，默认 "IPATool"（合并目标）；也可写单个功能名
+#   IPATOOL_TARGETS   目标列表，默认 "IPATool QNet"；也可写单个功能名
 #
 set -euo pipefail
 
@@ -23,7 +25,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT_DIR="${IPATOOL_OUT_DIR:-$HERE/build}"
 MIN_IOS="${IPATOOL_MIN_IOS:-14.0}"
 ARCHS="${IPATOOL_ARCHS:-arm64}"
-TARGETS="${IPATOOL_TARGETS:-IPATool}"
+TARGETS="${IPATOOL_TARGETS:-IPATool QNet}"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "错误：编译 iOS dylib 需要 macOS + Xcode 命令行工具（当前系统：$(uname -s)）" >&2
@@ -84,7 +86,7 @@ done
 sources_for_target() {
   case "$1" in
     IPATool)
-      printf '%s\n' "$HERE/ControlPanel.m" "$HERE/FileBridge.m" "$HERE/QNet.m" "$HERE/PluginLoader.m" "$OUT_DIR/IPAToolIcon.m"
+      printf '%s\n' "$HERE/ControlPanel.m" "$HERE/FileBridge.m" "$HERE/PluginLoader.m" "$OUT_DIR/IPAToolIcon.m"
       ;;
     *)
       if [[ "$1" == "ControlPanel" ]]; then
