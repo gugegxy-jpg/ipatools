@@ -309,6 +309,88 @@ def zsign_ipa(
     log(f"  zsign 完成 -> {out_ipa}")
 
 
+def _write_minimal_plist(app_dir: str, exe_name: str) -> None:
+    """写一个最小可用的 Info.plist，让 zsign 能把目录当成 .app 来签。
+
+    只用 ASCII，避免 UTF-8 BOM 让 zsign 解析不到 CFBundleExecutable 而报错。
+    """
+    plist = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+        '"http://www.app.com/DTDs/PropertyList-1.0.dtd">\n'
+        '<plist version="1.0"><dict>\n'
+        '<key>CFBundleName</key><string>Wrap</string>\n'
+        '<key>CFBundleIdentifier</key><string>com.example.wrap</string>\n'
+        '<key>CFBundleVersion</key><string>1.0</string>\n'
+        '<key>CFBundleShortVersionString</key><string>1.0</string>\n'
+        f'<key>CFBundleExecutable</key><string>{exe_name}</string>\n'
+        '<key>MinimumOSVersion</key><string>12.0</string>\n'
+        '<key>CFBundlePackageType</key><string>APPL</string>\n'
+        '</dict></plist>\n'
+    )
+    with open(os.path.join(app_dir, "Info.plist"), "w", encoding="ascii") as f:
+        f.write(plist)
+
+
+def zsign_one(
+    in_path: str,
+    out_path: str,
+    p12: str,
+    p12_password: str | None = None,
+    provision: str | None = None,
+    entitlements: str | None = None,
+    log=print,
+) -> None:
+    """用 zsign 给单个插件 dylib 签名（Windows / Linux / macOS 通用）。
+
+    **关键点**：zsign v1.1.2 不支持给「独立的 .dylib」文件签名——直接给它 -o 或
+    就地签都会空过（文件原样不动，还谎报成功，正是之前 dylib 变 0KB 的根因）。
+    正确做法是把 dylib 包进一个临时 .app，用 zsign 签整个包（它会签 Frameworks/
+    下的 dylib），再把签好名的 dylib 抽出来写到 out_path。
+    """
+    if not p12:
+        raise SignError("zsign 签名 dylib 需要 --p12 证书文件")
+    binary = zsign_binary()
+    if not binary:
+        raise SignError("找不到 zsign。\n" + zsign_report())
+
+    name = os.path.basename(in_path)
+    work = tempfile.mkdtemp(prefix="zsign-dylib-")
+    try:
+        app_dir = os.path.join(work, "_Wrap.app")
+        fw_dir = os.path.join(app_dir, "Frameworks")
+        os.makedirs(fw_dir)
+        # dylib 放进 Frameworks；主程序用一个副本占位（签完即丢弃）
+        shutil.copyfile(in_path, os.path.join(fw_dir, name))
+        shutil.copyfile(in_path, os.path.join(app_dir, "_Wrap"))
+        _write_minimal_plist(app_dir, "_Wrap")
+
+        # 注意：zsign 对 .app 输入**不要**传 -o（指向 .app 时会去找 Payload/ 目录、报
+        # "Can't find payload directory!" 然后退出非 0）。直接就地签整个 _Wrap.app，
+        # 它会签 Frameworks/ 下的 dylib，签完从输入 app 里把 dylib 抽出来即可。
+        cmd = [binary, "-k", p12]
+        if p12_password:
+            cmd += ["-p", p12_password]
+        if provision:
+            cmd += ["-m", provision]
+        if entitlements:
+            cmd += ["-e", entitlements]
+        cmd += ["-z", "9", app_dir]
+        r = subprocess.run(cmd, capture_output=True, check=False)
+        if r.returncode != 0:
+            raise SignError(
+                "zsign 失败：\n"
+                + (r.stderr.decode("utf-8", "replace").strip() or r.stdout.decode("utf-8", "replace").strip())
+            )
+        signed = os.path.join(app_dir, "Frameworks", name)
+        if not os.path.isfile(signed) or os.path.getsize(signed) == 0:
+            raise SignError("zsign 未生成签名后的 dylib（请检查证书 / 描述文件是否匹配）")
+        shutil.move(signed, out_path)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    log(f"  zsign 完成 -> {out_path}")
+
+
 def embed_provision(app_dir: str, provision: str) -> str:
     dest = os.path.join(app_dir, "embedded.mobileprovision")
     shutil.copyfile(provision, dest)
