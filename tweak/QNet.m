@@ -1220,6 +1220,13 @@ static NSString *IPATQnPresetSummary(IPATQnPresetItem *item) {
     return YES;
 }
 
+/// 拿到输入焦点时再要一次 key：用户中途点过游戏的话 key 已经回到游戏窗口了，
+/// 那种状态下系统同样不会给键盘（键盘只跟 key window 走）
+- (void)textFieldDidBeginEditing:(UITextField *)textField {
+    UIWindow *window = self.window;
+    if (window && !window.isKeyWindow) [window makeKeyWindow];
+}
+
 - (void)refreshValues {
     IPATQnConfig cfg = IPATQnSnapshot();
     self.enableSwitch.on = cfg.enabled ? YES : NO;
@@ -1522,13 +1529,20 @@ static NSString *IPATQnPresetSummary(IPATQnPresetItem *item) {
 
 #pragma mark - 弹窗窗口
 
-/// 不抢焦点（游戏不会因为弹窗被暂停），窗口空白区也不吃触摸
+/// 空白区不吃触摸；平时也不抢焦点（游戏不会因为弹窗被暂停）。
+/// 但设置卡片里有输入框，而 iOS 的键盘只服务 **key window** 的第一响应者：
+/// 非 key 窗口里点输入框能聚焦，系统就是不给键盘（表现就是「点输入框没反应」）。
+/// 所以卡片打开期间允许它成为 key，关掉时把 key 还给游戏——做法与 FileBridge 里那个窗口一致。
 @interface IPATQnWindow : UIWindow
+
+/// 只有设置卡片打开的那段时间置 YES
+@property (nonatomic, assign) BOOL ipatAllowsKey;
+
 @end
 
 @implementation IPATQnWindow
 
-- (BOOL)canBecomeKeyWindow { return NO; }
+- (BOOL)canBecomeKeyWindow { return self.ipatAllowsKey; }
 
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hit = [super hitTest:point withEvent:event];
@@ -1710,6 +1724,11 @@ static NSString *IPATQnPresetSummary(IPATQnPresetItem *item) {
         if (!window) return;
         [self syncWindowGeometry];
         window.hidden = NO;
+        // 卡片里有数字输入框：让窗口成为 key，否则点了输入框系统不给键盘
+        if ([window isKindOfClass:[IPATQnWindow class]]) {
+            ((IPATQnWindow *)window).ipatAllowsKey = YES;
+            if (!window.isKeyWindow) [window makeKeyWindow];
+        }
 
         if (!self.card) {
             CGFloat width = MIN(340.0, window.bounds.size.width - 32.0);
@@ -1756,6 +1775,12 @@ static NSString *IPATQnPresetSummary(IPATQnPresetItem *item) {
             NSArray<UIView *> *subs = [self.settingsWindow.rootViewController.view.subviews copy];
             for (UIView *subview in subs) {
                 [subview removeFromSuperview];
+            }
+            // 关掉之前把 key 还给游戏，别让它一直挂在我们的窗口上（输入 / 焦点都受影响）
+            if ([self.settingsWindow isKindOfClass:[IPATQnWindow class]]) {
+                UIWindow *app = IPATAppKeyWindowExcluding(self.settingsWindow);
+                if (app && !app.isKeyWindow) [app makeKeyWindow];
+                ((IPATQnWindow *)self.settingsWindow).ipatAllowsKey = NO;
             }
             self.settingsWindow.hidden = YES;
         }
