@@ -10,11 +10,13 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
 import time
 import webbrowser
+import zipfile
 import urllib.error
 import urllib.request
 from urllib.parse import quote, urlparse
@@ -144,6 +146,50 @@ def _download_binary(url, headers, path, timeout=180):
             return
         last_err = RuntimeError(p.stderr.decode("utf-8", "replace").strip()[:200])
     raise RuntimeError(f"下载失败: {last_err}")
+
+
+def _parse_repo(url: str, default_branch: str = "main"):
+    """从各种写法里抠出 (owner, repo)；分支沿用传入值（默认 main）。"""
+    s = url.strip().rstrip("/")
+    s = re.sub(r"\.git$", "", s, flags=re.IGNORECASE)
+    m = re.search(r"github\.com[:/]+([^/\s]+)/([^/\s]+)", s)
+    if m:
+        return m.group(1), m.group(2)
+    m = re.match(r"^([^/\s]+)/([^/\s]+)$", s)          # 允许直接写 owner/repo
+    if m:
+        return m.group(1), m.group(2)
+    raise ValueError(f"无法解析 GitHub 仓库地址: {url}")
+
+
+def export_repo(url, branch, out_dir, token="", log=print, timeout=300):
+    """把仓库源码打包下载并解压到本地目录（等价 git archive 下载，不含 .git 历史）。
+
+    branch 可为分支 / 标签 / 提交；私有仓库传 token（走 Authorization 头）。
+    """
+    owner, repo = _parse_repo(url, branch)
+    archive_url = f"https://codeload.github.com/{owner}/{repo}/zip/{branch}"
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    os.makedirs(out_dir, exist_ok=True)
+    tmp = os.path.join(out_dir, f".{repo}-{branch}.zip.tmp")
+    log(f"[导出] {owner}/{repo}@{branch} 开始下载 …")
+    _download_binary(archive_url, headers, tmp, timeout=timeout)
+    log("[导出] 下载完成，正在解压 …")
+    _extract_zip(tmp, out_dir)
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    log(f"[导出] 已导出到 {out_dir}")
+
+
+def _extract_zip(zip_path, out_dir):
+    with zipfile.ZipFile(zip_path, "r") as z:
+        bad = z.testzip()
+        if bad is not None:
+            raise RuntimeError(f"压缩包损坏: {bad}")
+        z.extractall(out_dir)
 
 
 # --------------------------------------------------------------------------- #
