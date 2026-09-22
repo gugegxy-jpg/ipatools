@@ -7,8 +7,11 @@
 #   IPATOOL_TARGETS="ControlPanel FileBridge QNet" ./tweak/build.sh   只编译指定目标（单独出包）
 #
 # 默认两个产物：
-#   - IPATool.dylib  = ControlPanel + FileBridge + PluginLoader（悬浮面板 / 文件导入导出 / 运行时插件加载）
+#   - IPATool.dylib  = ControlPanel + FileBridge（悬浮面板 / 文件导入导出）
 #   - QNet.dylib      = 弱网测试，单独一个 dylib（见下）
+# 说明：运行时「插件加载」(PluginLoader) 已从默认合编里移除 —— iOS 从沙盒 Documents 加载
+# dylib 必须有 disable-library-validation（系统强约束，很多开发描述文件不放行），
+# 故默认不再编入；需要该能力时单独出 PluginLoader.dylib 并经越狱/TrollStore 等环境安装。
 # QNet 单独出包：它和面板之间只用「通知 + NSUserDefaults」通信（IPATControlShared.h），
 # 不链接彼此符号，所以单独编成 QNet.dylib、靠 --qnet 注入 Frameworks 或运行时当插件加载都行，
 # 加载后自己 post IPATControlRegister，面板就会多出弱网那一节。这样改 QNet 不用重编主 dylib。
@@ -86,7 +89,7 @@ done
 sources_for_target() {
   case "$1" in
     IPATool)
-      printf '%s\n' "$HERE/ControlPanel.m" "$HERE/FileBridge.m" "$HERE/PluginLoader.m" "$OUT_DIR/IPAToolIcon.m"
+      printf '%s\n' "$HERE/ControlPanel.m" "$HERE/FileBridge.m" "$OUT_DIR/IPAToolIcon.m"
       ;;
     *)
       if [[ "$1" == "ControlPanel" ]]; then
