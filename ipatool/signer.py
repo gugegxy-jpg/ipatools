@@ -3,10 +3,16 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
+import zipfile
+import plistlib
+
+from cryptography.hazmat.primitives.serialization import pkcs7
 
 from .ipa import is_bundle_dir, is_dylib
 
@@ -194,6 +200,85 @@ def _temp_plist(data: bytes) -> str:
     return path
 
 
+def _provision_entitlements(provision: str) -> dict:
+    """从 .mobileprovision 解出 Entitlements 字典，作为合并基线。
+
+    描述文件允许的键（application-identifier / keychain-access-groups /
+    get-task-allow / com.apple.developer.* 等）必须出现在最终签名里，否则 iOS 会报
+    0xe8008015（找不到有效的描述文件）。
+    """
+    try:
+        data = open(provision, "rb").read()
+    except OSError:
+        return {}
+    content = None
+    try:
+        sig = pkcs7.load_der_pkcs7_signature(data)
+        content = sig.get_content()
+    except Exception:
+        m = re.search(rb"<\?xml.*?</plist>", data, re.S)
+        content = m.group(0) if m else None
+    if not content:
+        return {}
+    try:
+        plist = plistlib.loads(content)
+    except Exception:
+        return {}
+    ents = plist.get("Entitlements")
+    return ents if isinstance(ents, dict) else {}
+
+
+# 这些键只有「开发(Development)描述文件」才允许；Ad-Hoc / 发行描述文件里出现会直接
+# 触发 0xe8008015。而本工具把 dylib 注进 Frameworks/ 用同证书签，library validation 自然
+# 通过，并不需要它们——所以非开发描述文件下直接丢弃，避免把能装的包签坏。
+_DEV_ONLY_KEYS = (
+    "com.apple.security.cs.disable-library-validation",
+    "com.apple.security.cs.allow-unsigned-executable-memory",
+    "com.apple.security.cs.allow-dyld-environment-variables",
+    "com.apple.security.cs.disable-executable-page-protection",
+    "com.apple.security.cs.debuggable",
+)
+
+
+def _merge_entitlements(user_path: str, base: dict, dev_profile: bool | None = None,
+                        log=print) -> str:
+    """把用户自定义 entitlements 合并进 base，写临时 plist 返回路径。
+
+    规则（避免 0xe8008015）：
+      - base = 描述文件允许的 entitlements，是**权威基线**，它的键原样保留；
+      - 用户只负责「追加」描述文件里没有的键；
+      - 用户**不能覆盖**描述文件已管控的键——尤其 get-task-allow；
+      - 当 dev_profile 显式给出时：disable-library-validation / com.apple.security.cs.*
+        这类「仅开发描述文件可用」的键，若描述文件不是开发型就丢弃并提示（加了会 0xe8008015，
+        而包内注入本就不需要它们）。
+    """
+    try:
+        user = plistlib.loads(open(user_path, "rb").read())
+    except Exception:
+        user = {}
+    if not isinstance(user, dict):
+        user = {}
+    merged = dict(base)
+    dropped: list[str] = []
+    for k, v in user.items():
+        # 描述文件已经管控这个键 -> 必须跟描述文件一致，禁止用户覆盖
+        if k in base:
+            continue
+        # get-task-allow 是描述文件强约束键：只有描述文件自己允许（已出现）时才用用户值，
+        # 描述文件没列它（多为发行/Ad-Hoc）时一律不额外加，否则 0xe8008015。
+        if k == "get-task-allow":
+            continue
+        # 仅开发描述文件可用的键：非开发描述文件下丢弃（避免把包签坏）
+        if dev_profile is not None and not dev_profile and k in _DEV_ONLY_KEYS:
+            dropped.append(k)
+            continue
+        merged[k] = v
+    if dropped:
+        log(f"[签名] 描述文件不是开发型，已忽略不需要的 entitlements 键（否则 iOS 会"
+            f" 0xe8008015）：{', '.join(dropped)}")
+    return _temp_plist(plistlib.dumps(merged))
+
+
 def codesign_one(
     path: str,
     identity: str = "-",
@@ -211,8 +296,20 @@ def codesign_one(
     """
     temps: list[str] = []
     try:
-        ent_file = entitlements
-        if not ent_file:
+        ent_file = None
+        if entitlements:
+            # 合并：以原签名里的 entitlements 为基线，叠加用户自定义键（如
+            # disable-library-validation），避免整包替换丢权限。
+            dumped = _dump_entitlements(path)
+            base = {}
+            if dumped:
+                try:
+                    base = plistlib.loads(dumped) or {}
+                except Exception:
+                    base = {}
+            ent_file = _merge_entitlements(entitlements, base)
+            temps.append(ent_file)
+        else:
             dumped = _dump_entitlements(path)
             if dumped:
                 ent_file = _temp_plist(dumped)
@@ -272,6 +369,22 @@ def codesign_payload(
         log(f"  已签名 {os.path.relpath(path, payload_dir)}")
 
 
+def _ipa_bundle_id(in_ipa: str) -> str | None:
+    """从 IPA 里读出主 App 当前的 CFBundleIdentifier（用于把 embedded
+    application-identifier 对齐到它，从而保留原 bundleId、不强制改写 Info.plist）。"""
+    try:
+        with zipfile.ZipFile(in_ipa) as z:
+            for name in z.namelist():
+                if re.match(r"Payload/[^/]+\\.app/Info\\.plist$", name):
+                    try:
+                        return plistlib.loads(z.read(name)).get("CFBundleIdentifier")
+                    except Exception:
+                        return None
+    except Exception:
+        pass
+    return None
+
+
 def zsign_ipa(
     in_ipa: str,
     out_ipa: str,
@@ -295,13 +408,70 @@ def zsign_ipa(
         cmd += ["-p", p12_password]
     if provision:
         cmd += ["-m", provision]
+
+    # 从描述文件解析基线（一次性），合并 entitlements 用到
+    base = _provision_entitlements(provision) if provision else {}
+
+    ent_file = None
+    tmp = None
     if entitlements:
-        cmd += ["-e", entitlements]
+        # 合并而非替换：以描述文件允许的 entitlements 为基线，叠加用户自定义键。
+        # dev_profile：描述文件 Entitlements 里 get-task-allow=true 即视为开发型，
+        # 只有开发型才允许 disable-library-validation / com.apple.security.cs.*。
+        if not base or "application-identifier" not in base:
+            # 拿不到描述文件的应用标识 -> 绝不能硬塞一份缺 application-identifier 的
+            # entitlements（否则 iOS 报 0xe8008015「找不到有效描述文件」）。退回让 zsign
+            # 按描述文件自动推导（用户已验证这条路径能装），只损失 disable-library-validation
+            # 等额外键（包内注入本就不需要）。
+            log("[签名] 未能从描述文件解析出 application-identifier，已改用 zsign 按描述文件"
+                "自动生成 entitlements（跳过 --entitlements），以保证可安装。")
+        else:
+            # 推导「最终生效的 Bundle ID」：用户显式给了 --bundle-id 就用它，否则沿用 IPA
+            # 里 Info.plist 的 CFBundleIdentifier（保持原 bundleId，装不同 App 互不覆盖）。
+            # 然后把 embedded 的 application-identifier / keychain 组对齐成 TeamID.该BundleID，
+            # 这样「描述文件允许范围」和「Info.plist 的 bundleId」一致，不会 0xe8008015。
+            # 说明：你用指定 App 的描述文件也能装不同 bundleId，靠的是设备端绕过
+            # 「描述文件 vs embedded」的校验（越狱+AppSync 之类），工具这边只需保证
+            # Info.plist 与 embedded entitlements 自洽即可。通配符描述文件
+            # （application-identifier 形如 TEAMID.*）保持通配，不拼成 TEAMID.*.xxx。
+            eff_bid = bundle_id or _ipa_bundle_id(in_ipa)
+            if eff_bid:
+                app_id = base["application-identifier"]
+                if app_id.endswith(".*"):
+                    base["application-identifier"] = app_id
+                else:
+                    team = app_id.split(".", 1)[0]
+                    base["application-identifier"] = f"{team}.{eff_bid}"
+                    if "keychain-access-groups" in base:
+                        # 只重映射 Team 作用域的组（team.*），保留 com.apple.token
+                        # 这类跨 App 共享组，避免误删导致 Keychain 共享失效。
+                        new_groups = []
+                        for g in base["keychain-access-groups"]:
+                            if g == f"{team}.*" or g.startswith(f"{team}."):
+                                new_groups.append(f"{team}.{eff_bid}")
+                            else:
+                                new_groups.append(g)
+                        base["keychain-access-groups"] = new_groups
+            log(f"[签名] embedded application-identifier = {base.get('application-identifier')}"
+                f"（开发型={bool(base.get('get-task-allow'))}）；按此合并 entitlements，"
+                f"保留原 bundleId={eff_bid or '（未知）'}。")
+            is_dev = bool(base.get("get-task-allow"))
+            tmp = _merge_entitlements(entitlements, base, dev_profile=is_dev, log=log)
+            ent_file = tmp
+    if ent_file:
+        cmd += ["-e", ent_file]
     if bundle_id:
         cmd += ["-b", bundle_id]
     cmd += ["-z", "9", "-o", out_ipa, in_ipa]
 
-    r = subprocess.run(cmd, capture_output=True, check=False)
+    try:
+        r = subprocess.run(cmd, capture_output=True, check=False)
+    finally:
+        if tmp and os.path.isfile(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
     if r.returncode != 0:
         raise SignError(
             "zsign 失败：\n" + (r.stderr.decode("utf-8", "replace").strip() or r.stdout.decode("utf-8", "replace").strip())
@@ -373,10 +543,25 @@ def zsign_one(
             cmd += ["-p", p12_password]
         if provision:
             cmd += ["-m", provision]
+        ent_file = None
+        tmp = None
         if entitlements:
-            cmd += ["-e", entitlements]
+            # 与 zsign_ipa 一致：以描述文件允许的 entitlements 为基线合并，避免整包替换。
+            # dylib 本身不绑描述文件、替换也无害，但统一行为更稳。
+            base = _provision_entitlements(provision) if provision else {}
+            tmp = _merge_entitlements(entitlements, base or {})
+            ent_file = tmp
+        if ent_file:
+            cmd += ["-e", ent_file]
         cmd += ["-z", "9", app_dir]
-        r = subprocess.run(cmd, capture_output=True, check=False)
+        try:
+            r = subprocess.run(cmd, capture_output=True, check=False)
+        finally:
+            if tmp and os.path.isfile(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
         if r.returncode != 0:
             raise SignError(
                 "zsign 失败：\n"
@@ -386,9 +571,55 @@ def zsign_one(
         if not os.path.isfile(signed) or os.path.getsize(signed) == 0:
             raise SignError("zsign 未生成签名后的 dylib（请检查证书 / 描述文件是否匹配）")
         shutil.move(signed, out_path)
+        # zsign 把 CMS 写到 0x10000 槽、非标准；纠正到 0x10001，否则从 Documents 独立
+        # dlopen 时 dyld 报 code signature invalid。
+        if _fix_codesignature_cms_slot(out_path):
+            log("  已把 CMS 签名槽纠正到 0x10001（标准 CSSLOT_SIGNATURE）")
     finally:
         shutil.rmtree(work, ignore_errors=True)
     log(f"  zsign 完成 -> {out_path}")
+
+
+def _fix_codesignature_cms_slot(path: str) -> bool:
+    """zsign 会把 CMS 证书签名写到 superblob 的 0x10000 槽；但 Apple 规定该槽是
+    “备用 CodeDirectory”(CSSLOT_ALTERNATE_CODEDIRECTORIES)，真正的签名必须放在
+    0x10001(CSSLOT_SIGNATURE)。包内 dylib 由 App 的密封 CodeDirectory 担保、不受影响；
+    但从 App 沙盒 Documents 独立 dlopen 的 dylib 要单独验自己的签名，dyld 在 0x10001
+    找不到合法 CMS、却在 0x10000 撞到 CSMAGIC_BLOBWRAPPER(0xfade0b01)当 CodeDirectory
+    解析 -> 报 code signature invalid。
+
+    这里把 CMS blob 的槽位类型从 0x10000 改成 0x10001。仅改写 4 字节 type 字段、
+    不动 blob 大小与内容；而 CodeDirectory 哈希只覆盖代码段、不覆盖签名区，因此
+    修改签名槽位本身不会破坏签名有效性。返回是否做了修改。
+    """
+    try:
+        d = bytearray(open(path, "rb").read())
+    except OSError:
+        return False
+    if len(d) < 32 or d[:4] != b"\xcf\xfa\xed\xfe":
+        return False
+    _, ncmds, _, _ = struct.unpack("<4I", d[16:32])
+    off = 32
+    for _ in range(ncmds):
+        cmd, cmdsize = struct.unpack("<II", d[off:off+8])
+        if cmd == 0x1d:  # LC_CODE_SIGNATURE
+            so, ss = struct.unpack("<II", d[off+8:off+16])
+            cnt = struct.unpack(">I", d[so+8:so+12])[0]
+            changed = False
+            for j in range(cnt):
+                ent = so + 12 + j * 8
+                t, bo = struct.unpack(">II", d[ent:ent+8])
+                magic = struct.unpack(">I", d[so+bo:so+bo+4])[0]
+                # BLOBWRAPPER(CMS/PKCS7) 被放在了非标准槽 -> 纠正为 CSSLOT_SIGNATURE
+                if magic == 0xfade0b01 and t != 0x10001:
+                    d[ent:ent+4] = struct.pack(">I", 0x10001)
+                    changed = True
+            if changed:
+                with open(path, "wb") as f:
+                    f.write(d)
+                return True
+        off += cmdsize
+    return False
 
 
 def embed_provision(app_dir: str, provision: str) -> str:
