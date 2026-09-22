@@ -311,6 +311,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="打开图形界面（tkinter），功能与本命令行一致",
         description="启动图形界面；界面只是把参数拼成命令行再调用本工具，行为完全一致",
     )
+
+    pe = sub.add_parser(
+        "export",
+        help="把 GitHub 仓库源码下载 / 导出到本地目录",
+        description=(
+            "把指定 GitHub 仓库的源码打包下载并解压到本地目录（等价于 git archive 下载，不含 .git 历史）。\n"
+            "repo 支持 https://github.com/owner/repo 或 owner/repo；branch 可为分支 / 标签 / 提交。"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    pe.add_argument("repo", help="仓库地址：https://github.com/owner/repo 或 owner/repo")
+    pe.add_argument("-b", "--branch", default="main", help="分支 / 标签 / 提交（默认 main）")
+    pe.add_argument("-o", "--out", required=True, help="导出到的本地目录")
+    pe.add_argument("--token", default="", help="私有仓库的 GitHub Token（也可走环境变量 GITHUB_TOKEN）")
     return p
 
 
@@ -1091,6 +1105,14 @@ def cmd_inject(args) -> int:
         _cleanup_workdir(workdir, started)
 
 
+def cmd_export(args) -> int:
+    from . import cloud_build
+    token = args.token or os.environ.get("GITHUB_TOKEN", "")
+    cloud_build.export_repo(args.repo, args.branch, args.out, token=token, log=print)
+    print(f"已导出 {args.repo}@{args.branch} 到 {args.out}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -1112,4 +1134,6 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_signdylib(args)
     if args.cmd == "sign":
         return cmd_sign(args)
+    if args.cmd == "export":
+        return cmd_export(args)
     return cmd_modify(args)
