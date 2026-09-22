@@ -240,7 +240,8 @@ class IpatoolGui:
         self.root.rowconfigure(2, weight=1)
 
         self.q: "queue.Queue[tuple[str, object]]" = queue.Queue()
-        self.busy = False
+        self._running_tasks: set[str] = set()   # 正在跑的任务（支持签名 / 安装并发）
+        self.install_button = None               # 安装到设备按钮，运行时单独禁用
         self.custom_dylibs: list[str] = []
         self.action_buttons: list[ttk.Button] = []
 
@@ -412,6 +413,12 @@ class IpatoolGui:
         self.v_sign_mode = tk.StringVar(value="ad-hoc(付费账号)")
         self.v_apple_team_id = tk.StringVar()
         self.v_workflow_file = tk.StringVar(value="build-tweak.yml")
+
+        # —— GitHub 仓库导出（下载源码到本地）——
+        self.v_export_repo = tk.StringVar()
+        self.v_export_branch = tk.StringVar(value="main")
+        self.v_export_out = tk.StringVar()
+        self.v_export_token = tk.StringVar()
         self.v_dylib_path = tk.StringVar()
         self.v_ipa_path = tk.StringVar()
         # 页面内部状态（下拉选项 / 最近运行等）
@@ -537,12 +544,14 @@ class IpatoolGui:
         self.github_page = self._build_github_tab()
         self.codemagic_page = self._build_codemagic_tab()
         self.compile_page = self._build_compile_tab()
+        self.export_page = self._build_export_tab()
 
         self._add_tab("pack", "  改 ID · 注入 · 签名  ", self.pack_page)
         self._add_tab("info", "  IPA信息  ", self.info_page)
         self._add_tab("github", "  GitHub 导入  ", self.github_page)
         self._add_tab("codemagic", "  Codemagic 构建  ", self.codemagic_page)
         self._add_tab("compile", "  编译打包  ", self.compile_page)
+        self._add_tab("export", "  GitHub 导出  ", self.export_page)
 
         # 页签栏底下的分隔线，铺满整行
         sep = tk.Frame(self.tabbar, bg=BORDER, height=1)
@@ -869,8 +878,9 @@ class IpatoolGui:
 
         acts = ttk.Frame(box)
         acts.grid(row=2, column=1, columnspan=3, sticky="w", pady=(6, 0))
-        ttk.Button(acts, text="安装到设备", style="Accent.TButton",
-                   command=self._install_to_device).pack(side="left")
+        self.install_button = ttk.Button(acts, text="安装到设备", style="Accent.TButton",
+                                         command=self._install_to_device)
+        self.install_button.pack(side="left")
         ttk.Button(acts, text="打开产物文件夹", command=self._reveal_output).pack(
             side="left", padx=(6, 0))
         ttk.Button(acts, text="复制路径", command=self._copy_output_path).pack(
@@ -1318,6 +1328,11 @@ class IpatoolGui:
         if path:
             var.set(path)
 
+    def _pick_dir(self, var: tk.StringVar) -> None:
+        path = filedialog.askdirectory(title="选择目录")
+        if path:
+            var.set(path)
+
     def _add_dylib(self) -> None:
         paths = filedialog.askopenfilenames(title="选择要注入的 dylib", filetypes=[("动态库", "*.dylib"), ("所有文件", "*.*")])
         for path in paths or ():
@@ -1382,19 +1397,30 @@ class IpatoolGui:
             self._append(traceback.format_exc(), "err")
         self.root.after(80, self._poll)
 
+    _SIGN_GROUP = frozenset({"sign", "modify", "inject", "inject-list"})
+
     def _start(self, argv: list[str], task: str, quiet: bool = False) -> None:
         """quiet=True 用于自动刷新：不弹「请稍候」、也不把命令行回显到日志里。"""
-        if self.busy:
+        if task in self._running_tasks:
             if not quiet:
-                messagebox.showinfo("请稍候", "已有任务在运行，请等它结束。")
+                messagebox.showinfo("请稍候", f"「{task}」任务正在进行，请等它结束。")
             return
-        self.busy = True
-        for btn in self.action_buttons:
-            btn.configure(state="disabled")
+        self._running_tasks.add(task)
+        self._apply_busy_state()
         self._set_status("运行中…", "run")
         if not quiet:
             self._append(f"\n$ {_format_argv(argv)}\n")
         threading.Thread(target=self._work, args=(argv, task), daemon=True).start()
+
+    def _apply_busy_state(self) -> None:
+        """按正在跑的任务只禁用对应按钮：安装只冻安装按钮，签名类只冻开始执行。
+        两者可并发——安装跑着时点「开始执行」照样能签。"""
+        if self.install_button is not None:
+            self.install_button.configure(
+                state="disabled" if "install" in self._running_tasks else "normal")
+        sign_running = bool(self._running_tasks & self._SIGN_GROUP)
+        for btn in self.action_buttons:
+            btn.configure(state="disabled" if sign_running else "normal")
 
     def _work(self, argv: list[str], task: str) -> None:
         code, text = 0, ""
@@ -1421,15 +1447,17 @@ class IpatoolGui:
         self.q.put(("done", (task, code)))
 
     def _finish(self, task: str, code: int) -> None:
-        self.busy = False
-        for btn in self.action_buttons:
-            btn.configure(state="normal")
+        self._running_tasks.discard(task)
+        self._apply_busy_state()
         if task in ("inject", "modify", "sign", "install"):
             self._refresh_devices_silent()   # 跑完顺手静默刷新（可能刚插上手机）
         if code == 0:
             self._set_status("完成")
             if task == "install":
                 messagebox.showinfo("完成", "安装完成。")
+                return
+            if task == "export":
+                messagebox.showinfo("完成", "源码已导出到本地（详见日志）。")
                 return
             if task in ("inject", "modify", "sign"):
                 # 产物刚生成：把路径自动填进「安装到设备」的「安装包」栏，
@@ -1621,7 +1649,7 @@ class IpatoolGui:
 
     def _auto_refresh_devices(self) -> None:
         """空闲时定时静默刷新：插上 / 拔掉手机都能自动反映，不用手点「刷新设备」。"""
-        if not self.busy:
+        if not self._running_tasks:
             self._refresh_devices_silent()
         self.root.after(DEVICE_POLL_MS, self._auto_refresh_devices)
 
@@ -2625,6 +2653,52 @@ class IpatoolGui:
             win.destroy()
 
         ttk.Button(win, text="下载", command=choose).pack(pady=(0, 8))
+
+    # ---- GitHub 仓库导出 ------------------------------------------------ #
+    def _build_export_tab(self) -> ttk.Frame:
+        # 注意：自定义 tab 由 _select_tab 把「滚动外层 outer」grid 进 page_area；
+        # 这里必须返回 outer（和 info / github 页一致），否则整页空白。
+        outer, page = self._make_scroll(self.page_area)
+        page.columnconfigure(0, weight=1)
+        box = self._group(page, "导出 GitHub 仓库源码到本地", 0)
+        self._entry(box, 0, "仓库地址", self.v_export_repo,
+                    "https://github.com/owner/repo 或 owner/repo")
+        self._entry(box, 1, "分支 / 标签 / 提交", self.v_export_branch, "留空默认 main")
+
+        ttk.Label(box, text="导出到").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(box, textvariable=self.v_export_out).grid(row=2, column=1, sticky="ew", pady=4)
+        ttk.Button(box, text="浏览…", width=8,
+                   command=lambda: self._pick_dir(self.v_export_out)).grid(
+            row=2, column=2, sticky="w", padx=(8, 0), pady=4)
+
+        ttk.Label(box, text="Token（私有仓库）").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(box, textvariable=self.v_export_token, show="*").grid(
+            row=3, column=1, sticky="ew", pady=4)
+
+        ttk.Button(box, text="导出到本地", style="Accent.TButton",
+                   command=self._export_repo_run).grid(row=4, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(
+            box, style="Muted.TLabel", justify="left", wraplength=560,
+            text="把指定仓库的源码打包下载并解压到本地目录（等价于 git archive 下载，不含 .git 历史）。"
+                 "默认复用「GitHub 导入」页填的 Token。",
+        ).grid(row=4, column=1, columnspan=3, sticky="w", pady=(10, 0))
+        return outer
+
+    def _export_repo_run(self) -> None:
+        repo = self.v_export_repo.get().strip()
+        if not repo:
+            messagebox.showwarning("缺少仓库地址", "请先填写 GitHub 仓库地址。")
+            return
+        out = self.v_export_out.get().strip()
+        if not out:
+            messagebox.showwarning("缺少导出目录", "请先选择导出到的本地目录。")
+            return
+        branch = self.v_export_branch.get().strip() or "main"
+        token = self.v_export_token.get().strip() or self.v_gh_token.get().strip()
+        argv = ["export", repo, "-b", branch, "-o", out]
+        if token:
+            argv += ["--token", token]
+        self._start(argv, "export")
 
 def main(argv: list[str] | None = None) -> int:
     _enable_dpi_awareness()
