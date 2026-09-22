@@ -300,6 +300,13 @@ class IpatoolGui:
                   background=[("active", HOVER), ("pressed", HOVER), ("disabled", "#161d27")],
                   foreground=[("disabled", "#5b6675")],
                   bordercolor=[("focus", ACCENT), ("active", ACCENT)])
+        # 底部日志栏的折叠 / 清空按钮：紧凑样式，少占地方
+        style.configure("Mini.TButton", background=CARD_ALT, foreground=TEXT, bordercolor=BORDER,
+                        padding=(6, 2), relief="flat", focuscolor=ACCENT, font=(FONT, 9))
+        style.map("Mini.TButton",
+                  background=[("active", HOVER), ("pressed", HOVER), ("disabled", "#161d27")],
+                  foreground=[("disabled", "#5b6675")],
+                  bordercolor=[("focus", ACCENT), ("active", ACCENT)])
         style.configure("Accent.TButton", background=ACCENT, foreground="#04212a",
                         bordercolor=ACCENT, padding=(20, 8), font=(FONT, 10, "bold"))
         style.map("Accent.TButton",
@@ -352,7 +359,7 @@ class IpatoolGui:
         self.v_bundle_id = tk.StringVar()
         self.v_name = tk.StringVar()
         self.v_bundle_name = tk.StringVar()
-        self.v_no_localized = tk.BooleanVar(value=False)
+
 
         # 签名
         self.v_sign = tk.StringVar(value="auto")
@@ -360,14 +367,9 @@ class IpatoolGui:
         self.v_p12 = tk.StringVar()
         self.v_p12_password = tk.StringVar()
         self.v_provision = tk.StringVar()
-        self.v_entitlements = tk.StringVar()
+
         self.v_zip_level = tk.StringVar(value="auto")
         self.v_remember = tk.BooleanVar(value=True)
-
-        # 签名 dylib（独立页签用）
-        self.v_dylib_sign = tk.StringVar()      # 要签名的 .dylib
-        self.v_dylib_sign_out = tk.StringVar()  # 签名后输出（留空=就地签名）
-        self.v_dylib_sign_backend = tk.StringVar(value="auto")  # auto/codesign/zsign
 
         # 证书列表「选择」用（像爱思那样：存下来 → 下拉里选一个，不用每次填路径密码）
         self.v_cert = tk.StringVar()            # 「使用证书」下拉里显示的文本
@@ -436,7 +438,7 @@ class IpatoolGui:
         self._gh_save_job: str | None = None
         self._restore_settings()
         for var in (self.v_sign, self.v_identity, self.v_p12, self.v_p12_password,
-                    self.v_provision, self.v_entitlements,
+                    self.v_provision,
                     self.v_zip_level, self.v_remember):
             var.trace_add("write", self._schedule_save)
         # 「安装包 / 输出 / 输入 / 就地覆盖」任一变化，都把那行摘要刷新一下
@@ -522,7 +524,7 @@ class IpatoolGui:
         self.tabbar.grid(row=1, column=0, sticky="ew", padx=12)
 
         self.page_area = tk.Frame(self.root, bg=BG)
-        self.page_area.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        self.page_area.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 6))
         self.page_area.columnconfigure(0, weight=1)
         self.page_area.rowconfigure(0, weight=1)
 
@@ -535,14 +537,12 @@ class IpatoolGui:
         self.github_page = self._build_github_tab()
         self.codemagic_page = self._build_codemagic_tab()
         self.compile_page = self._build_compile_tab()
-        self.signdylib_page = self._build_signdylib_tab()
 
         self._add_tab("pack", "  改 ID · 注入 · 签名  ", self.pack_page)
-        self._add_tab("info", "  信息  ", self.info_page)
+        self._add_tab("info", "  IPA信息  ", self.info_page)
         self._add_tab("github", "  GitHub 导入  ", self.github_page)
         self._add_tab("codemagic", "  Codemagic 构建  ", self.codemagic_page)
         self._add_tab("compile", "  编译打包  ", self.compile_page)
-        self._add_tab("signdylib", "  签名 dylib  ", self.signdylib_page)
 
         # 页签栏底下的分隔线，铺满整行
         sep = tk.Frame(self.tabbar, bg=BORDER, height=1)
@@ -550,6 +550,10 @@ class IpatoolGui:
 
         # 全局滚轮：悬浮在输入框等单行控件上 → 整页滚动；多行文本/列表/树自己滚
         self.root.bind_all("<MouseWheel>", self._on_page_wheel)
+        # Combobox 在 Windows 上滚轮会直接改选项值（还会误触发保存），改成「滚页面」并吞掉
+        self.root.bind_class("TCombobox", "<MouseWheel>", self._on_combo_wheel)
+        self.root.bind_class("TCombobox", "<Button-4>", self._on_combo_wheel)
+        self.root.bind_class("TCombobox", "<Button-5>", self._on_combo_wheel)
 
         self._select_tab("pack")
 
@@ -584,24 +588,15 @@ class IpatoolGui:
     # ---- 改 ID · 注入 · 签名（合并页） -------------------------------- #
     def _build_pack_tab(self) -> None:
         page = self._scroll_page()
-        self._build_pack_identity(page, 0)
-        self._build_pack_dylib(page, 1)
-        self._build_pack_sign(page, 2)
-        self._build_pack_install(page, 3)
-        self._build_pack_keep(page, 4)
-        self._build_pack_action(page, 5)
-
-    def _build_pack_action(self, page, row: int) -> None:
-        box = self._group(page, "操作", row)
-        b = ttk.Button(box, text="开始执行", style="Accent.TButton",
-                       command=lambda: self._run_current(dry_run=False))
-        b.grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
-        self.action_buttons.append(b)
-        ttk.Label(
-            box, style="Muted.TLabel", justify="left", wraplength=520,
-            text="按当前页填写内容自动执行：填了 dylib 就注入+签名，填了 ID/名称就改掉，"
-                 "都没填就只重新打包+签名。",
-        ).grid(row=0, column=1, sticky="w", pady=4)
+        # 改 ID / 名称 与 注入 dylib 左右并排放在同一行
+        top = ttk.Frame(page)
+        top.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        top.columnconfigure(0, weight=1)
+        top.columnconfigure(1, weight=1)
+        self._build_pack_identity(top, 0, column=0, sticky="nsew")
+        self._build_pack_dylib(top, 0, column=1, sticky="nsew")
+        self._build_pack_sign(page, 1)
+        self._build_pack_install(page, 2)
 
     # ---- 信息 --------------------------------------------------------- #
     def _build_info_tab(self) -> None:
@@ -664,8 +659,29 @@ class IpatoolGui:
         inner.columnconfigure(0, weight=1)
         window = canvas.create_window((0, 0), window=inner, anchor="nw")
 
-        inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window, width=e.width))
+        # 重算滚动区：内容/窗口尺寸一变就更新。
+        # 关键：滚动区下界钳到可视区——内容比屏幕矮时 scrollregion 正好等于可视区，
+        # 于是「不满一屏」时上下都滚不动；内容超高时保持内容高度，正常可滚。
+        # bbox 可能为 None（还没布局好），先判空再设，避免把 scrollregion 写坏。
+        def _sync_region(_e=None):
+            bbox = canvas.bbox("all")
+            if not bbox:
+                return
+            x0, y0, x1, y1 = bbox
+            cw, ch = canvas.winfo_width(), canvas.winfo_height()
+            if cw:
+                x1 = max(x1, cw)
+            if ch:
+                y1 = max(y1, ch)
+            canvas.configure(scrollregion=(x0, y0, x1, y1))
+
+        inner.bind("<Configure>", _sync_region)
+        canvas.bind("<Configure>",
+                    lambda e: (canvas.itemconfigure(window, width=e.width),
+                               _sync_region()))
+        # 切到该页（显示）时再算一次：隐藏页的尺寸是 0，inner 不一定重触发，
+        # 否则 scrollregion 停在旧值——看起来没满屏却滚不动 / 底部被裁。
+        outer.bind("<Map>", lambda _e: _sync_region())
         return outer, inner
 
     def _on_page_wheel(self, event):
@@ -687,6 +703,20 @@ class IpatoolGui:
                 w.yview_scroll(step or 1, "units")
             return "break"
         return None
+
+    def _on_combo_wheel(self, event):
+        """Combobox 滚轮：改为整页滚动并吞掉事件，避免 Windows 上滚轮误改选项值
+        （误改 v_sign 等还会触发「已保存证书设置」刷屏）。下拉打开时目标是 Listbox，
+        不会走到这里，下拉内滚动不受影响。"""
+        cv = self._find_page_canvas(event.widget)
+        if cv is not None:
+            delta = getattr(event, "delta", 0)
+            if event.num in (4, 5):          # Linux 触控板上下
+                step = -1 if event.num == 4 else 1
+            else:
+                step = int(-delta / 120) if abs(delta) >= 120 else (-1 if delta > 0 else 1)
+            cv.yview_scroll(step or 1, "units")
+        return "break"
 
     @staticmethod
     def _can_self_scroll(w) -> bool:
@@ -717,16 +747,16 @@ class IpatoolGui:
         return inner
 
     # ---- 改 ID / 名称 -------------------------------------------------- #
-    def _build_pack_identity(self, page, row: int) -> None:
-        box = self._group(page, "改 ID / 名称（留空不改）", row)
-        self._entry(box, 0, "Bundle Identifier", self.v_bundle_id, "如 com.company.newapp")
-        self._entry(box, 1, "显示名称", self.v_name, "桌面图标下的名字")
-        self._check(box, "不改本地化名称（--no-localized）", self.v_no_localized).grid(
-            row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
+    def _build_pack_identity(self, parent, row: int, column: int = 0,
+                              sticky: str = "new") -> None:
+        box = self._group(parent, "改 ID / 名称（留空不改）", row, column, sticky)
+        self._entry(box, 0, "Bundle Identifier", self.v_bundle_id)
+        self._entry(box, 1, "显示名称", self.v_name)
 
     # ---- 注入 dylib ---------------------------------------------------- #
-    def _build_pack_dylib(self, page, row: int) -> None:
-        box = self._group(page, "注入 dylib", row)
+    def _build_pack_dylib(self, parent, row: int, column: int = 0,
+                           sticky: str = "new") -> None:
+        box = self._group(parent, "注入 dylib", row, column, sticky)
         wrap = ttk.Frame(box, style="Card.TFrame")
         wrap.grid(row=0, column=0, columnspan=4, sticky="ew")
         wrap.columnconfigure(0, weight=1)
@@ -743,15 +773,20 @@ class IpatoolGui:
         self.list_dylibs.configure(yscrollcommand=self._fade_scrollbar(bar_y))
 
         btns = ttk.Frame(box, style="Card.TFrame")
-        btns.grid(row=1, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        btns.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        btns.columnconfigure(0, weight=1)
+        btns.columnconfigure(1, weight=1)
         for index, (label, command) in enumerate((
             ("添加 dylib…", self._add_dylib),
             ("移除所选", self._remove_dylib),
             ("清空", self._clear_dylib),
             ("核对产物", self._list_injected),
         )):
-            ttk.Button(btns, text=label, command=command).pack(
-                side="left", padx=(0 if index == 0 else 8, 0))
+            r, c = divmod(index, 2)
+            ttk.Button(btns, text=label, command=command).grid(
+                row=r, column=c, sticky="ew",
+                padx=(0, 4) if c == 0 else (4, 0),
+                pady=(0, 4) if r == 0 else 0)
 
         ttk.Label(
             box, style="Muted.TLabel", justify="left",
@@ -788,7 +823,28 @@ class IpatoolGui:
         ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(2, 3))
 
         self._entry(box, 4, "描述文件", self.v_provision, "改过 Bundle ID 需匹配", browse=lambda: self._pick_file(self.v_provision, [("描述文件", "*.mobileprovision"), ("所有文件", "*.*")]))
-        self._entry(box, 5, "entitlements", self.v_entitlements, "可选；从沙盒 dlopen 加载 dylib 建议加 disable-library-validation", browse=lambda: self._pick_file(self.v_entitlements, [("entitlements", "*.plist"), ("所有文件", "*.*")]))
+
+        # 记住证书（勾选则下次自动填好）+ 清除已保存
+        self._check(box, "记住证书 / 密码", self.v_remember).grid(
+            row=6, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Label(
+            box, style="Muted.TLabel", justify="left", wraplength=620,
+            text=f"保存在 {_gui_config_path()}",
+        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Button(
+            box, text="清除已保存的证书", command=self._clear_settings,
+        ).grid(row=7, column=3, sticky="e", padx=(10, 0))
+
+        # 开始执行（直接放在签名这一栏）：按当前页填写内容自动决定做什么
+        b = ttk.Button(box, text="执行签名+注入", style="Accent.TButton",
+                       command=lambda: self._run_current(dry_run=False))
+        b.grid(row=8, column=0, sticky="w", padx=(0, 8), pady=(12, 0))
+        self.action_buttons.append(b)
+        ttk.Label(
+            box, style="Muted.TLabel", justify="left", wraplength=520,
+            text="按当前页填写内容自动执行：填了 dylib 就注入+签名，填了 ID/名称就改掉，"
+                 "都没填就只重新打包+签名。",
+        ).grid(row=8, column=1, columnspan=3, sticky="w", pady=(12, 0))
 
     # ---- 安装到设备 ---------------------------------------------------- #
     def _build_pack_install(self, page, row: int) -> None:
@@ -813,7 +869,8 @@ class IpatoolGui:
 
         acts = ttk.Frame(box)
         acts.grid(row=2, column=1, columnspan=3, sticky="w", pady=(6, 0))
-        ttk.Button(acts, text="安装到设备", command=self._install_to_device).pack(side="left")
+        ttk.Button(acts, text="安装到设备", style="Accent.TButton",
+                   command=self._install_to_device).pack(side="left")
         ttk.Button(acts, text="打开产物文件夹", command=self._reveal_output).pack(
             side="left", padx=(6, 0))
         ttk.Button(acts, text="复制路径", command=self._copy_output_path).pack(
@@ -827,182 +884,31 @@ class IpatoolGui:
             )
         self._refresh_install_summary()
 
-    # ---- 记住设置 ------------------------------------------------------ #
-    def _build_pack_keep(self, page, row: int) -> None:
-        # 证书 / 密码存下来，下次打开自动填好
-        keep = self._group(page, "记住设置", row)
-        self._check(keep, "记住证书 / 密码，下次自动填好", self.v_remember).grid(
-            row=0, column=0, columnspan=3, sticky="w")
-        ttk.Label(
-            keep, style="Muted.TLabel", justify="left", wraplength=620,
-            text=f"明文保存在 {_gui_config_path()}；取消勾选即不再保存",
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        ttk.Button(
-            keep, text="清除已保存的证书", command=self._clear_settings,
-        ).grid(row=1, column=2, sticky="e", padx=(10, 0))
-
-    # ---- 签名 dylib（独立页，复用证书管理） --------------------------- #
-    def _build_signdylib_tab(self) -> None:
-        outer, page = self._make_scroll(self.page_area)
-        page.columnconfigure(0, weight=1)
-
-        # dylib 文件
-        card, box = self._card(page, "dylib 文件")
-        card.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        box.columnconfigure(1, weight=1)
-        ttk.Label(box, text="dylib").grid(row=0, column=0, sticky="w", padx=(0, 6))
-        ttk.Entry(box, textvariable=self.v_dylib_sign).grid(row=0, column=1, sticky="ew")
-        ttk.Button(
-            box, text="浏览…", width=8,
-            command=lambda: self._pick_file(
-                self.v_dylib_sign, [("dylib", "*.dylib"), ("所有文件", "*.*")]),
-        ).grid(row=0, column=2, padx=6)
-        ttk.Button(box, text="GitHub 下载…", width=12, command=self._signdylib_download).grid(
-            row=0, column=3, padx=6)
-
-        ttk.Label(box, text="输出").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
-        ttk.Entry(box, textvariable=self.v_dylib_sign_out).grid(row=1, column=1, sticky="ew", pady=(6, 0))
-        ttk.Button(box, text="另存为…", width=8, command=self._pick_save_dylib).grid(
-            row=1, column=2, padx=6, pady=(6, 0))
-
-        ttk.Label(
-            box, style="Muted.TLabel", justify="left", wraplength=680,
-            text="留空则就地签名（会先签到临时文件再写回，安全）；填了输出则签到新文件。"
-                 "「GitHub 下载…」会从「GitHub 导入」页配置的仓库拉取构建产物并自动填入上面的 dylib。",
-        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
-
-        # 签名：复用证书下拉 + 添加/编辑/删除
-        self._build_signdylib_sign(page, 1)
-
-        # 说明
-        note, note_box = self._card(page, "说明")
-        note.grid(row=2, column=0, sticky="ew", pady=(0, 10))
-        note_box.columnconfigure(0, weight=1)
-        ttk.Label(
-            note_box, style="Muted.TLabel", justify="left", wraplength=680,
-            text=(
-                "iOS 的 library validation 要求插件和主 App 同一个 Team ID，"
-                "所以插件要用签主 App 的那把证书签，否则 dlopen 会报 code signature invalid。\n"
-                "后端 auto：macOS 走 codesign，其他平台走项目自带的 zsign（zsign 需 --p12 证书，"
-                "建议再带 --provision 让 Team ID 一致）。\n"
-                "不选证书则为 ad-hoc，ad-hoc 没有 Team ID，未越狱设备基本加载不了。"
-            ),
-        ).grid(row=0, column=0, sticky="w")
-
-        # 操作：本页自带「开始签名」，不再依赖底部全局按钮
-        act, act_box = self._card(page, "操作")
-        act.grid(row=3, column=0, sticky="ew", pady=(0, 10))
-        act_box.columnconfigure(0, weight=1)
-        b = ttk.Button(act_box, text="开始签名", style="Accent.TButton",
-                       command=lambda: self._run_signdylib(dry_run=False))
-        b.grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
-        self.action_buttons.append(b)
-        ttk.Label(
-            act_box, style="Muted.TLabel", justify="left", wraplength=540,
-            text="按所选后端（auto/codesign/zsign）+ 证书对上面的 dylib 签名；"
-                 "输出留空则就地签名。",
-        ).grid(row=0, column=1, sticky="w", pady=4)
-        return outer
-
-    def _build_signdylib_sign(self, page, row: int) -> None:
-        box = self._group(page, "签名（选证书；不选则 ad-hoc）", row)
-        ttk.Label(box, text="后端").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=3)
-        ttk.Combobox(
-            box, textvariable=self.v_dylib_sign_backend,
-            values=["auto", "codesign", "zsign"], state="readonly", width=14,
-        ).grid(row=0, column=1, sticky="w", pady=3)
-        ttk.Label(
-            box, style="Muted.TLabel", justify="left", wraplength=420,
-            text="auto：macOS 用 codesign，其它用 zsign；zsign 需 p12 证书",
-        ).grid(row=0, column=2, sticky="w", padx=(10, 0), pady=3)
-
-        ttk.Label(box, text="使用证书").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=3)
-        self.cb_cert_dylib = ttk.Combobox(
-            box, textvariable=self.v_cert, values=[], state="readonly", width=46)
-        self.cb_cert_dylib.grid(row=1, column=1, columnspan=3, sticky="ew", pady=3)
-        self.cb_cert_dylib.bind("<<ComboboxSelected>>", self._apply_cert_choice)
-
-        certbtns = ttk.Frame(box)
-        certbtns.grid(row=2, column=1, columnspan=3, sticky="w")
-        ttk.Button(certbtns, text="添加证书…", command=self._open_cert_dialog).pack(side="left")
-        ttk.Button(certbtns, text="编辑…", command=self._edit_cert).pack(side="left", padx=(6, 0))
-        ttk.Button(certbtns, text="删除", command=self._delete_cert).pack(side="left", padx=(6, 0))
-
-        ttk.Label(
-            box, style="Muted.TLabel", justify="left", wraplength=680,
-            textvariable=self.v_cert_summary,
-        ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(2, 3))
-
-        self._entry(
-            box, 4, "描述文件", self.v_provision, "zsign 签 dylib 建议带，确保 Team ID 一致",
-            browse=lambda: self._pick_file(
-                self.v_provision, [("描述文件", "*.mobileprovision"), ("所有文件", "*.*")]))
-        self._entry(
-            box, 5, "entitlements", self.v_entitlements, "可选；留空则沿用 dylib 原签名里的权限",
-            browse=lambda: self._pick_file(
-                self.v_entitlements, [("entitlements", "*.plist"), ("所有文件", "*.*")]))
-
-        self._rebuild_cert_choices()
-
-    def _pick_save_dylib(self) -> None:
-        path = filedialog.asksaveasfilename(
-            defaultextension=".dylib",
-            filetypes=[("dylib", "*.dylib"), ("所有文件", "*.*")],
-        )
-        if path:
-            self.v_dylib_sign_out.set(path)
-
-    def _signdylib_download(self) -> None:
-        """从「GitHub 导入」页配置的仓库拉取构建产物（dylib）并自动填入上面的 dylib 框。"""
-        token = self.v_gh_token.get().strip()
-        owner, repo = self.v_owner.get().strip(), self.v_repo.get().strip()
-        branch = self.v_branch.get().strip() or "main"
-        wf = self.v_workflow_file.get().strip() or "build-tweak.yml"
-        if not (token and owner and repo):
-            messagebox.showerror("错误", "请先在「GitHub 导入」页填写 GitHub Token / 所有者 / 仓库名")
-            return
-        d = filedialog.askdirectory(title="选择 Artifacts 解压目录")
-        if not d:
-            return
-        self._clog("下载 Actions Artifacts (dylib) ...")
-
-        def work():
-            try:
-                cloud_mod.download_actions_artifact(token, owner, repo, wf, branch, d, artifact_name=None)
-                self._clog(f"已下载并解压 Artifacts 到: {d}")
-                self.root.after(0, lambda: self._signdylib_pick_dylib(d))
-            except RuntimeError as e:
-                self._clog("❌ 下载 Artifacts 失败: " + str(e))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _signdylib_pick_dylib(self, d) -> None:
-        found = [os.path.join(dp, fn) for dp, _, fns in os.walk(d)
-                 for fn in fns if fn.endswith(".dylib")]
-        if not found:
-            self._clog(f"目录 {d} 下未找到 .dylib 文件")
-            return
-        self.v_dylib_sign.set(found[0])
-        self._clog(f"已从 GitHub 下载并自动填入 dylib: {found[0]}")
-
     # ------------------------------------------------------------------ #
     # 底部：日志 + 操作
     # ------------------------------------------------------------------ #
     def _build_bottom(self) -> None:
         area = ttk.Frame(self.root)
-        area.grid(row=3, column=0, sticky="nsew", padx=12, pady=(6, 12))
+        area.grid(row=3, column=0, sticky="nsew", padx=10, pady=(2, 6))
         area.columnconfigure(0, weight=1)
         area.rowconfigure(1, weight=1)
 
+        self._bottom_area = area
         bar = ttk.Frame(area)
         bar.grid(row=0, column=0, sticky="ew")
         self.lbl_status = ttk.Label(bar, textvariable=self.v_status, style="Status.TLabel")
         self.lbl_status.pack(side="right")
-        ttk.Button(bar, text="清空日志",
-                   command=lambda: self._set_text(self.log, "")).pack(side="right", padx=(0, 14))
+        # 折叠 / 展开运行日志：点一下把整张卡片收起，省出下方空间（默认收起）
+        self._log_toggle_btn = ttk.Button(bar, text="日志 ▲", style="Mini.TButton",
+                                          command=self._toggle_log)
+        self._log_toggle_btn.pack(side="left", padx=(0, 4))
+        ttk.Button(bar, text="清空日志", style="Mini.TButton",
+                   command=lambda: self._set_text(self.log, "")).pack(side="left", padx=(4, 6))
 
         card, log_box = self._card(area, "运行日志")
-        card.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        self.log_card = card
+        # 运行日志默认收起：卡片不 grid，_toggle_log 展开时再加回
+        self._log_collapsed = True
         card.rowconfigure(1, weight=1)
         log_box.grid_configure(sticky="nsew")    # 卡片拉高了，日志就跟着长（不再空在底部）
         log_box.columnconfigure(0, weight=1, minsize=0)
@@ -1024,6 +930,24 @@ class IpatoolGui:
         zsign = signer.zsign_binary()
         if zsign:
             self._append(f"[签名] zsign  : {zsign}\n")
+
+    def _toggle_log(self) -> None:
+        """折叠 / 展开运行日志卡片。
+
+        折叠时把整张卡片 grid_remove，并把底部区域的第 1 行权重收回，
+        日志区就不占高度了（状态栏、清空/折叠按钮仍在）。展开时还原。
+        折叠期间日志仍在后台累加，只是不可见，展开后即可看到。
+        """
+        if self._log_collapsed:
+            self.log_card.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+            self._bottom_area.rowconfigure(1, weight=1)
+            self._log_toggle_btn.configure(text="收起 ▼")
+            self._log_collapsed = False
+        else:
+            self.log_card.grid_remove()
+            self._bottom_area.rowconfigure(1, weight=0)
+            self._log_toggle_btn.configure(text="日志 ▲")
+            self._log_collapsed = True
 
     # ------------------------------------------------------------------ #
     # 布局小助手
@@ -1062,11 +986,12 @@ class IpatoolGui:
         body.columnconfigure(0, minsize=88)
         return card, body
 
-    def _group(self, parent, title: str, row: int) -> ttk.Frame:
-        """页签里的一块卡片（自动占一行）。返回内容区。"""
+    def _group(self, parent, title: str, row: int, column: int = 0,
+               sticky: str = "new") -> ttk.Frame:
+        """页签里的一块卡片（自动占一行 / 某一列）。返回内容区。"""
         card, body = self._card(parent, title)
-        card.grid(row=row, column=0, sticky="new", pady=(0, 10))
-        parent.columnconfigure(0, weight=1)
+        card.grid(row=row, column=column, sticky=sticky, pady=(0, 10))
+        parent.columnconfigure(column, weight=1)
         return body
 
     # ------------------------------------------------------------------ #
@@ -1089,7 +1014,6 @@ class IpatoolGui:
         self.v_identity.set(str(data.get("identity") or ""))
         self.v_p12.set(str(data.get("p12") or ""))
         self.v_provision.set(str(data.get("provision") or ""))
-        self.v_entitlements.set(str(data.get("entitlements") or ""))
         self.v_zip_level.set(str(data.get("zip_level") or "auto"))
         self.v_remember.set(bool(data.get("remember", True)))
         if self.v_remember.get():
@@ -1133,7 +1057,6 @@ class IpatoolGui:
             "identity": self.v_identity.get(),
             "p12": self.v_p12.get(),
             "provision": self.v_provision.get(),
-            "entitlements": self.v_entitlements.get(),
             "certs": self.certs,
             "cert_choice": self._current_cert_key(),
             "zip_level": self.v_zip_level.get(),
@@ -1636,7 +1559,6 @@ class IpatoolGui:
         _add(argv, "--p12", self.v_p12.get())
         _add(argv, "--p12-password", self.v_p12_password.get())
         _add(argv, "--provision", self.v_provision.get())
-        _add(argv, "--entitlements", self.v_entitlements.get())
         if self.v_zip_level.get().strip() not in ("", "auto"):
             _add(argv, "--zip-level", self.v_zip_level.get().strip())
         _flag(argv, "--hardened-runtime", self.v_hardened.get())
@@ -1659,7 +1581,6 @@ class IpatoolGui:
         _add(argv, "-i", self.v_bundle_id.get())
         _add(argv, "-n", self.v_name.get())
         _add(argv, "--bundle-name", self.v_bundle_name.get())
-        _flag(argv, "--no-localized", self.v_no_localized.get())
         return argv + self._common_args()
 
     def _inject_argv(self) -> list[str] | None:
@@ -1732,7 +1653,7 @@ class IpatoolGui:
     def _render_devices(self, data: dict) -> None:
         devices = data.get("devices") or []
         chosen = self._selected_udid()          # 刷新前用户选的是哪台
-        self._device_texts = ["自动选择（只连一台时用它）"]
+        self._device_texts = ["自动选择"]
         self._device_keys = [""]
         for item in devices:
             udid = str(item.get("udid") or "")
@@ -1766,10 +1687,10 @@ class IpatoolGui:
     def _refresh_install_summary(self) -> None:
         """摘要行：装到哪台 + 装哪个包，点「安装到设备」之前就能看清会发生什么。"""
         udid = self._selected_udid()
-        where = f"装到 UDID …{udid[-6:]}" if udid else "设备：自动选择（只连一台时就是它）"
+        where = f"装到 UDID …{udid[-6:]}" if udid else "设备：自动选择"
         target = self._install_target()
         if not target:
-            what = "安装包：还没得选（在「IPA 文件」里选输入，或填好「输出」）"
+            what = "安装包：空（请选择安装包）"
         else:
             name = os.path.basename(target)
             if not self.v_install_ipa.get().strip():
@@ -1926,26 +1847,6 @@ class IpatoolGui:
 
     def _run_sign(self, dry_run: bool = False) -> None:
         self._start_task(self._sign_argv(), "sign", dry_run)
-
-    def _run_signdylib(self, dry_run: bool = False) -> None:
-        self._start_task(self._signdylib_argv(), "signdylib", dry_run)
-
-    def _signdylib_argv(self) -> list[str] | None:
-        src = self.v_dylib_sign.get().strip()
-        if not src:
-            messagebox.showwarning("缺少 dylib", "请先选择（或点「GitHub 下载…」）要签名的 .dylib 文件。")
-            return None
-        argv = ["signdylib", src]
-        _add(argv, "--sign", self.v_dylib_sign_backend.get())
-        _add(argv, "--identity", self.v_identity.get())
-        _add(argv, "--p12", self.v_p12.get())
-        _add(argv, "--p12-password", self.v_p12_password.get())
-        _add(argv, "--provision", self.v_provision.get())
-        _add(argv, "--entitlements", self.v_entitlements.get())
-        out = self.v_dylib_sign_out.get().strip()
-        if out:
-            _add(argv, "--output", out)
-        return argv
 
     def _start_task(self, argv: list[str] | None, task: str, dry_run: bool) -> None:
         if argv is None:
