@@ -8,6 +8,9 @@ tweak/build/
 build/
 dist/
 
+# zsign 缓存（自动重建的派生文件，非密钥）
+.zsign_cache/
+
 # 虚拟环境
 .venv/
 venv/
@@ -31,3 +34,7 @@ simrun*.txt
 
 # 从手机上导出来的日志
 *.log
+
+# 本地调试脚本（非发布内容）
+decode_prov.py
+diag_sign.py
