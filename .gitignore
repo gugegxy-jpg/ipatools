@@ -19,6 +19,9 @@ venv/
 *.cer
 *.key
 
+# 云构建配置（含 GitHub / Codemagic Token，切勿提交；代码里也已禁止上传）
+importer_config.json
+
 .DS_Store
 
 # 本地验证用临时产物
