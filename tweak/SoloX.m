@@ -9,8 +9,8 @@
 //  依赖 IPATControlShared.h 的整套「通知 + NSUserDefaults」协议（与 QNet 一致），
 //  不链接 ControlPanel 的符号，谁先加载都不影响。
 //
-#import "IPATControlShared.h"
 #import <UIKit/UIKit.h>
+#import "IPATControlShared.h"
 #import <mach/mach.h>
 #import <sys/sysctl.h>
 #import <ifaddrs.h>
