@@ -98,6 +98,7 @@
                                            userInfo:nil
                                             repeats:YES];
     [self refreshMetrics];
+    [self applyVisibility];   // 若 App 此刻已在前台（如运行中注入），直接显示并对齐
     return self;
 }
 
@@ -119,38 +120,37 @@
 
 #pragma mark - 悬浮层（顶部性能条，触摸穿透）
 
-- (void)buildWindow {
-    // 只靠 hidden 控制显隐，绝不 makeKeyAndVisible：抢成 key 窗口会让系统把
-    // 游戏窗口的旋转 transform 收回（系统只给 key 窗口管界面旋转），于是我们每帧
-    // 从游戏窗口抄到 identity，悬浮窗就停在竖屏顶部。ControlPanel 也是这个做法。
-    UIWindow *window = nil;
+- (UIWindowScene *)activeWindowScene {
     if (@available(iOS 13.0, *)) {
-        UIWindowScene *scene = nil;
         for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
             if ([s isKindOfClass:[UIWindowScene class]] &&
-                ((UIWindowScene *)s).activationState == UISceneActivationStateForegroundActive) {
-                scene = (UIWindowScene *)s;
-                break;
-            }
+                ((UIWindowScene *)s).activationState == UISceneActivationStateForegroundActive)
+                return (UIWindowScene *)s;
         }
-        if (!scene) {
-            for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
-                if ([s isKindOfClass:[UIWindowScene class]]) { scene = (UIWindowScene *)s; break; }
-            }
-        }
+    }
+    return nil;
+}
+
+- (void)buildWindow {
+    // 只靠 hidden 控制显隐，绝不 makeKeyAndVisible：抢成 key 窗口会让游戏暂停。
+    // 用「场景窗口」并挂到「前台激活」的 scene 上：launch 阶段 scene 可能还没激活，
+    // 所以先建好、隐藏，等 didBecomeActive / scene 激活后再由 applyVisibility 挂到激活
+    // scene 并显示（否则窗口会卡在竖屏 / 不显示，要切后台才转正）。
+    UIWindow *window = nil;
+    if (@available(iOS 13.0, *)) {
+        UIWindowScene *scene = [self activeWindowScene];
         if (scene && [UIWindow instancesRespondToSelector:@selector(initWithWindowScene:)]) {
             window = [[UIWindow alloc] initWithWindowScene:scene];
         }
     }
-    if (!window) {
-        window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-    }
+    if (!window) window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
     _window = window;
     // 关键：整窗不接收触摸事件 -> 全部穿透到游戏
     _window.userInteractionEnabled = NO;
     _window.windowLevel = UIWindowLevelStatusBar + 100;
     _window.backgroundColor = [UIColor clearColor];
-    _window.hidden = !_masterOn;
+    _window.hidden = YES;   // 先隐藏；等 App 真正进入前台（didBecomeActive）后由 applyVisibility 显示，
+                            // 否则 launch 阶段挂在未激活窗口上会一直不显示，要手动开关一次才出
     _window.rootViewController = [[UIViewController alloc] init];
 
     UIView *rootView = _window.rootViewController.view;
@@ -161,13 +161,13 @@
     _bar.layer.cornerRadius = 6;            // 自身小圆角，避免和屏幕圆角打架
     _bar.clipsToBounds = YES;
     [rootView addSubview:_bar];
-    // 贴着安全区布局：系统会按当前旋转把条子从刘海 / 灵动岛 / 圆角里缩进，
-    // 否则横竖屏下都会被屏幕圆角裁掉
-    UILayoutGuide *safe = rootView.safeAreaLayoutGuide;
+    // 钉在窗口自身 bounds 上（align 把窗口铺满屏幕，scene 负责把它转到正确方向）；
+    // 不用 safeAreaLayoutGuide，避免随界面方向变化时安全区计算错位。
+    // 两侧留 16pt 空白，避免被屏幕物理圆角把性能条两侧圆角裁掉；顶部留 8pt。
     [NSLayoutConstraint activateConstraints:@[
-        [_bar.topAnchor constraintEqualToAnchor:safe.topAnchor],
-        [_bar.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:6],
-        [_bar.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-6],
+        [_bar.topAnchor constraintEqualToAnchor:rootView.topAnchor constant:8],
+        [_bar.leadingAnchor constraintEqualToAnchor:rootView.leadingAnchor constant:16],
+        [_bar.trailingAnchor constraintEqualToAnchor:rootView.trailingAnchor constant:-16],
         [_bar.heightAnchor constraintEqualToConstant:22],
     ]];
 
@@ -211,12 +211,21 @@
 }
 
 - (void)align {
-    // 横屏游戏里窗口被转过，照抄主窗口的方向/坐标，保证性能条贴在屏幕顶部
-    UIWindow *app = IPATAppKeyWindowExcluding(_window);
-    IPATAlignWindowToInterface(_window, app);
+    // 场景窗口的方向由所在 scene 负责，这里只保证窗口铺满屏幕即可；
+    // 不手动设 transform —— 会被 scene 覆盖，正是之前停在竖屏的根因。
+    CGRect screen = [UIScreen mainScreen].bounds;
+    _window.frame = screen;
+    _window.transform = CGAffineTransformIdentity;
+    if (_window.rootViewController.view) _window.rootViewController.view.frame = _window.bounds;
 }
 
 - (void)applyVisibility {
+    // 把窗口挂到当前前台激活的 scene：launch 阶段可能挂到了未激活 scene，
+    // 导致一直不显示 / 卡竖屏，激活后再挂一次即可转正
+    if (@available(iOS 13.0, *)) {
+        UIWindowScene *scene = [self activeWindowScene];
+        if (scene && _window.windowScene != scene) _window.windowScene = scene;
+    }
     _window.hidden = !_masterOn;
     _cpu.hidden = !_showCPU;
     _mem.hidden = !_showMEM;
@@ -255,6 +264,11 @@
     [c addObserver:self selector:@selector(handleChange:)   name:IPATControlDidChangeNotification object:nil];
     [c addObserver:self selector:@selector(handleDiscover:) name:IPATControlDiscoverNotification object:nil];
     [c addObserver:self selector:@selector(align)          name:UIDeviceOrientationDidChangeNotification object:nil];
+    // App 进入前台 / scene 激活后再显示并对齐一次：解决「启动不显示 + 横屏不转正」
+    [c addObserver:self selector:@selector(applyVisibility) name:UIApplicationDidBecomeActiveNotification object:nil];
+    if (@available(iOS 13.0, *)) {
+        [c addObserver:self selector:@selector(applyVisibility) name:UISceneDidActivateNotification object:nil];
+    }
     [[UIDevice currentDevice] beginGeneratingDeviceOrientationNotifications];
 }
 
@@ -281,13 +295,10 @@
 #pragma mark - 指标采样
 
 - (void)tickFPS:(CADisplayLink *)link {
-    _frameCount++;
-    [self align];   // 每帧把悬浮窗对齐到游戏窗口，实时跟随屏幕旋转
+    _frameCount++;   // 仅计帧；界面方向由所在 scene 负责，无需每帧手动对齐
 }
 
 - (void)refreshMetrics {
-    [self align];
-
     // FPS：用上一秒的帧数
     _fpsValue = (double)_frameCount;
     _frameCount = 0;
@@ -389,7 +400,10 @@
     return dev.batteryLevel * 100.0f;
 }
 
-// 温度：通过 IOKit 读电源/电池 Temperature（私有属性，非越狱可用）。失败回退 --。
+// 温度：通过 IOKit 读电源/电池/PMU 的 Temperature（私有属性，非越狱可用）。
+// iOS 13+ 用 IOMainPort 取代 IOMasterPort（iOS 17+ 后 IOMasterPort 符号被移除），两个都试。
+// 多个服务名 / 键名兜底，应对不同机型与 iOS 版本；部分来源单位是 0.1℃，
+// 读数 > 150℃ 视为该单位并 ÷10。读不到回退 -1（界面显示 --）。
 - (float)sampleTemperature {
     float temp = -1;
     void *io = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY);
@@ -399,7 +413,6 @@
     typedef void *(*GetPtr)(void *, void *);
     typedef CFTypeRef (*PropPtr)(void *, CFStringRef, CFAllocatorRef, uint32_t);
     typedef kern_return_t (*RelPtr)(void *);
-    // iOS 13+ 起 IOMasterPort 被 IOMainPort 取代，iOS 17+ 后 IOMasterPort 符号被移除，
     // 先取 IOMainPort，取不到再回退 IOMasterPort；否则 iOS 27 上 dlsym 拿到 NULL，
     // 整个温度读取路径走不进去，界面一直显示 --（读不出来）
     MachPortPtr MachPort = dlsym(io, "IOMainPort");
@@ -411,15 +424,34 @@
     if (MachPort && Match && Get && Prop && Rel) {
         void *port = NULL;
         MachPort(0, &port);
-        void *svc = Get(port, Match("IOPMPowerSource"));
-        if (svc) {
-            CFTypeRef v = Prop(svc, CFSTR("Temperature"), kCFAllocatorDefault, 0);
-            if (v) {
-                if (CFGetTypeID(v) == CFNumberGetTypeID())
-                    CFNumberGetValue((CFNumberRef)v, kCFNumberFloatType, &temp);
-                CFRelease(v);
+        if (port) {
+            // 依次尝试不同温度传感器服务；iOS 27 上 IOPMPowerSource 可能被沙盒限制，
+            // 退而求其次读 PMU / RTC 的温度服务
+            const char *services[] = {"IOPMPowerSource", "IOPMUPowerSource", "AppleARMPMURTC", NULL};
+            const char *keys[] = {"Temperature", "temperature", "current-temperature", "AvgTemperature", NULL};
+            for (int s = 0; services[s]; s++) {
+                void *svc = Get(port, Match(services[s]));
+                if (!svc) continue;
+                for (int k = 0; keys[k]; k++) {
+                    CFStringRef keyRef = CFStringCreateWithCString(kCFAllocatorDefault,
+                                                                  keys[k], kCFStringEncodingUTF8);
+                    if (!keyRef) continue;
+                    CFTypeRef v = Prop(svc, keyRef, kCFAllocatorDefault, 0);
+                    if (v) {
+                        if (CFGetTypeID(v) == CFNumberGetTypeID()) {
+                            float raw = 0;
+                            CFNumberGetValue((CFNumberRef)v, kCFNumberFloatType, &raw);
+                            if (raw > 150.0f) raw /= 10.0f;   // 0.1℃ 单位修正
+                            if (raw > 0 && raw <= 150.0f) temp = raw;
+                        }
+                        CFRelease(v);
+                    }
+                    CFRelease(keyRef);
+                    if (temp > 0) break;
+                }
+                Rel(svc);
+                if (temp > 0) break;
             }
-            Rel(svc);
         }
     }
     dlclose(io);
