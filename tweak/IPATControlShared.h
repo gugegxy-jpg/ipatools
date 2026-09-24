@@ -245,36 +245,48 @@ static inline void IPATAlignWindowToInterface(UIWindow *window, UIWindow *appWin
     CGAffineTransform targetTransform = window.transform;
     BOOL resolved = NO;
 
+    // 游戏的旋转可能做在 window.transform（系统转屏），也可能只转了
+    // rootViewController.view.transform（部分引擎/游戏自己转内容，窗口本身仍是竖屏）。
+    // 两种情况都要识别成「整 90°/180°」的旋转并照抄，否则直接绑死窗口几何。
+    UIView *appRoot = appWindow ? appWindow.rootViewController.view : nil;
+    CGAffineTransform appRot = CGAffineTransformIdentity;
+    if (appWindow && !CGAffineTransformIsIdentity(appWindow.transform)) {
+        appRot = appWindow.transform;
+    } else if (appRoot && !CGAffineTransformIsIdentity(appRoot.transform)) {
+        appRot = appRoot.transform;
+    }
+    CGFloat appRotAngle = 0;
+    if (!CGAffineTransformIsIdentity(appRot)) {
+        CGFloat angle = atan2f((float)appRot.b, (float)appRot.a);
+        CGFloat quarters = roundf(angle / (float)M_PI_2);
+        if (fabs(angle - quarters * (float)M_PI_2) < 0.05f) {
+            appRotAngle = quarters * (CGFloat)M_PI_2;
+        }
+    }
+
     if (appWindow) {
         CGRect target = appWindow.bounds;
         CGFloat area = target.size.width * target.size.height;
         CGFloat screenArea = screen.size.width * screen.size.height;
-        // 面积够大就认定它是主窗口，直接绑死（小窗/带缩放的 App 窗口不适用）
+        // 面积够大就认定它是主窗口（小窗/带缩放的 App 窗口不适用）
         if (area > 0 && (!hasScreen || screenArea <= 0 || area >= screenArea * 0.6)) {
             targetBounds = target;
             targetCenter = appWindow.center;
-            targetTransform = appWindow.transform;
+            if (appRotAngle != 0) {
+                // 游戏自己转过窗口/内容：照抄角度，窗口本身的（未旋转）尺寸原样绑定
+                targetTransform = CGAffineTransformMakeRotation(appRotAngle);
+            } else {
+                targetTransform = appWindow.transform;
+            }
             resolved = YES;
         }
     }
 
     if (!resolved) {
         if (!hasScreen) return;
-        CGAffineTransform candidate = CGAffineTransformIdentity;
-        UIView *appRoot = appWindow ? appWindow.rootViewController.view : nil;
-        if (appWindow && !CGAffineTransformIsIdentity(appWindow.transform)) {
-            candidate = appWindow.transform;
-        } else if (appRoot && !CGAffineTransformIsIdentity(appRoot.transform)) {
-            candidate = appRoot.transform;
-        }
         CGAffineTransform rotation = CGAffineTransformIdentity;
-        if (!CGAffineTransformIsIdentity(candidate)) {
-            // 只跟「整 90°/180°」的旋转，而且只取角度、不带缩放
-            CGFloat angle = atan2f((float)candidate.b, (float)candidate.a);
-            CGFloat quarters = roundf(angle / (float)M_PI_2);
-            if (fabs(angle - quarters * (float)M_PI_2) < 0.05f) {
-                rotation = CGAffineTransformMakeRotation(quarters * (CGFloat)M_PI_2);
-            }
+        if (appRotAngle != 0) {
+            rotation = CGAffineTransformMakeRotation(appRotAngle);
         }
         if (!CGAffineTransformIsIdentity(rotation)) {
             // 游戏是自己转过窗口的（系统不知道）：照抄角度，尺寸用「转回来」的大小，
