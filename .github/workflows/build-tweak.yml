@@ -46,8 +46,9 @@ jobs:
         env:
           IPATOOL_MIN_IOS: ${{ inputs.min_ios || '14.0' }}
           IPATOOL_ARCHS: ${{ inputs.archs || 'arm64' }}
-          # 悬浮窗 / 文件导入导出 / 插件加载合编成一个 IPATool.dylib；弱网测试单独出 QNet.dylib
-          IPATOOL_TARGETS: IPATool QNet
+          # 悬浮窗 / 文件导入导出 / 插件加载合编成一个 IPATool.dylib；
+          # 弱网测试单独出 QNet.dylib；性能悬浮窗单独出 SoloX.dylib
+          IPATOOL_TARGETS: IPATool QNet SoloX
         run: |
           mkdir -p tweak/build
           chmod +x tweak/build.sh
@@ -88,7 +89,7 @@ jobs:
         continue-on-error: true
         run: |
           python3 -m ipatool inject demo/build/IPATDemo.ipa \
-            --files --qnet --plugins --in-place --sign none 2>&1 | tee demo-inject.log
+            --files --qnet --plugins --solox --in-place --sign none 2>&1 | tee demo-inject.log
           echo "=== 注入后核对 ===" | tee -a demo-inject.log
           python3 -m ipatool inject demo/build/IPATDemo.ipa --list 2>&1 | tee -a demo-inject.log
           python3 -m ipatool info demo/build/IPATDemo.ipa 2>&1 | tee -a demo-inject.log
