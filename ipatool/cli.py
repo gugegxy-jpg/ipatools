@@ -151,7 +151,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     pj = sub.add_parser(
         "inject",
-        help="注入 dylib（内置 --files 文件导入导出、--qnet 弱网测试、--plugins 运行时插件加载）",
+        help="注入 dylib（内置 --files 文件导入导出、--qnet 弱网测试、--plugins 运行时插件加载、--solox 性能悬浮窗）",
         description="把 dylib 放进 App 的 Frameworks/ 并写入 LC_LOAD_DYLIB；注入后必须重新签名才能安装",
     )
     pj.add_argument("input", help="IPA 文件路径，或已解包且含 Payload 的目录")
@@ -202,6 +202,15 @@ def _build_parser() -> argparse.ArgumentParser:
     panel.add_argument("--no-panel", action="store_true", help="不注入悬浮窗（只改配置、不加界面）")
     panel.add_argument("--panel-dylib", metavar="PATH", help="悬浮窗 dylib 路径，默认自动查找（macOS 上会自动编译）")
     panel.add_argument("--panel-title", metavar="TEXT", help="悬浮按钮上的文字，默认 IPAT")
+
+    solox = pj.add_argument_group(
+        "性能悬浮窗（--solox）",
+        "注入一个独立 dylib，在游戏内悬浮窗里挂「性能悬浮窗」开关；开启后屏幕顶部漂浮显示 "
+        "CPU / 内存 / 网络 / FPS / 电量 / 温度，且点击穿透到游戏。"
+        "开关在游戏内悬浮窗里控制（需同时注入悬浮窗 --panel 或任一内置功能）。",
+    )
+    solox.add_argument("--solox", action="store_true", help="注入性能悬浮窗 SoloX.dylib")
+    solox.add_argument("--solox-dylib", metavar="PATH", help="性能悬浮窗 dylib 路径，默认自动查找（macOS 上会自动编译）")
 
     files = pj.add_argument_group(
         "文件导入导出",
@@ -918,16 +927,19 @@ def cmd_inject(args) -> int:
         qnet_enabled = bool(args.qnet or qnet_tuning) and not args.no_qnet
         plugins_tuning = bool(args.plugins_dylib or args.plugins_autoload)
         plugins_enabled = bool(args.plugins or plugins_tuning) and not args.no_plugins
-        # 悬浮窗默认跟着内置功能一起注入；--no-panel 关掉它
+        solox_enabled = bool(args.solox or args.solox_dylib)
+        # 悬浮窗默认跟着内置功能一起注入；--no-panel 关掉它。
+        # SoloX 的开关在悬浮窗里，所以开 --solox 时也默认把悬浮窗一起注入（除非 --no-panel）。
         panel_tuning = bool(args.panel or args.panel_dylib or args.panel_title)
         panel_enabled = bool(
-            files_enabled or qnet_enabled or plugins_enabled or panel_tuning
+            files_enabled or qnet_enabled or plugins_enabled or panel_tuning or solox_enabled
         ) and not args.no_panel
         plist_touched = bool(
             files_enabled
             or qnet_enabled
             or plugins_enabled
             or panel_enabled
+            or solox_enabled
             or args.background_mode
             or args.allow_arbitrary_loads
         )
@@ -994,6 +1006,19 @@ def cmd_inject(args) -> int:
                 planned.append((panel_dylib, inject_mod.CONTROL_PANEL_DYLIB_NAME))
                 print(f"悬浮窗      : {panel_dylib}")
                 print("              （App 内会出现可拖动的悬浮按钮，点开即可开关上面这些功能）")
+        if solox_enabled:
+            solox_dylib = inject_mod.locate_solox_dylib(
+                explicit=args.solox_dylib,
+                log=lambda m: print(f"  {m}"),
+            )
+            planned.append((solox_dylib, inject_mod.SOLOX_DYLIB_NAME))
+            print(f"性能悬浮窗  : {solox_dylib}")
+            settings.append((inject_mod.SOLOX_INFO_KEY,
+                             inject_mod.build_solox_options(enabled=True), "性能悬浮窗"))
+            if not panel_enabled:
+                warnings.append("没有注入悬浮窗，SoloX 开关无处可放：建议去掉 --no-panel 或加 --panel，"
+                                "否则只能显示、不能在游戏内关掉")
+
         for path in args.dylib or []:
             planned.append((path, os.path.basename(path)))
 
