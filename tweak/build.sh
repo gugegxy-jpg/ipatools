@@ -3,7 +3,7 @@
 # 编译注入用的 dylib（悬浮控制面板 / 文件导入导出 / 弱网测试）。需要 macOS + Xcode 命令行工具：
 #   xcode-select --install
 #
-#   ./tweak/build.sh                               默认出 IPATool.dylib + QNet.dylib
+#   ./tweak/build.sh                               默认出 IPATool.dylib + QNet.dylib + SoloX.dylib
 #   IPATOOL_TARGETS="ControlPanel FileBridge QNet" ./tweak/build.sh   只编译指定目标（单独出包）
 #
 # 默认两个产物：
@@ -28,7 +28,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT_DIR="${IPATOOL_OUT_DIR:-$HERE/build}"
 MIN_IOS="${IPATOOL_MIN_IOS:-14.0}"
 ARCHS="${IPATOOL_ARCHS:-arm64}"
-TARGETS="${IPATOOL_TARGETS:-IPATool QNet}"
+TARGETS="${IPATOOL_TARGETS:-IPATool QNet SoloX}"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "错误：编译 iOS dylib 需要 macOS + Xcode 命令行工具（当前系统：$(uname -s)）" >&2
@@ -90,6 +90,9 @@ sources_for_target() {
   case "$1" in
     IPATool)
       printf '%s\n' "$HERE/ControlPanel.m" "$HERE/FileBridge.m" "$OUT_DIR/IPAToolIcon.m"
+      ;;
+    SoloX)
+      printf '%s\n' "$HERE/SoloX.m"
       ;;
     *)
       if [[ "$1" == "ControlPanel" ]]; then
