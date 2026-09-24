@@ -28,7 +28,45 @@
 #define IPATKeySoloXFPS     @"IPAToolPanelSoloXFPS"
 #define IPATKeySoloXBAT     @"IPAToolPanelSoloXBAT"
 #define IPATKeySoloXTEMP    @"IPAToolPanelSoloXTEMP"
+#define IPATKeySoloXExport  @"IPAToolPanelSoloXExport"    // 导出报告（动作行）
 #define IPAToolSoloXPlistKey @"IPAToolSoloX"              // Info.plist 初始配置字典
+
+// 导出 HTML 报告内嵌的图表脚本：纯原生 Canvas 绘制，无外部依赖，可离线打开看走势。
+// 仅用单引号，避免与 ObjC 字符串的双引号冲突。
+static NSString *const kSoloXChartJS =
+@"var specs=[{f:'cpu',l:'CPU 使用率',u:'%',c:'#33ff66'},"
+@"{f:'mem',l:'内存',u:'MB',c:'#4aa3ff'},"
+@"{f:'net',l:'网络吞吐',u:'B/s',c:'#ffcc33'},"
+@"{f:'fps',l:'FPS',u:'',c:'#ff66cc'},"
+@"{f:'bat',l:'电量',u:'%',c:'#66ffcc'},"
+@"{f:'temp',l:'温度',u:'℃',c:'#ff7744'}];"
+@"var host=document.getElementById('charts');"
+@"function vals(f){var a=[];for(var i=0;i<data.length;i++){var v=data[i][f];a.push(v===null||v===undefined?null:v);}return a;}"
+@"function draw(s){"
+@"var v=vals(s.f);var cv=document.createElement('canvas');"
+@"cv.style.width='100%';cv.style.height='170px';cv.style.background='#0d1117';"
+@"cv.style.borderRadius='8px';cv.style.display='block';cv.style.margin='6px 0';"
+@"var t=document.createElement('div');t.style.color=s.c;t.style.font='13px sans-serif';"
+@"t.style.margin='10px 0 2px';t.textContent=s.l+' ('+s.u+')';"
+@"host.appendChild(t);host.appendChild(cv);"
+@"var dpr=window.devicePixelRatio||1;var w=cv.clientWidth||(window.innerWidth-32);var h=cv.clientHeight;"
+@"cv.width=w*dpr;cv.height=h*dpr;var ctx=cv.getContext('2d');ctx.scale(dpr,dpr);"
+@"var valid=v.filter(function(x){return x!==null;});"
+@"if(valid.length<2){ctx.fillStyle='#888';ctx.font='12px sans-serif';ctx.fillText('数据不足',8,24);return;}"
+@"var min=Math.min.apply(null,valid),max=Math.max.apply(null,valid);"
+@"if(max-min<1e-6){max=min+1;}"
+@"var padL=42,padR=8,padT=10,padB=16;var gw=w-padL-padR,gh=h-padT-padB;"
+@"ctx.strokeStyle='#222';ctx.fillStyle='#888';ctx.font='10px sans-serif';ctx.lineWidth=1;"
+@"for(var g=0;g<=4;g++){var yy=padT+gh*g/4;ctx.beginPath();ctx.moveTo(padL,yy);ctx.lineTo(w-padR,yy);ctx.stroke();"
+@"var val=max-(max-min)*g/4;ctx.fillText(val.toFixed(max>100?0:1),2,yy+3);}"
+@"ctx.strokeStyle=s.c;ctx.lineWidth=1.5;ctx.beginPath();var started=false;"
+@"for(var i=0;i<v.length;i++){if(v[i]===null){started=false;continue;}"
+@"var x=padL+gw*i/(v.length-1);var y=padT+gh*(1-(v[i]-min)/(max-min));"
+@"if(!started){ctx.moveTo(x,y);started=true;}else ctx.lineTo(x,y);}"
+@"ctx.stroke();"
+@"var last=valid[valid.length-1];ctx.fillStyle=s.c;ctx.font='12px sans-serif';"
+@"ctx.fillText(s.l+'：'+last.toFixed(max>100?0:1)+s.u,padL,padT+12);}"
+@"specs.forEach(draw);";
 
 @interface SoloXMonitor : NSObject
 + (void)loadPlugin;
@@ -53,6 +91,10 @@
     uint64_t _lastCPU;
     CFAbsoluteTime _lastCPUTime;
     uint64_t _lastNet;
+
+    // 当次运行采样记录（每秒一条，封顶 3600 = 1 小时，超出丢弃最旧）
+    NSMutableArray<NSDictionary *> *_samples;
+    NSDateFormatter *_tsFormatter;
 }
 
 + (void)load {
@@ -172,7 +214,7 @@
     ]];
 
     UIFont *font = [UIFont monospacedDigitSystemFontOfSize:11 weight:UIFontWeightMedium];
-    UIColor *fg = [UIColor colorWithWhite:0.95 alpha:1.0];
+    UIColor *fg = [UIColor colorWithRed:0.40 green:1.0 blue:0.50 alpha:1.0];   // 绿色字体
 
     _cpu = [self makeLabel:font fg:fg];
     _mem = [self makeLabel:font fg:fg];
@@ -252,6 +294,7 @@
             @{IPATRowKey: IPATKeySoloXFPS,  IPATRowTitle: @"FPS",  IPATRowKind: IPATRowKindSwitch, IPATRowValue: @(_showFPS)},
             @{IPATRowKey: IPATKeySoloXBAT,  IPATRowTitle: @"电量", IPATRowKind: IPATRowKindSwitch, IPATRowValue: @(_showBAT)},
             @{IPATRowKey: IPATKeySoloXTEMP, IPATRowTitle: @"温度", IPATRowKind: IPATRowKindSwitch, IPATRowValue: @(_showTEMP)},
+            @{IPATRowKey: IPATKeySoloXExport, IPATRowTitle: @"导出报告", IPATRowKind: IPATRowKindAction},
         ],
     };
     [[NSNotificationCenter defaultCenter] postNotificationName:IPATControlRegisterNotification
@@ -262,6 +305,7 @@
 - (void)observe {
     NSNotificationCenter *c = [NSNotificationCenter defaultCenter];
     [c addObserver:self selector:@selector(handleChange:)   name:IPATControlDidChangeNotification object:nil];
+    [c addObserver:self selector:@selector(handleAction:)   name:IPATControlActionNotification object:nil];
     [c addObserver:self selector:@selector(handleDiscover:) name:IPATControlDiscoverNotification object:nil];
     [c addObserver:self selector:@selector(align)          name:UIDeviceOrientationDidChangeNotification object:nil];
     // App 进入前台 / scene 激活后再显示并对齐一次：解决「启动不显示 + 横屏不转正」
@@ -292,6 +336,109 @@
     [self applyVisibility];
 }
 
+- (void)handleAction:(NSNotification *)note {
+    if (![note.userInfo[IPATActKey] isEqualToString:IPATKeySoloXExport]) return;
+    [self exportReport];
+}
+
+#pragma mark - 报告导出
+
+- (void)exportReport {
+    if (_samples.count == 0) {
+        [self alertWithTitle:@"暂无数据"
+                     message:@"性能窗开启并运行一段时间后才有采样可导出。"];
+        return;
+    }
+    // 拼内嵌数据：var data=[{t,cpu,mem,net,fps,bat,temp},...]（读不到的以 null 表示断点）
+    NSMutableString *dataJS = [NSMutableString stringWithString:@"var data=["];
+    for (NSDictionary *s in _samples) {
+        double cpu  = [s[@"cpu"]  doubleValue];
+        double mem  = [s[@"mem"]  doubleValue];
+        uint64_t net = [s[@"net"] unsignedLongLongValue];
+        double fps  = [s[@"fps"]  doubleValue];
+        double bat  = [s[@"bat"]  doubleValue];
+        double temp = [s[@"temp"] doubleValue];
+        [dataJS appendFormat:@"{t:\"%@\",cpu:%@,mem:%@,net:%llu,fps:%@,bat:%@,temp:%@},",
+            s[@"t"],
+            cpu  >= 0 ? @(cpu)  : @"null",
+            mem  >= 0 ? @(mem)  : @"null",
+            net,
+            @(fps),
+            bat  >= 0 ? @(bat)  : @"null",
+            temp >= 0 ? @(temp) : @"null"];
+    }
+    [dataJS appendString:@"];"];
+
+    NSDate *now = [NSDate date];
+    NSDateFormatter *stamp = [[NSDateFormatter alloc] init];
+    stamp.dateFormat = @"yyyyMMdd_HHmmss";
+    stamp.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    NSDateFormatter *disp = [[NSDateFormatter alloc] init];
+    disp.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+    disp.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    NSString *stampStr = [stamp stringFromDate:now];
+    NSString *dispStr  = [disp stringFromDate:now];
+
+    NSString *head = [NSString stringWithFormat:
+        @"<!doctype html><html lang=\"zh\"><head><meta charset=\"utf-8\">"
+        @"<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        @"<title>SoloX 性能报告</title><style>"
+        @"body{background:#0d1117;color:#e6edf3;font-family:-apple-system,Segoe UI,sans-serif;margin:0;padding:16px}"
+        @"h1{font-size:18px;margin:0 0 4px}#charts{margin-top:8px}"
+        @"</style></head><body><h1>SoloX 性能报告</h1>"
+        @"<p style=\"color:#8b949e;font-size:13px\">样本数：%lu · 生成时间：%@</p>"
+        @"<div id=\"charts\"></div>",
+        (unsigned long)_samples.count, dispStr];
+
+    NSMutableString *html = [NSMutableString string];
+    [html appendString:head];
+    [html appendString:@"<script>"];
+    [html appendString:dataJS];
+    [html appendString:kSoloXChartJS];
+    [html appendString:@"</script></body></html>"];
+
+    // 落盘到 App 沙盒 Documents（可用「文件」/Finder 取出；无 Documents 则退到 tmp）
+    NSArray<NSString *> *dirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                                                                   NSUserDomainMask, YES);
+    NSString *dir = dirs.firstObject ?: NSTemporaryDirectory();
+    NSString *path = [dir stringByAppendingPathComponent:
+        [NSString stringWithFormat:@"SoloX_%@.html", stampStr]];
+    [html writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+    // 弹系统分享：可存到「文件」、AirDrop、拷贝等
+    UIActivityViewController *avc =
+        [[UIActivityViewController alloc] initWithActivityItems:@[[NSURL fileURLWithPath:path]]
+                                          applicationActivities:nil];
+    [self presentViewController:avc];
+}
+
+// 找一个能 present 的 VC：优先游戏 key 窗口的 rootViewController（可交互），
+// 否则退回我们自己的窗口。分享面板是系统独立窗口，不受我们窗口 userInteractionEnabled=NO 影响。
+- (void)presentViewController:(UIViewController *)vc {
+    UIViewController *presenter = nil;
+    UIWindow *app = IPATAppKeyWindowExcluding(_window);
+    if (app && app.rootViewController) presenter = app.rootViewController;
+    if (!presenter) presenter = _window.rootViewController;
+    if (!presenter) return;
+    if ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad) {
+        vc.popoverPresentationController.sourceView = presenter.view;
+        vc.popoverPresentationController.sourceRect =
+            CGRectMake(CGRectGetMidX(presenter.view.bounds),
+                       CGRectGetMidY(presenter.view.bounds), 0, 0);
+    }
+    [presenter presentViewController:vc animated:YES completion:nil];
+}
+
+- (void)alertWithTitle:(NSString *)title message:(NSString *)message {
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:title
+                                                              message:message
+                                                       preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"好的"
+                                          style:UIAlertActionStyleDefault
+                                        handler:nil]];
+    [self presentViewController:ac];
+}
+
 #pragma mark - 指标采样
 
 - (void)tickFPS:(CADisplayLink *)link {
@@ -317,6 +464,24 @@
     if (_showBAT)  _bat.text  = [NSString stringWithFormat:@"BAT %.0f%%", bat];
     if (_showTEMP) _temp.text = [NSString stringWithFormat:@"TEMP %@℃",
                                  temp >= 0 ? [NSNumber numberWithInt:(int)(temp + 0.5)] : @"--"];
+
+    // 记录当次运行采样（每秒一条，封顶 3600 = 1 小时，超出丢弃最旧）
+    if (!_tsFormatter) {
+        _tsFormatter = [[NSDateFormatter alloc] init];
+        _tsFormatter.dateFormat = @"HH:mm:ss";
+        _tsFormatter.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    }
+    if (!_samples) _samples = [NSMutableArray array];
+    [_samples addObject:@{
+        @"t":   [_tsFormatter stringFromDate:[NSDate date]],
+        @"cpu": @(cpu),
+        @"mem": @(mem),
+        @"net": @(net),
+        @"fps": @(_fpsValue),
+        @"bat": @(bat),
+        @"temp":@(temp),
+    }];
+    if (_samples.count > 3600) [_samples removeObjectAtIndex:0];
 }
 
 // 进程 CPU：汇总所有线程时间，按采样间隔求增量，再除以活跃核数归一。
