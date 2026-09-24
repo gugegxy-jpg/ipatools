@@ -75,7 +75,7 @@
     if (!self) return nil;
 
     // 初始状态：先看 NSUserDefaults（面板写过的），再看 Info.plist，都没有就默认全开
-    _masterOn = [self boolForKey:IPATKeySoloXEnabled plistSub:@"Enabled" dflt:YES];
+    _masterOn = [self boolForKey:IPATKeySoloXEnabled plistSub:@"Enabled" dflt:NO];
     _showCPU = [self boolForKey:IPATKeySoloXCPU dflt:YES];
     _showMEM = [self boolForKey:IPATKeySoloXMEM dflt:YES];
     _showNET = [self boolForKey:IPATKeySoloXNET dflt:YES];
@@ -120,7 +120,32 @@
 #pragma mark - 悬浮层（顶部性能条，触摸穿透）
 
 - (void)buildWindow {
-    _window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    // 只靠 hidden 控制显隐，绝不 makeKeyAndVisible：抢成 key 窗口会让系统把
+    // 游戏窗口的旋转 transform 收回（系统只给 key 窗口管界面旋转），于是我们每帧
+    // 从游戏窗口抄到 identity，悬浮窗就停在竖屏顶部。ControlPanel 也是这个做法。
+    UIWindow *window = nil;
+    if (@available(iOS 13.0, *)) {
+        UIWindowScene *scene = nil;
+        for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+            if ([s isKindOfClass:[UIWindowScene class]] &&
+                ((UIWindowScene *)s).activationState == UISceneActivationStateForegroundActive) {
+                scene = (UIWindowScene *)s;
+                break;
+            }
+        }
+        if (!scene) {
+            for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+                if ([s isKindOfClass:[UIWindowScene class]]) { scene = (UIWindowScene *)s; break; }
+            }
+        }
+        if (scene && [UIWindow instancesRespondToSelector:@selector(initWithWindowScene:)]) {
+            window = [[UIWindow alloc] initWithWindowScene:scene];
+        }
+    }
+    if (!window) {
+        window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    }
+    _window = window;
     // 关键：整窗不接收触摸事件 -> 全部穿透到游戏
     _window.userInteractionEnabled = NO;
     _window.windowLevel = UIWindowLevelStatusBar + 100;
@@ -128,10 +153,23 @@
     _window.hidden = !_masterOn;
     _window.rootViewController = [[UIViewController alloc] init];
 
-    _bar = [[UIView alloc] initWithFrame:CGRectMake(0, 0, _window.bounds.size.width, 22)];
-    _bar.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    UIView *rootView = _window.rootViewController.view;
+
+    _bar = [[UIView alloc] init];
+    _bar.translatesAutoresizingMaskIntoConstraints = NO;
     _bar.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.55];
-    [_window.rootViewController.view addSubview:_bar];
+    _bar.layer.cornerRadius = 6;            // 自身小圆角，避免和屏幕圆角打架
+    _bar.clipsToBounds = YES;
+    [rootView addSubview:_bar];
+    // 贴着安全区布局：系统会按当前旋转把条子从刘海 / 灵动岛 / 圆角里缩进，
+    // 否则横竖屏下都会被屏幕圆角裁掉
+    UILayoutGuide *safe = rootView.safeAreaLayoutGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [_bar.topAnchor constraintEqualToAnchor:safe.topAnchor],
+        [_bar.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:6],
+        [_bar.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-6],
+        [_bar.heightAnchor constraintEqualToConstant:22],
+    ]];
 
     UIFont *font = [UIFont monospacedDigitSystemFontOfSize:11 weight:UIFontWeightMedium];
     UIColor *fg = [UIColor colorWithWhite:0.95 alpha:1.0];
@@ -144,15 +182,22 @@
     _temp = [self makeLabel:font fg:fg];
 
     UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[_cpu, _mem, _net, _fps, _bat, _temp]];
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
     stack.axis = UILayoutConstraintAxisHorizontal;
     stack.alignment = UIStackViewAlignmentCenter;
     stack.distribution = UIStackViewDistributionEqualSpacing;
     stack.spacing = 10;
-    stack.frame = CGRectMake(8, 0, _bar.bounds.size.width - 16, _bar.bounds.size.height);
-    stack.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [stack setLayoutMarginsRelativeArrangement:YES];
+    stack.layoutMargins = UIEdgeInsetsMake(0, 6, 0, 6);
     [_bar addSubview:stack];
+    [NSLayoutConstraint activateConstraints:@[
+        [stack.topAnchor constraintEqualToAnchor:_bar.topAnchor],
+        [stack.bottomAnchor constraintEqualToAnchor:_bar.bottomAnchor],
+        [stack.leadingAnchor constraintEqualToAnchor:_bar.leadingAnchor],
+        [stack.trailingAnchor constraintEqualToAnchor:_bar.trailingAnchor],
+    ]];
 
-    [_window makeKeyAndVisible];
+    // 不 makeKeyAndVisible：保持游戏为 key 窗口，游戏窗口的旋转 transform 才不会被系统收回
     [self align];
 }
 
@@ -237,6 +282,7 @@
 
 - (void)tickFPS:(CADisplayLink *)link {
     _frameCount++;
+    [self align];   // 每帧把悬浮窗对齐到游戏窗口，实时跟随屏幕旋转
 }
 
 - (void)refreshMetrics {
@@ -353,7 +399,11 @@
     typedef void *(*GetPtr)(void *, void *);
     typedef CFTypeRef (*PropPtr)(void *, CFStringRef, CFAllocatorRef, uint32_t);
     typedef kern_return_t (*RelPtr)(void *);
-    MachPortPtr MachPort = dlsym(io, "IOMasterPort");
+    // iOS 13+ 起 IOMasterPort 被 IOMainPort 取代，iOS 17+ 后 IOMasterPort 符号被移除，
+    // 先取 IOMainPort，取不到再回退 IOMasterPort；否则 iOS 27 上 dlsym 拿到 NULL，
+    // 整个温度读取路径走不进去，界面一直显示 --（读不出来）
+    MachPortPtr MachPort = dlsym(io, "IOMainPort");
+    if (!MachPort) MachPort = dlsym(io, "IOMasterPort");
     MatchPtr Match = dlsym(io, "IOServiceMatching");
     GetPtr Get = dlsym(io, "IOServiceGetMatchingService");
     PropPtr Prop = dlsym(io, "IORegistryEntryCreateCFProperty");
