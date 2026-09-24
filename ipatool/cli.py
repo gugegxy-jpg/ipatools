@@ -1014,7 +1014,7 @@ def cmd_inject(args) -> int:
             planned.append((solox_dylib, inject_mod.SOLOX_DYLIB_NAME))
             print(f"性能悬浮窗  : {solox_dylib}")
             settings.append((inject_mod.SOLOX_INFO_KEY,
-                             inject_mod.build_solox_options(enabled=True), "性能悬浮窗"))
+                             inject_mod.build_solox_options(enabled=False), "性能悬浮窗"))
             if not panel_enabled:
                 warnings.append("没有注入悬浮窗，SoloX 开关无处可放：建议去掉 --no-panel 或加 --panel，"
                                 "否则只能显示、不能在游戏内关掉")
