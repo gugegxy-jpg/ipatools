@@ -12,12 +12,17 @@ dylib 注入：把动态库放进 App 的 Frameworks/ 并给主可执行文件�
     不用再重新打包签名安装。插件必须用签主 App 的同一把证书签名
     （iOS 的 library validation 看 Team ID），签名用 ipatool signdylib
 
+还有「性能悬浮窗」（--solox，独立 dylib）：
+  - 单独出 SoloX.dylib（不走合编），注入后在游戏内悬浮窗里挂「性能悬浮窗」开关，
+    屏幕顶部漂浮显示 CPU / 内存 / 网络 / FPS / 电量 / 温度，且点击穿透到游戏
+  - 开关在游戏内悬浮窗里控制（需同时注入悬浮窗 --panel 或任一内置功能）
+
 上面这些功能都合编在同一个 IPATool.dylib 里（内含悬浮窗），注入一次即可，
 用哪个功能由对应的 Info.plist 配置字典决定（没用到的会写成 Enabled=NO）；
 用 --no-panel 可以不带悬浮窗。
 
 需要单独出包时（比如改了某个功能只想重编它）可以用 --files-dylib /
---qnet-dylib / --plugins-dylib / --panel-dylib 指定单独的 dylib，
+--qnet-dylib / --plugins-dylib / --panel-dylib / --solox-dylib 指定单独的 dylib，
 那时退回一功能一库的注入方式。
 """
 from __future__ import annotations
@@ -57,6 +62,12 @@ PLUGINS_DYLIB_NAME = "PluginLoader.dylib"
 PLUGINS_INFO_KEY = "IPAToolPlugins"
 PLUGINS_NAME = "PluginLoader"
 
+# 性能悬浮窗（SoloX）：独立 dylib，注入后在游戏内悬浮窗里挂开关，
+# 自身在屏幕顶部漂浮显示 CPU/内存/网络/FPS/电量/温度，并穿透点击。
+SOLOX_DYLIB_NAME = "SoloX.dylib"
+SOLOX_INFO_KEY = "IPAToolSoloX"
+SOLOX_NAME = "SoloX"
+
 # 四个内置功能默认合编成一个 IPATool.dylib：只注入一次，
 # 开哪些功能由 Info.plist 里 IPAToolControl / IPAToolFiles / IPAToolQNet / IPAToolPlugins
 # 的 Enabled 决定。
@@ -71,6 +82,7 @@ TWEAKS = {
     QNET_NAME: (QNET_DYLIB_NAME, "IPATOOL_QNET_DYLIB"),
     PLUGINS_NAME: (PLUGINS_DYLIB_NAME, "IPATOOL_PLUGINS_DYLIB"),
     MERGED_NAME: (MERGED_DYLIB_NAME, "IPATOOL_DYLIB"),
+    SOLOX_NAME: (SOLOX_DYLIB_NAME, "IPATOOL_SOLOX_DYLIB"),
 }
 
 
@@ -174,6 +186,11 @@ def locate_plugins_dylib(explicit: str | None = None, auto_build: bool = True, l
 def locate_merged_dylib(explicit: str | None = None, auto_build: bool = True, log=print) -> str:
     """定位合编了三个功能的 IPATool.dylib。"""
     return locate_tweak_dylib(MERGED_NAME, explicit=explicit, auto_build=auto_build, log=log)
+
+
+def locate_solox_dylib(explicit: str | None = None, auto_build: bool = True, log=print) -> str:
+    """定位性能悬浮窗 SoloX.dylib（独立 tweak）。"""
+    return locate_tweak_dylib(SOLOX_NAME, explicit=explicit, auto_build=auto_build, log=log)
 
 
 # --------------------------------------------------------------------------- #
@@ -330,6 +347,20 @@ def build_plugins_options(
         options["Enabled"] = enabled
     if auto_load is not None:
         options["AutoLoad"] = auto_load
+    return options
+
+
+def build_solox_options(
+    enabled: bool | None = None,
+) -> dict:
+    """性能悬浮窗（SoloX）配置：仅写显式指定的项，其余交给 dylib 默认值。
+
+    enabled 控制注入后是否默认显示（总开关）；各指标子开关在游戏内悬浮窗里调，
+    不在这里配。
+    """
+    options: dict = {}
+    if enabled is not None:
+        options["Enabled"] = enabled
     return options
 
 
