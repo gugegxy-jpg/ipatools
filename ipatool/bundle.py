@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import copy
 import os
+import re
 from dataclasses import dataclass
 
 from . import plistutil
-from .ipa import is_bundle_dir
+from .ipa import is_bundle_dir, MACHO_MAGICS
 
 PAYLOAD = "Payload"
 
@@ -95,6 +96,133 @@ def main_app(bundles: list[Bundle]) -> Bundle:
         if b.rel.count("/") == 1 and b.rel.startswith(PAYLOAD + "/"):
             return b
     return apps[0]
+
+
+def inspect_ipa(ipa_path: str) -> dict:
+    """
+    不落地解包，直接从 IPA(zip) 读取主程序 / 内嵌 bundle 的 Info.plist 与注入情况。
+    只读取需要的几个文件（各 Info.plist + 主可执行文件），避免解压整个包。
+    返回 {"app": Bundle, "nested": [Bundle...], "injected": [str...], "background_modes": [...]}.
+    """
+    import zipfile
+
+    from . import macho as macho_mod
+
+    with zipfile.ZipFile(ipa_path) as zf:
+        names = zf.namelist()
+
+        # 主程序：Payload 下第一层的 *.app/（不依赖 zip 里是否显式写了目录项）
+        app_prefix = None
+        for n in names:
+            m = re.match(r"^" + re.escape(PAYLOAD) + r"/([^/]+\.app)/", n)
+            if m:
+                app_prefix = m.group(0)
+                break
+        if app_prefix is None:
+            raise ValueError("IPA 中未找到 .app 主程序")
+        app_dir = app_prefix.rstrip("/")
+
+        def load_plist_rel(rel: str) -> dict:
+            return plistutil.load_plist_bytes(zf.read(rel))
+
+        main_plist_rel = None
+        for cand in (app_prefix + "Info.plist", app_prefix + "Resources/Info.plist"):
+            if cand in names:
+                main_plist_rel = cand
+                break
+        if main_plist_rel is None:
+            raise ValueError("主程序缺少 Info.plist")
+
+        data = load_plist_rel(main_plist_rel)
+        app = Bundle(
+            path=app_dir,
+            rel=app_dir,
+            kind="app",
+            plist_path=main_plist_rel,
+            identifier=data.get("CFBundleIdentifier"),
+            display_name=data.get("CFBundleDisplayName"),
+            bundle_name=data.get("CFBundleName"),
+            executable=data.get("CFBundleExecutable"),
+            version=data.get("CFBundleShortVersionString"),
+            build=data.get("CFBundleVersion"),
+            min_os=data.get("MinimumOSVersion"),
+        )
+
+        # 内嵌 bundle：扫所有 Info.plist，向上找最近的 bundle 目录（排除主程序自身）
+        nested: list[Bundle] = []
+        seen_dirs: set[str] = set()
+        for n in names:
+            if not n.endswith("Info.plist"):
+                continue
+            # 找到所属 bundle 目录
+            d = n
+            bundle_dir = None
+            while "/" in d:
+                d = d.rsplit("/", 1)[0]
+                if d == app_dir:
+                    bundle_dir = None
+                    break
+                if is_bundle_dir(os.path.basename(d)):
+                    bundle_dir = d
+                    break
+            if bundle_dir is None or bundle_dir in seen_dirs:
+                continue
+            seen_dirs.add(bundle_dir)
+            try:
+                bdata = load_plist_rel(n)
+            except (ValueError, OSError, KeyError):
+                continue
+            nested.append(Bundle(
+                path=bundle_dir,
+                rel=bundle_dir,
+                kind=os.path.splitext(bundle_dir)[1].lstrip(".") or "bundle",
+                plist_path=n,
+                identifier=bdata.get("CFBundleIdentifier"),
+                display_name=bdata.get("CFBundleDisplayName"),
+                bundle_name=bdata.get("CFBundleName"),
+                executable=bdata.get("CFBundleExecutable"),
+                version=bdata.get("CFBundleShortVersionString"),
+                build=bdata.get("CFBundleVersion"),
+                min_os=bdata.get("MinimumOSVersion"),
+            ))
+
+        # 注入情况：读主可执行文件字节（不落地），列出 @executable_path 依赖
+        injected: list[str] = []
+        exe_rel = _find_executable_rel(zf, app_prefix, names, app.executable)
+        if exe_rel:
+            try:
+                deps = macho_mod.read_dylibs_bytes(zf.read(exe_rel))
+                injected = [d for d in deps if d.startswith("@executable_path/")]
+            except macho_mod.MachOError:
+                injected = []
+
+        modes = data.get("UIBackgroundModes")
+        return {
+            "app": app,
+            "nested": nested,
+            "injected": injected,
+            "background_modes": modes if isinstance(modes, list) else None,
+        }
+
+
+def _find_executable_rel(zf, app_prefix: str, names: list[str], exe_name) -> str | None:
+    """在 zip 里定位主可执行文件条目。先按 CFBundleExecutable，否则扫 app 目录找 Mach-O。"""
+    if exe_name:
+        cand = app_prefix + exe_name
+        if cand in names:
+            return cand
+    for n in names:
+        if not n.startswith(app_prefix) or n.endswith("/"):
+            continue
+        if "/" in n[len(app_prefix):]:  # 只在本目录（不递归子目录）
+            continue
+        try:
+            head = zf.read(n)[:4]
+        except (OSError, zipfile.BadZipFile):
+            continue
+        if head in MACHO_MAGICS:
+            return n
+    return None
 
 
 def _map_identifier(current: str | None, old: str | None, new: str | None) -> str | None:
