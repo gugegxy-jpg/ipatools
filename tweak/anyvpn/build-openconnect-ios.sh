@@ -37,7 +37,8 @@ cd "$WORK"
 
 fetch() { [ -d "$1" ] || git clone --depth 1 --branch "$3" "$2" "$1"; }
 fetch openconnect https://gitlab.com/openconnect/openconnect.git v9.12
-fetch openssl     https://github.com/openssl/openssl.git         openssl-1.1.1w
+# 注意：OpenSSL 1.1.1 系列的 tag 是 OpenSSL_1_1_1w 驼峰命名（openssl-x.y.z 是 3.x 的风格）
+fetch openssl     https://github.com/openssl/openssl.git         OpenSSL_1_1_1w
 fetch libxml2     https://gitlab.gnome.org/GNOME/libxml2.git     v2.12.4
 fetch lwip        https://github.com/lwip-tcpip/lwip.git         STABLE-2_1_3
 
@@ -45,9 +46,12 @@ PREFIX="$WORK/prefix-$ARCH"
 LOGF="$WORK/build-$ARCH.log"
 : > "$LOGF"
 
-# --- OpenSSL（静态库；ios64-cross 读 CROSS_SYSROOT）-----------------------
-export CROSS_SYSROOT="$SDK"
+# --- OpenSSL（静态库）------------------------------------------------------
+# 1.1.1 的 ios64-cross 目标靠 CROSS_TOP / CROSS_SDK 找 iPhoneOS SDK；
+# 3.0 系列才用 CROSS_SYSROOT。两个都设上，脚本以后换版本也能用。
+export CROSS_SDK="$(basename "$SDK")"
 export CROSS_TOP="$(dirname "$(dirname "$SDK")")"
+export CROSS_SYSROOT="$SDK"
 if [ -f "$PREFIX/lib/libcrypto.a" ] && [ -f "$PREFIX/lib/libssl.a" ]; then
   echo ">>> OpenSSL 已构建，跳过"
 else
