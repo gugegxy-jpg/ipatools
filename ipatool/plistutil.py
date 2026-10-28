@@ -22,6 +22,14 @@ def load_plist(path: str) -> dict:
     return data
 
 
+def load_plist_bytes(raw: bytes) -> dict:
+    """从内存字节解析 plist（用于不落地读取 zip 内的 Info.plist）。"""
+    data = plistlib.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("plist 不是字典类型")
+    return data
+
+
 def _detect_fmt(path: str) -> int:
     try:
         with open(path, "rb") as f:
