@@ -42,13 +42,28 @@ jobs:
           xcrun --sdk iphoneos --show-sdk-version
           xcrun --sdk iphoneos --show-sdk-path
 
+      # AnyVpn.dylib 依赖 iOS 版 openconnect/openssl/lwIP 静态库，
+      # 交叉编译要 10-20 分钟，按脚本内容缓存产物
+      - name: Cache AnyVPN prebuilt libs
+        uses: actions/cache@v4
+        with:
+          path: tweak/anyvpn/prebuilt
+          key: anyvpn-prebuilt-${{ inputs.archs || 'arm64' }}-${{ hashFiles('tweak/anyvpn/build-openconnect-ios.sh') }}
+
+      - name: Build AnyVPN dependencies (openconnect/openssl/libxml2/lwIP)
+        run: |
+          chmod +x tweak/anyvpn/build-openconnect-ios.sh
+          ./tweak/anyvpn/build-openconnect-ios.sh 2>&1 | tee anyvpn-deps.log
+          exit ${PIPESTATUS[0]}
+
       - name: Build dylibs
         env:
           IPATOOL_MIN_IOS: ${{ inputs.min_ios || '14.0' }}
           IPATOOL_ARCHS: ${{ inputs.archs || 'arm64' }}
           # 悬浮窗 / 文件导入导出 / 插件加载合编成一个 IPATool.dylib；
-          # 弱网测试单独出 QNet.dylib；性能悬浮窗单独出 SoloX.dylib
-          IPATOOL_TARGETS: IPATool QNet SoloX
+          # 弱网测试单独出 QNet.dylib；性能悬浮窗单独出 SoloX.dylib；
+          # VPN 隧道单独出 AnyVpn.dylib
+          IPATOOL_TARGETS: IPATool QNet SoloX AnyVpn
         run: |
           mkdir -p tweak/build
           chmod +x tweak/build.sh
@@ -132,6 +147,7 @@ jobs:
           if [ -f demo/build/IPATDemo.ipa ]; then assets+=(demo/build/IPATDemo.ipa); fi
           if [ -f demo-build.log ]; then assets+=(demo-build.log); fi
           if [ -f demo-inject.log ]; then assets+=(demo-inject.log); fi
+          if [ -f anyvpn-deps.log ]; then assets+=(anyvpn-deps.log); fi
           gh release create "$TAG" "${assets[@]}" \
             --title "$TAG" \
             --notes "Actions 自动编译：run ${{ github.run_number }} / commit ${{ github.sha }}" \
