@@ -97,7 +97,9 @@ pushd openconnect
   make clean >>"$LOGF" 2>&1 || true
   PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" \
   ./configure --host="$TRIPLE" --prefix="$PREFIX" \
-      --with-openssl="$PREFIX" \
+      # openconnect 的 configure 只在 DIR 下直接找 libssl.a/libcrypto.a
+      # （不查 DIR/lib/），所以必须指到 lib 目录；头文件走下面 CFLAGS 的 -I
+      --with-openssl="$PREFIX/lib" \
       --without-gnutls --without-libpskc --without-stoken \
       --without-liboath --without-lz4 \
       --enable-static --disable-shared \
