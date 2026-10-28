@@ -68,6 +68,12 @@ SOLOX_DYLIB_NAME = "SoloX.dylib"
 SOLOX_INFO_KEY = "IPAToolSoloX"
 SOLOX_NAME = "SoloX"
 
+# VPN 隧道（AnyVpn，OpenConnect/AnyConnect 协议）：独立 dylib，
+# 依赖 iOS 版 openconnect 静态库（tweak/anyvpn/build-openconnect-ios.sh 产出）。
+ANYVPN_DYLIB_NAME = "AnyVpn.dylib"
+ANYVPN_INFO_KEY = "IPAToolAnyVpn"
+ANYVPN_NAME = "AnyVpn"
+
 # 四个内置功能默认合编成一个 IPATool.dylib：只注入一次，
 # 开哪些功能由 Info.plist 里 IPAToolControl / IPAToolFiles / IPAToolQNet / IPAToolPlugins
 # 的 Enabled 决定。
@@ -83,6 +89,7 @@ TWEAKS = {
     PLUGINS_NAME: (PLUGINS_DYLIB_NAME, "IPATOOL_PLUGINS_DYLIB"),
     MERGED_NAME: (MERGED_DYLIB_NAME, "IPATOOL_DYLIB"),
     SOLOX_NAME: (SOLOX_DYLIB_NAME, "IPATOOL_SOLOX_DYLIB"),
+    ANYVPN_NAME: (ANYVPN_DYLIB_NAME, "IPATOOL_ANYVPN_DYLIB"),
 }
 
 
@@ -191,6 +198,11 @@ def locate_merged_dylib(explicit: str | None = None, auto_build: bool = True, lo
 def locate_solox_dylib(explicit: str | None = None, auto_build: bool = True, log=print) -> str:
     """定位性能悬浮窗 SoloX.dylib（独立 tweak）。"""
     return locate_tweak_dylib(SOLOX_NAME, explicit=explicit, auto_build=auto_build, log=log)
+
+
+def locate_anyvpn_dylib(explicit: str | None = None, auto_build: bool = True, log=print) -> str:
+    """定位 VPN 隧道 AnyVpn.dylib（独立 tweak，依赖 openconnect 静态库）。"""
+    return locate_tweak_dylib(ANYVPN_NAME, explicit=explicit, auto_build=auto_build, log=log)
 
 
 # --------------------------------------------------------------------------- #
@@ -361,6 +373,42 @@ def build_solox_options(
     options: dict = {}
     if enabled is not None:
         options["Enabled"] = enabled
+    return options
+
+
+def build_anyvpn_options(
+    server: str | None = None,
+    user: str | None = None,
+    password: str | None = None,
+    group: str | None = None,
+    enabled: bool | None = None,
+    auto_connect: bool | None = None,
+    disable_dtls: bool | None = None,
+    underlying_iface: str | None = None,
+) -> dict:
+    """VPN 隧道（AnyVpn）配置：仅写显式指定的项，其余交给 dylib 默认值。
+
+    server/user/password/group 是连接凭据（写进 Info.plist，随包重签后生效）；
+    enabled 是总开关（默认 NO，用户在游戏内悬浮窗里点「立即连接」或开总开关）；
+    auto_connect / disable_dtls 也可以在游戏内悬浮窗里改（NSUserDefaults 优先）。
+    """
+    options: dict = {}
+    if server is not None:
+        options["Server"] = server
+    if user is not None:
+        options["User"] = user
+    if password is not None:
+        options["Password"] = password
+    if group is not None:
+        options["AuthGroup"] = group
+    if enabled is not None:
+        options["Enabled"] = enabled
+    if auto_connect is not None:
+        options["AutoConnect"] = auto_connect
+    if disable_dtls is not None:
+        options["DisableDTLS"] = disable_dtls
+    if underlying_iface:
+        options["UnderlyingIface"] = underlying_iface
     return options
 
 
