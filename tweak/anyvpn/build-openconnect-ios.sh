@@ -57,13 +57,14 @@ if [ -f "$PREFIX/lib/libcrypto.a" ] && [ -f "$PREFIX/lib/libssl.a" ]; then
   echo ">>> OpenSSL 已构建，跳过"
 else
   pushd openssl
-    make clean >>"$LOGF" 2>&1 || true
+    make clean 2>&1 | tee -a "$LOGF" || true
+    # 注意：1.1.1 的 Configure 不认裸的 -arch/-fPIC 选项（3.0 才行）；
+    # arch / min-version 已含在 CC 里，PIC 用 CFLAGS 传
     ./Configure "$OPENSSL_TARGET" --prefix="$PREFIX" \
-        no-shared no-tests no-asm no-hw -fPIC \
-        -arch "$ARCH" -mios-version-min="$MIN_IOS" \
-        CC="$CC" >>"$LOGF" 2>&1
-    make -j"$(sysctl -n hw.ncpu)" build_libs >>"$LOGF" 2>&1
-    make install_sw >>"$LOGF" 2>&1
+        no-shared no-tests no-asm no-hw \
+        CC="$CC" CFLAGS="-fPIC" 2>&1 | tee -a "$LOGF"
+    make -j"$(sysctl -n hw.ncpu)" build_libs 2>&1 | tee -a "$LOGF"
+    make install_sw 2>&1 | tee -a "$LOGF"
   popd
 fi
 
@@ -72,13 +73,13 @@ if [ -f "$PREFIX/lib/libxml2.a" ]; then
   echo ">>> libxml2 已构建，跳过"
 else
   pushd libxml2
-    [ -f configure ] || NOCONFIGURE=1 ./autogen.sh >>"$LOGF" 2>&1
-    make clean >>"$LOGF" 2>&1 || true
+    [ -f configure ] || NOCONFIGURE=1 ./autogen.sh 2>&1 | tee -a "$LOGF"
+    make clean 2>&1 | tee -a "$LOGF" || true
     ./configure --host="$TRIPLE" --prefix="$PREFIX" \
         --without-python --without-lzma --without-zlib \
         --enable-static --disable-shared \
-        CC="$CC" CFLAGS="-fPIC" >>"$LOGF" 2>&1
-    make -j"$(sysctl -n hw.ncpu)" >>"$LOGF" 2>&1 && make install >>"$LOGF" 2>&1
+        CC="$CC" CFLAGS="-fPIC" 2>&1 | tee -a "$LOGF"
+    make -j"$(sysctl -n hw.ncpu)" 2>&1 | tee -a "$LOGF" && make install 2>&1 | tee -a "$LOGF"
   popd
 fi
 
@@ -95,8 +96,8 @@ pushd openconnect
       --with-vpnc-script=/etc/vpnc/vpnc-script \
       --disable-nls \
       CC="$CC" \
-      CFLAGS="-I$PREFIX/include -fPIC" LDFLAGS="-L$PREFIX/lib" >>"$LOGF" 2>&1
-  make -j"$(sysctl -n hw.ncpu)" libopenconnect.la >>"$LOGF" 2>&1
+      CFLAGS="-I$PREFIX/include -fPIC" LDFLAGS="-L$PREFIX/lib" 2>&1 | tee -a "$LOGF"
+  make -j"$(sysctl -n hw.ncpu)" libopenconnect.la 2>&1 | tee -a "$LOGF"
 popd
 
 # --- lwIP（非越狱模式的用户态 TCP/IP 栈；NO_SYS 单线程，见 tweak/lwipopts.h）---
@@ -111,7 +112,8 @@ else
       EXTRA_INC="-I$HERE/.."
       for f in ../src/core/*.c ../src/core/ipv4/*.c; do
         [ -e "$f" ] || continue
-        $CC -c "$f" -I../src/include $EXTRA_INC -o "$(basename "${f%.c}").o" >>"$LOGF" 2>&1
+        $CC -c "$f" -I../src/include $EXTRA_INC -o "$(basename "${f%.c}").o" >>"$LOGF" 2>&1 \
+          || { echo "lwIP 编译失败: $f"; tail -40 "$LOGF"; exit 1; }
       done
       xcrun -sdk iphoneos ar rcs "$PREFIX/lib/liblwip.a" ./*.o
     popd >/dev/null
