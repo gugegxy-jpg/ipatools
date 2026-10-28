@@ -47,6 +47,14 @@ PREFIX="$WORK/prefix-$ARCH"
 LOGF="$WORK/build-$ARCH.log"
 : > "$LOGF"
 
+# --- 构建依赖：libxml2 / openconnect 从 git 源码构建需要 autotools ---------
+# GitHub 的 macOS runner 默认没装这三样；本机已装则直接跳过
+if ! command -v autoreconf >/dev/null 2>&1 || ! command -v automake >/dev/null 2>&1 \
+   || ! command -v libtoolize >/dev/null 2>&1; then
+  echo ">>> 缺 autoconf/automake/libtool，用 brew 安装（首次约 1 分钟）"
+  brew install autoconf automake libtool pkg-config || true
+fi
+
 # --- OpenSSL（静态库）------------------------------------------------------
 # 1.1.1 的 ios64-cross 目标靠 CROSS_TOP / CROSS_SDK 找 iPhoneOS SDK；
 # 3.0 系列才用 CROSS_SYSROOT。两个都设上，脚本以后换版本也能用。

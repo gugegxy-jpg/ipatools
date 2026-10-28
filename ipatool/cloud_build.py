@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -341,11 +342,24 @@ def dl_artifact_ipa(token, owner, repo, run_id, out_dir, workflow_file="build-ip
 
 
 # --------------------------------------------------------------------------- #
-# GitHub 导入（把本地文件夹逐文件推到仓库；空仓库首个文件会自动建默认分支）
+# GitHub 导入（差量上传：远端树比对 + 只传改动 + 合并成 1 个提交）
 # --------------------------------------------------------------------------- #
+def _git_blob_sha(data: bytes) -> str:
+    """算文件的 git blob SHA-1，用于和远端树比对，判断文件是否真的变了。"""
+    h = hashlib.sha1()
+    h.update(b"blob %d\0" % len(data))
+    h.update(data)
+    return h.hexdigest()
+
+
 def import_to_github(token, owner, repo, branch, files, target="",
-                     visibility="public", auto_create=False):
+                     visibility="public", auto_create=False, log=print):
     """把 files[(rel, full), ...] 推到 owner/repo@branch 的 target 路径下。
+
+    差量上传：先 2 次请求拉远端整棵树，本地算 blob 哈希比对，只上传有变化的
+    文件，并合并成 **1 个提交**（老实现每文件 2 次请求 + 各一个提交，几百个
+    文件既慢还会连环触发 Actions）。不删除远端多出来的文件：本地列表常带大小
+    过滤，镜像删除容易误删，宁可多留。
 
     返回 (msg, created)。仓库不存在且 auto_create=True 时自动在 Token 对应账号下创建。
     """
@@ -367,37 +381,69 @@ def import_to_github(token, owner, repo, branch, files, target="",
                      {"name": repo, "private": private,
                       "description": "Imported via ipatool", "auto_init": False})
             created = True
-    base_api = f"https://api.github.com/repos/{owner}/{repo}"
-    total = len(files)
-    for i, (rel, full) in enumerate(files, 1):
-        # 规范化：两侧斜杠都去掉，避免生成 "/foo" 或 "//foo"
-        # （GitHub Contents API 的 path 不能以斜杠开头，否则 422）
-        t = target.strip().strip("/")
+    base = f"https://api.github.com/repos/{owner}/{repo}"
+    target = target.strip().strip("/")
+
+    # 1) 读本地文件、算哈希（不走网络）
+    local: dict[str, bytes] = {}
+    for rel, full in files:
         r = rel.replace("\\", "/").strip().strip("/")
-        path = "/".join(p for p in (t, r) if p)
+        path = "/".join(p for p in (target, r) if p)
         try:
             with open(full, "rb") as fh:
-                content = base64.b64encode(fh.read()).decode("ascii")
+                local[path] = fh.read()
         except OSError as e:
             raise RuntimeError(f"读取本地文件失败 {full}: {e}")
-        sha = None
-        try:
-            _, gj = api_call("GET", f"{base_api}/contents/{_q(path)}?ref={_q(branch)}", token)
-            sha = gj.get("sha") if isinstance(gj, dict) else None
-        except RuntimeError:
-            pass
-        payload = {"message": f"Add {repo} from local folder", "content": content}
-        if sha:
-            payload["sha"] = sha
-        try:
-            api_call("PUT", f"{base_api}/contents/{_q(path)}", token, payload)
-        except RuntimeError as e:
-            msg = str(e)
-            if ".github/workflows" in msg:
-                msg += ("\n提示: 上传工作流文件需要 Token 含 workflow 权限，"
-                        "请重新生成 Token 并同时勾选 repo 与 workflow。")
-            raise RuntimeError(f"[上传 {path}] {msg}")
-    msg = f"✅ 导入成功! {total} 个文件 -> {owner}/{repo}@{branch}"
+
+    # 2) 拉远端整棵树（2 次请求）；分支不存在/空仓库时按全量新上传处理
+    remote: dict[str, str] = {}
+    head_sha = head_tree_sha = None
+    try:
+        _, rj = api_call("GET", f"{base}/git/ref/heads/{_q(branch)}", token)
+        head_sha = rj["object"]["sha"]
+        _, tj = api_call("GET", f"{base}/git/trees/{head_sha}?recursive=1", token)
+        head_tree_sha = tj.get("sha")
+        for e in tj.get("tree", []):
+            if e.get("type") == "blob":
+                remote[e["path"]] = e["sha"]
+    except RuntimeError:
+        pass
+
+    # 3) 差异比对：只传真变了/新增的
+    changed = [(p, d) for p, d in local.items() if _git_blob_sha(d) != remote.get(p)]
+    unchanged = len(local) - len(changed)
+    if not changed:
+        return (f"✅ 无改动，{unchanged} 个文件远端已是最新，跳过上传", created)
+
+    # 4) 只为变化的文件建 blob，然后 1 个 tree + 1 个 commit + 1 次 ref 更新
+    tree_entries = []
+    for i, (path, data) in enumerate(changed, 1):
+        _, bj = api_call("POST", f"{base}/git/blobs", token,
+                         {"content": base64.b64encode(data).decode("ascii"),
+                          "encoding": "base64"})
+        tree_entries.append({"path": path, "mode": "100644",
+                             "type": "blob", "sha": bj["sha"]})
+        log(f"  [{i}/{len(changed)}] {path}")
+
+    tree_payload: dict = {"tree": tree_entries}
+    if head_tree_sha:
+        tree_payload["base_tree"] = head_tree_sha
+    _, ntj = api_call("POST", f"{base}/git/trees", token, tree_payload)
+
+    commit_payload = {"message": f"Add {repo} from local folder",
+                      "tree": ntj["sha"],
+                      "parents": [head_sha] if head_sha else []}
+    _, cj = api_call("POST", f"{base}/git/commits", token, commit_payload)
+
+    if head_sha:
+        api_call("PATCH", f"{base}/git/refs/heads/{_q(branch)}", token,
+                 {"sha": cj["sha"], "force": False})
+    else:
+        api_call("POST", f"{base}/git/refs", token,
+                 {"ref": f"refs/heads/{branch}", "sha": cj["sha"]})
+
+    msg = (f"✅ 导入成功! {len(changed)} 个文件有改动已上传"
+           f"（{unchanged} 个未变跳过），合并为 1 个提交 -> {owner}/{repo}@{branch}")
     return msg, created
 
 

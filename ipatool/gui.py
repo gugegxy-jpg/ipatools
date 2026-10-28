@@ -2253,7 +2253,8 @@ class IpatoolGui:
             try:
                 msg, created = cloud_mod.import_to_github(
                     token, owner, repo, branch, files, target,
-                    visibility=visibility, auto_create=auto_create)
+                    visibility=visibility, auto_create=auto_create,
+                    log=self._clog)
                 self._clog(msg)
                 if created:
                     self.root.after(0, self._gh_list_repos)
