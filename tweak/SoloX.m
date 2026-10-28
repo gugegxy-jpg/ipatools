@@ -141,6 +141,16 @@ static NSString *const kSoloXChartJS =
                                             repeats:YES];
     [self refreshMetrics];
     [self applyVisibility];   // 若 App 此刻已在前台（如运行中注入），直接显示并对齐
+
+    // 冷启动兜底：App/scene 可能在观察者注册前就已经激活，生命周期通知被错过，
+    // 导致默认开启时悬浮窗不显示、要手动开关一次。延迟再显示+对齐几次，直到游戏窗口就绪。
+    for (NSNumber *delay in @[@1.0, @3.0]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [self applyVisibility];
+        });
+    }
     return self;
 }
 
@@ -253,12 +263,11 @@ static NSString *const kSoloXChartJS =
 }
 
 - (void)align {
-    // 场景窗口的方向由所在 scene 负责，这里只保证窗口铺满屏幕即可；
-    // 不手动设 transform —— 会被 scene 覆盖，正是之前停在竖屏的根因。
-    CGRect screen = [UIScreen mainScreen].bounds;
-    _window.frame = screen;
-    _window.transform = CGAffineTransformIdentity;
-    if (_window.rootViewController.view) _window.rootViewController.view.frame = _window.bounds;
+    // 直接对齐到游戏主窗口的实际几何与旋转（抄它的 bounds/center/transform），
+    // 不依赖 scene/状态栏方向：横屏游戏锁方向、或自己转 transform 时都不会跑偏。
+    // 拿不到游戏窗口（冷启动瞬间）就退回按屏幕尺寸铺满。
+    UIWindow *app = IPATAppKeyWindowExcluding(_window);
+    IPATAlignWindowToInterface(_window, app);
 }
 
 - (void)applyVisibility {
@@ -312,6 +321,7 @@ static NSString *const kSoloXChartJS =
     [c addObserver:self selector:@selector(applyVisibility) name:UIApplicationDidBecomeActiveNotification object:nil];
     if (@available(iOS 13.0, *)) {
         [c addObserver:self selector:@selector(applyVisibility) name:UISceneDidActivateNotification object:nil];
+        [c addObserver:self selector:@selector(applyVisibility) name:UISceneWillEnterForegroundNotification object:nil];
     }
     [[UIDevice currentDevice] beginGeneratingDeviceOrientationNotifications];
 }
@@ -482,6 +492,10 @@ static NSString *const kSoloXChartJS =
         @"temp":@(temp),
     }];
     if (_samples.count > 3600) [_samples removeObjectAtIndex:0];
+
+    // 每拍顺带对齐一次：游戏窗口出现得比我们晚、或生命周期通知被错过时，
+    // 也能在 1 秒内自动转正/铺满，不必靠后台切换或手动开关。（align 内部对未变化会跳过）
+    if (_masterOn) [self align];
 }
 
 // 进程 CPU：汇总所有线程时间，按采样间隔求增量，再除以活跃核数归一。
