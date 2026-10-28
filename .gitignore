@@ -8,6 +8,13 @@ tweak/build/
 build/
 dist/
 
+# AnyVPN：交叉编译产物与中间目录（Actions 上自动生成，体积大不入库）
+tweak/anyvpn/prebuilt/
+tweak/anyvpn/.build/
+
+# zsign 本地二进制（各平台自行下载，见 README；体积大且平台相关，不入库）
+ipatool/zsign/
+
 # zsign 缓存（自动重建的派生文件，非密钥）
 .zsign_cache/
 
