@@ -421,6 +421,12 @@ class IpatoolGui:
         self.v_export_token = tk.StringVar()
         self.v_dylib_path = tk.StringVar()
         self.v_ipa_path = tk.StringVar()
+        # VPN 隧道（AnyVpn）
+        self.v_anyvpn = tk.BooleanVar(value=False)
+        self.v_anyvpn_server = tk.StringVar()
+        self.v_anyvpn_user = tk.StringVar()
+        self.v_anyvpn_pass = tk.StringVar()
+        self.v_anyvpn_group = tk.StringVar()
         # 页面内部状态（下拉选项 / 最近运行等）
         self._repo_full: dict[str, str] = {}
         self.repo_cb = None
@@ -471,8 +477,9 @@ class IpatoolGui:
 
         hint = ttk.Label(
             box,
-            text="输入支持 .ipa 或含 Payload 的目录；输出留空则自动命名。"
-                 "选中后不解析，要看包内信息点「读取信息」。",
+            text="输入支持 .ipa 或含 Payload 的目录。选中后自动读取包内信息"
+                 "（直接读 zip 内的 Info.plist，不解包整包，大包也秒开）；"
+                 "也可在「IPA 信息」页点「读取信息」手动读。",
             style="Muted.TLabel", justify="left", wraplength=940,
         )
         hint.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
@@ -502,13 +509,15 @@ class IpatoolGui:
             self._set_input_path(path)
 
     def _set_input_path(self, path: str) -> None:
-        """
-        选中输入包后**不自动解析**：解析要解包 / 遍历整个包，只想注入和签名的人
-        根本不需要这一步。要看 Bundle ID / 名称时，点「读取信息」再读。
-        """
+        """选中输入包后自动读取信息：现在走 zip 直读（inspect_ipa），不解包整包、
+        不遍历整个包，大包也秒开，所以恢复「选完即读」；想手动读也可在
+        「IPA 信息」页点「读取信息」。"""
         self.v_input.set(path)
-        self._append(f"[输入] {path}（未解析，可直接执行）\n")
-        self._set_status("已选择输入（未解析）")
+        self._append(f"[输入] {path}（自动读取信息…）\n")
+        if "info" not in self._running_tasks:
+            self._load_info()
+        else:
+            self._set_status("已选择输入（信息读取进行中）")
 
     def _pick_output(self) -> None:
         current = self.v_output.get().strip()
@@ -606,6 +615,7 @@ class IpatoolGui:
         self._build_pack_dylib(top, 0, column=1, sticky="nsew")
         self._build_pack_sign(page, 1)
         self._build_pack_install(page, 2)
+        self._build_pack_vpn(page, 3)
 
     # ---- 信息 --------------------------------------------------------- #
     def _build_info_tab(self) -> None:
@@ -616,10 +626,10 @@ class IpatoolGui:
 
         bar = ttk.Frame(page)
         bar.grid(row=0, column=0, sticky="ew")
-        ttk.Button(bar, text="读取信息", command=self._load_info).pack(side="left")
+        ttk.Button(bar, text="读取信息（完整解包）", command=lambda: self._load_info(full=True)).pack(side="left")
         ttk.Button(bar, text="选择目录…", command=self._pick_input_dir).pack(side="left", padx=8)
         ttk.Label(
-            bar, text="解包后读取，包大时稍慢",
+            bar, text="选包时已自动快读；此按钮完整解包，信息更全、大包稍慢",
             style="PageMuted.TLabel",
         ).pack(side="left")
 
@@ -894,9 +904,21 @@ class IpatoolGui:
             )
         self._refresh_install_summary()
 
-    # ------------------------------------------------------------------ #
-    # 底部：日志 + 操作
-    # ------------------------------------------------------------------ #
+    def _build_pack_vpn(self, page, row: int) -> None:
+        """VPN 隧道（AnyVpn）：勾选后注入 AnyVpn.dylib 并把凭据写进 Info.plist。"""
+        box = self._group(page, "VPN 隧道（AnyConnect / OpenConnect）", row)
+        self._check(box, "注入 VPN 隧道（--anyvpn）", self.v_anyvpn).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 2))
+        ttk.Label(
+            box, style="Muted.TLabel", justify="left", wraplength=680,
+            text="连接 / 断开在游戏内悬浮窗里操作。流量接管需要 root（越狱）；"
+                 "dylib 本体需在 macOS 上先跑 tweak/anyvpn/build-openconnect-ios.sh 编出。",
+        ).grid(row=0, column=2, columnspan=2, sticky="e", pady=(0, 2))
+        self._entry(box, 1, "服务器", self.v_anyvpn_server, "AnyConnect 网关 URL")
+        self._entry(box, 2, "账号", self.v_anyvpn_user)
+        self._entry(box, 3, "密码", self.v_anyvpn_pass)
+        self._entry(box, 4, "认证组", self.v_anyvpn_group, "留空 = 选第一个")
+
     def _build_bottom(self) -> None:
         area = ttk.Frame(self.root)
         area.grid(row=3, column=0, sticky="nsew", padx=10, pady=(2, 6))
@@ -1594,8 +1616,11 @@ class IpatoolGui:
         _flag(argv, "-v", self.v_verbose.get())
         return argv
 
-    def _info_argv(self) -> list[str]:
-        return ["info", self.v_input.get().strip(), "--json"]
+    def _info_argv(self, full: bool = False) -> list[str]:
+        argv = ["info", self.v_input.get().strip(), "--json"]
+        if full:
+            argv.append("--full")
+        return argv
 
     def _modify_argv(self) -> list[str] | None:
         src = self.v_input.get().strip()
@@ -1619,10 +1644,17 @@ class IpatoolGui:
         argv = ["inject", src]
         for path in self.custom_dylibs:
             argv += ["--dylib", path]
+        if self.v_anyvpn.get():
+            argv.append("--anyvpn")
+            _add(argv, "--anyvpn-server", self.v_anyvpn_server.get().strip() or None)
+            _add(argv, "--anyvpn-user", self.v_anyvpn_user.get().strip() or None)
+            _add(argv, "--anyvpn-pass", self.v_anyvpn_pass.get() or None)
+            _add(argv, "--anyvpn-group", self.v_anyvpn_group.get().strip() or None)
         argv += self._common_args()
 
-        if not self.custom_dylibs:
-            messagebox.showwarning("没有要注入的东西", "请先点「添加…」选一个 dylib。")
+        if not self.custom_dylibs and not self.v_anyvpn.get():
+            messagebox.showwarning(
+                "没有要注入的东西", "请先点「添加…」选一个 dylib，或勾选「注入 VPN 隧道」。")
             return None
         return argv
 
@@ -1637,11 +1669,11 @@ class IpatoolGui:
     # ------------------------------------------------------------------ #
     # 动作
     # ------------------------------------------------------------------ #
-    def _load_info(self) -> None:
+    def _load_info(self, full: bool = False) -> None:
         src = self.v_input.get().strip()
         if not src:
             return
-        self._start(self._info_argv(), "info")
+        self._start(self._info_argv(full=full), "info")
 
     def _load_devices(self, quiet: bool = False) -> None:
         """读一遍连着的设备填进下拉（走 devices 子命令的 JSON 输出）。"""
