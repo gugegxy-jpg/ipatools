@@ -40,7 +40,8 @@ fetch openconnect https://gitlab.com/openconnect/openconnect.git v9.12
 # 注意：OpenSSL 1.1.1 系列的 tag 是 OpenSSL_1_1_1w 驼峰命名（openssl-x.y.z 是 3.x 的风格）
 fetch openssl     https://github.com/openssl/openssl.git         OpenSSL_1_1_1w
 fetch libxml2     https://gitlab.gnome.org/GNOME/libxml2.git     v2.12.4
-fetch lwip        https://github.com/lwip-tcpip/lwip.git         STABLE-2_1_3
+# lwIP 的发布 tag 都带 _RELEASE 后缀
+fetch lwip        https://github.com/lwip-tcpip/lwip.git         STABLE-2_1_3_RELEASE
 
 PREFIX="$WORK/prefix-$ARCH"
 LOGF="$WORK/build-$ARCH.log"
