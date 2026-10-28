@@ -94,6 +94,15 @@ sources_for_target() {
     SoloX)
       printf '%s\n' "$HERE/SoloX.m"
       ;;
+    AnyVpn)
+      # VPN 隧道（OpenConnect）：依赖 iOS 版静态库，没编译就明确跳过
+      if [[ ! -f "$HERE/anyvpn/prebuilt/lib/libopenconnect.a" ]]; then
+        echo "跳过 AnyVpn：缺 tweak/anyvpn/prebuilt/lib/libopenconnect.a，" \
+             "先在 macOS 上跑 tweak/anyvpn/build-openconnect-ios.sh" >&2
+        return 1
+      fi
+      printf '%s\n' "$HERE/AnyVpn.m" "$HERE/AnyVpnT2S.m" "$HERE/fishhook.c"
+      ;;
     *)
       if [[ "$1" == "ControlPanel" ]]; then
         printf '%s\n' "$HERE/$1.m" "$OUT_DIR/IPAToolIcon.m"
@@ -109,6 +118,14 @@ frameworks_for_source() {
   case "$(basename "$1" .m)" in
     # UniformTypeIdentifiers 是 iOS 14 才有的框架，用 weak 链接兼容更低的部署目标
     FileBridge)  printf '%s\n' -weak_framework UniformTypeIdentifiers -lz ;;
+    # VPN：OpenConnect/OpenSSL/libxml2/lwIP 静态库 + zlib；
+    # -I$HERE 是给 lwipopts.h / arch/cc.h 用的（lwIP 要求它们在搜索路径上）
+    AnyVpn)
+      local pre="$HERE/anyvpn/prebuilt"
+      printf '%s\n' -I"$HERE" -I"$pre/include" \
+        "$pre/lib/libopenconnect.a" "$pre/lib/libssl.a" \
+        "$pre/lib/libcrypto.a" "$pre/lib/libxml2.a" "$pre/lib/liblwip.a" -lz
+      ;;
   esac
 }
 
