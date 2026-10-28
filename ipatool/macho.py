@@ -282,16 +282,21 @@ def _dylib_command_bytes(path: str, is64: bool, endian: str) -> bytes:
     return cmd + raw.ljust(cmdsize - 24, b"\x00")
 
 
-def read_dylibs(path: str) -> list[str]:
-    """读取可执行文件里记录的所有 dylib 依赖路径。"""
-    with open(path, "rb") as f:
-        data = f.read()
+def read_dylibs_bytes(data: bytes) -> list[str]:
+    """从内存中的 Mach-O 字节读取所有 dylib 依赖路径。"""
     out: list[str] = []
     for sl in slices_of(data):
         for d in sl.dylibs:
             if d not in out:
                 out.append(d)
     return out
+
+
+def read_dylibs(path: str) -> list[str]:
+    """读取可执行文件里记录的所有 dylib 依赖路径。"""
+    with open(path, "rb") as f:
+        data = f.read()
+    return read_dylibs_bytes(data)
 
 
 def add_dylib(path: str, dylib_path: str, dry_run: bool = False) -> tuple[bool, list[str]]:
