@@ -95,10 +95,11 @@ fi
 pushd openconnect
   [ -f configure ] || NOCONFIGURE=1 ./autogen.sh >>"$LOGF" 2>&1
   make clean >>"$LOGF" 2>&1 || true
+  # 注意：续行（\）中间不能插注释行——拼接后 # 会把后面所有参数吞成注释。
+  # openconnect 的 configure 只在 DIR 下直接找 libssl.a/libcrypto.a（不查
+  # DIR/lib/），所以 --with-openssl 指到 lib 目录；头文件走 CFLAGS 的 -I。
   PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" \
   ./configure --host="$TRIPLE" --prefix="$PREFIX" \
-      # openconnect 的 configure 只在 DIR 下直接找 libssl.a/libcrypto.a
-      # （不查 DIR/lib/），所以必须指到 lib 目录；头文件走下面 CFLAGS 的 -I
       --with-openssl="$PREFIX/lib" \
       --without-gnutls --without-libpskc --without-stoken \
       --without-liboath --without-lz4 \
