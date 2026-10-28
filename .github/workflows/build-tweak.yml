@@ -30,9 +30,17 @@ on:
 permissions:
   contents: write
 
+# macOS 免费并发额度小、排队慢：连续导入只保留最新一次构建，
+# 旧的排上队也直接取消，不占额度
+concurrency:
+  group: build-tweak-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: macos-14
+    # 排队等待加上 360 默认太宽，显式 90 分钟封顶防 runner 卡死
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
