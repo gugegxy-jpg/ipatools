@@ -124,7 +124,7 @@ frameworks_for_source() {
       local pre="$HERE/anyvpn/prebuilt"
       printf '%s\n' -I"$HERE" -I"$pre/include" \
         "$pre/lib/libopenconnect.a" "$pre/lib/libssl.a" \
-        "$pre/lib/libcrypto.a" "$pre/lib/libxml2.a" "$pre/lib/liblwip.a" -lz
+        "$pre/lib/libcrypto.a" "$pre/lib/libxml2.a" "$pre/lib/liblwip.a" -lz -liconv
       ;;
   esac
 }
