@@ -98,11 +98,12 @@ pushd openconnect
   # 注意：续行（\）中间不能插注释行——拼接后 # 会把后面所有参数吞成注释。
   # openconnect 的 configure 只在 DIR 下直接找 libssl.a/libcrypto.a（不查
   # DIR/lib/），所以 --with-openssl 指到 lib 目录；头文件走 CFLAGS 的 -I。
+  # darwin host 会让 configure 强启用 PCSC(Yubikey)，但 iOS SDK 没有该框架。
   PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" \
   ./configure --host="$TRIPLE" --prefix="$PREFIX" \
       --with-openssl="$PREFIX/lib" \
       --without-gnutls --without-libpskc --without-stoken \
-      --without-liboath --without-lz4 \
+      --without-liboath --without-lz4 --without-libpcsclite \
       --enable-static --disable-shared \
       --with-vpnc-script=/etc/vpnc/vpnc-script \
       --disable-nls \
