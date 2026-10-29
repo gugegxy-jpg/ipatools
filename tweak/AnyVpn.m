@@ -923,14 +923,14 @@ static void cb_protect_socket(void *privdata, int fd) {
         [rows addObject:@{IPATRowKey: IPATKeyAnyVpnDelTotp, IPATRowTitle: @"－ 删除最后一个 TOTP 密钥",
                           IPATRowKind: IPATRowKindAction}];
     }
-    [rows addObject:@{IPATRowKey: IPATKeyAnyVpnAuto,   IPATRowTitle: @"注入后自动连接", IPATRowKind: IPATRowKindSwitch, IPATRowValue: @(self.autoConnect)}];
-    [rows addObject:@{IPATRowKey: IPATKeyAnyVpnNoDTLS, IPATRowTitle: @"禁用 DTLS",   IPATRowKind: IPATRowKindSwitch, IPATRowValue: @(self.noDTLS)}];
+    // 「注入后自动连接」「禁用 DTLS」子开关已从面板移除（内部保持默认行为）：
+    // 主开关即连接/断开，状态随连接结果自动回落
 
     NSString *detail;
     if (profs.count == 0) {
         detail = @"AnyConnect 协议：先点「＋ 添加连接」配置服务器和账号，然后打开顶部开关连接";
     } else {
-        detail = @"选中连接后打开顶部开关连接；行内可直接改服务器/账号/密码";
+        detail = @"选中连接后打开顶部开关连接；连接失败开关会自动弹回";
     }
 
     NSDictionary *reg = @{
@@ -1381,6 +1381,13 @@ static void cb_protect_socket(void *privdata, int fd) {
         g_vpninfo = NULL;
     }
     g_cmd_fd = -1;
+    // 主开关状态随连接结果回落：连接失败/被服务端断开时，面板上的开关
+    // 不能还停在 ON（那会骗人以为还连着）。切换连接的挂起重连除外——
+    // 那种场景马上要重新连上，开关保持 ON 是对的
+    if (self.masterOn && !self.pendingReconnect) {
+        self.masterOn = NO;
+        [[NSUserDefaults standardUserDefaults] setBool:NO forKey:IPATKeyAnyVpnEnabled];
+    }
     [self registerPanel];   // 刷新主开关状态显示
     // 切换连接时挂起的重连意图：旧隧道拆干净了，接上新连接
     if (self.pendingReconnect) {
