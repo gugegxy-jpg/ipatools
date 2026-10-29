@@ -166,17 +166,16 @@ static err_t t2s_output(struct netif *nif, struct pbuf *p, const ip4_addr_t *ipa
         memcpy(linear + total, q->payload, q->len);
         total += q->len;
     }
-    size_t off = 0;
-    while (off < total) {
-        ssize_t n = write(g_ocFd, linear + off, total - off);
-        if (n > 0) { off += (size_t)n; continue; }
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            // openconnect 暂时写不动：丢包，靠 lwIP TCP 重传兜底
-            return ERR_OK;
-        }
-        return ERR_IF;
+    // g_ocFd 是 SOCK_SEQPACKET：一次 write 必须是完整一个 IP 包（openconnect
+    // 按包边界 read）。不存在部分写——缓冲满（EAGAIN/ENOBUFS）就整包丢弃，
+    // 靠 lwIP TCP 重传兜底；UDP 丢了就丢了
+    ssize_t n = write(g_ocFd, linear, total);
+    if (n == (ssize_t)total) return ERR_OK;
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS ||
+                  errno == EINTR)) {
+        return ERR_OK;
     }
-    return ERR_OK;
+    return ERR_IF;
 }
 
 static err_t t2s_netif_init(struct netif *nif) {
@@ -190,16 +189,19 @@ static err_t t2s_netif_init(struct netif *nif) {
 
 static void t2s_feed_lwip(void) {
     static uint8_t pkt[65535];
+    // g_ocFd 是 SOCK_SEQPACKET：每次 read 恰好取出一个完整 IP 包（不会粘包/
+    // 残包），drain 到 EAGAIN 为止
     for (;;) {
         ssize_t n = read(g_ocFd, pkt, sizeof pkt);
-        if (n <= 0) {
-            return;   // 无数据（非阻塞）或对端关闭
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return;   // EAGAIN：无更多数据；对端关闭同样退出
         }
+        if (n == 0) return;
         struct pbuf *p = pbuf_alloc(PBUF_RAW, (u16_t)n, PBUF_RAM);
         if (!p) continue;
         pbuf_take(p, pkt, (u16_t)n);
         if (g_nif.input) g_nif.input(p, &g_nif);
-        if ((size_t)n < sizeof pkt) break;
     }
 }
 

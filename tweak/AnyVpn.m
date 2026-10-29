@@ -1256,8 +1256,11 @@ static void cb_protect_socket(void *privdata, int fd) {
             }
         } else {
             int sp[2];
-            if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) {
-                [self fail:@"socketpair 创建失败"];
+            // 必须用 SEQPACKET：openconnect 的 tun 读是按包边界的（一次 read =
+            // 一个完整 IP 包）。SOCK_STREAM 是字节流会粘包，openconnect 读出
+            // 畸形包 → 服务端解析失败断 CSTP → 表现为几秒一断的连接循环
+            if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sp) != 0) {
+                [self fail:@"socketpair 创建失败（SEQPACKET）"];
                 return;
             }
             if (openconnect_setup_tun_fd(g_vpninfo, sp[0]) != 0) {
