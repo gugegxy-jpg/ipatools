@@ -281,6 +281,9 @@ static int cb_auth_form(void *privdata, struct oc_auth_form *form) {
             g_cfgUser.length) val = g_cfgUser;
         else if ([name rangeOfString:@"pass" options:NSCaseInsensitiveSearch].length &&
                  g_cfgPass.length) val = g_cfgPass;
+        else if (o->value && o->value[0]) {
+            // 已有值：TOTP 模式下库会把动态码自动填进 secondary auth 字段
+        }
         else if (o->type == OC_FORM_OPT_TEXT || o->type == OC_FORM_OPT_PASSWORD) {
             // v9.12 没有 OC_FORM_OPT_NONBLANK 宏了（旧版 API），
             // 文本/密码类型的表单项就当作可能必填
@@ -430,7 +433,7 @@ static void cb_protect_socket(void *privdata, int fd) {
     if (sep.location == NSNotFound || sep.location == 0) return;
     NSString *pid = [rest substringToIndex:sep.location];
     NSString *field = [rest substringFromIndex:NSMaxRange(sep)];
-    if (![@[ @"name", @"server", @"user", @"password", @"authgroup" ] containsObject:field]) return;
+    if (![@[ @"name", @"server", @"user", @"password", @"authgroup", @"totp" ] containsObject:field]) return;
 
     NSMutableArray<NSDictionary *> *profs = [[self profiles] mutableCopy];
     NSMutableArray *out = [NSMutableArray array];
@@ -496,6 +499,11 @@ static void cb_protect_socket(void *privdata, int fd) {
         tf.placeholder = @"密码（可留空稍后填）";
         tf.secureTextEntry = YES;
     }];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"TOTP 密钥（可选，Base32）";
+        tf.autocorrectionType = UITextAutocorrectionTypeNo;
+        tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    }];
     [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     [alert addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *a) {
@@ -510,6 +518,7 @@ static void cb_protect_socket(void *privdata, int fd) {
         p[@"server"] = server;
         p[@"user"] = alert.textFields[2].text ?: @"";
         p[@"password"] = alert.textFields[3].text ?: @"";
+        p[@"totp"] = alert.textFields[4].text ?: @"";
         p[@"authgroup"] = @"";
         NSMutableArray *profs = [[self profiles] mutableCopy];
         [profs addObject:p];
@@ -578,6 +587,10 @@ static void cb_protect_socket(void *privdata, int fd) {
             [rows addObject:@{IPATRowKey: [NSString stringWithFormat:@"IPATAnyVpnProf:%@:authgroup", pid],
                               IPATRowTitle: [NSString stringWithFormat:@"[%@] 认证组", title],
                               IPATRowKind: IPATRowKindText, IPATRowValue: p[@"authgroup"] ?: @""}];
+            [rows addObject:@{IPATRowKey: [NSString stringWithFormat:@"IPATAnyVpnProf:%@:totp", pid],
+                              IPATRowTitle: [NSString stringWithFormat:@"[%@] TOTP 密钥", title],
+                              IPATRowKind: IPATRowKindText, IPATRowValue: p[@"totp"] ?: @"",
+                              IPATRowNote: @"Base32 密钥（Google Authenticator 那串）；网关要动态码时填"}];
         }
         [rows addObject:@{IPATRowKey: IPATKeyAnyVpnDelProfile, IPATRowTitle: @"删除当前连接",
                           IPATRowKind: IPATRowKindAction}];
@@ -739,6 +752,15 @@ static void cb_protect_socket(void *privdata, int fd) {
             return;
         }
         openconnect_set_protocol(g_vpninfo, "anyconnect");
+        // TOTP 动态码：profile 里存了 Base32 密钥就启用（库内置 OATH 实现），
+        // 网关弹 secondary auth 时 openconnect 自动生成并填入
+        NSString *totp = [self activeProfile][@"totp"];
+        if (totp.length) {
+            int tm = openconnect_set_token_mode(g_vpninfo, OC_TOKEN_MODE_TOTP,
+                                                (char *)totp.UTF8String);
+            IPATAppendLogLine([NSString stringWithFormat:@"[anyvpn] TOTP %s",
+                               tm == 0 ? "已启用" : "启用失败（密钥格式或库支持问题）"]);
+        }
         NSString *ver = [self plist:@"VersionString" default:@"5.0.05042"];
         if (ver.length) openconnect_set_version_string(g_vpninfo, ver.UTF8String);
         NSString *ros = [self plist:@"ReportedOS" default:@"iOS"];

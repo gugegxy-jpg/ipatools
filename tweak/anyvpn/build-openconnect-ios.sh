@@ -103,7 +103,7 @@ pushd openconnect
   ./configure --host="$TRIPLE" --prefix="$PREFIX" \
       --with-openssl="$PREFIX/lib" \
       --without-gnutls --without-libpskc --without-stoken \
-      --without-liboath --without-lz4 --without-libpcsclite \
+      --without-lz4 --without-libpcsclite \
       --enable-static --disable-shared \
       --with-vpnc-script=/etc/vpnc/vpnc-script \
       --disable-nls \
