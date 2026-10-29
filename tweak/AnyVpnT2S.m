@@ -29,6 +29,7 @@
 #import <sys/socket.h>
 #import <netinet/in.h>
 #import <arpa/inet.h>
+#import <netdb.h>   // getaddrinfo / struct addrinfo（劫持 DNS 用）
 #import <fcntl.h>
 #import <unistd.h>
 #import <dlfcn.h>
