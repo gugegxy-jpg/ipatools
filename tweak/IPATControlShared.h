@@ -19,6 +19,9 @@
 
 #include <math.h>
 #import <Foundation/Foundation.h>
+// 下面的取 keyWindow 辅助用了 UIWindow/UIScene；AnyVpnT2S 等底层
+// 编译单元自己没导 UIKit，必须在这里补上，否则 unknown type name
+#import <UIKit/UIKit.h>
 
 #pragma mark - 日志
 

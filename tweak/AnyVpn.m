@@ -33,9 +33,39 @@
 
 #import <sys/socket.h>
 #import <sys/ioctl.h>
+// iPhoneOS SDK 不带 sys/kern_control.h（macOS 才有），按 xnu 固定 ABI 自备；
+// 若哪天 SDK 带了则优先用系统的
+#if __has_include(<sys/kern_control.h>)
 #import <sys/kern_control.h>
+#else
+#define MAX_KCTL_NAME 96
+struct ctl_info {
+    u_int32_t ctl_id;                     /* 控制器内核分配的 id */
+    char      ctl_name[MAX_KCTL_NAME];
+};
+struct sockaddr_ctl {
+    u_char    sc_len;                     /* sizeof(struct sockaddr_ctl) */
+    u_char    sc_family;                  /* AF_SYSTEM */
+    u_int16_t ss_sysaddr;                 /* AF_SYS_CONTROL */
+    u_int32_t sc_id;                      /* 控制器 id（CTLIOCGINFO 查得） */
+    u_int32_t sc_unit;                    /* 0 = 内核自动分配 */
+    u_int32_t sc_reserved[5];
+};
+#ifndef CTLIOCGINFO
+#define CTLIOCGINFO _IOWR('N', 3, struct ctl_info)  /* 由名字查 id */
+#endif
+#endif
 #import <net/if.h>
+// net/if_utun.h 同样只有 macOS SDK 有
+#if __has_include(<net/if_utun.h>)
 #import <net/if_utun.h>
+#else
+#define UTUN_CONTROL_NAME       "com.apple.net.utun_control"
+#define UTUN_FLAGS              0
+#define UTUN_CTRL_FLAGS         0
+#define UTUN_UNIT_NAME          "utun"
+#define UTUN_UNIT_NUMBER_OFFSET 9
+#endif
 #import <net/route.h>
 #import <netinet/in.h>
 #import <arpa/inet.h>
