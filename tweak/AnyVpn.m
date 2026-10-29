@@ -96,6 +96,7 @@ struct ortentry {
 #endif
 #import <netinet/in.h>
 #import <arpa/inet.h>
+#import <netdb.h>   // getaddrinfo（fake-IP 预检用）
 #import <unistd.h>
 #import <time.h>
 #import <ctype.h>
@@ -1047,7 +1048,7 @@ static void cb_protect_socket(void *privdata, int fd) {
         // 只取尾部 300 行，剪贴板塞几十 KB 足够排障且不卡 UI
         NSMutableArray<NSString *> *lines = [[text componentsSeparatedByString:@"\n"] mutableCopy];
         if (lines.count > 300)
-            lines = [[lines subarrayWithIndex:lines.count - 300] mutableCopy];
+            lines = [[lines subarrayWithRange:NSMakeRange(lines.count - 300, 300)] mutableCopy];
         NSString *out = [lines componentsJoinedByString:@"\n"];
         dispatch_async(dispatch_get_main_queue(), ^{
             [UIPasteboard generalPasteboard].string = out;
