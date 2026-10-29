@@ -175,6 +175,7 @@ static void IPATAppendLogLine(NSString *line) {
 #define IPATKeyAnyVpnTotp      @"IPAToolPanelAnyVpnTotp"     // TOTP 密钥表（账号级）：NSArray<NSDictionary>（user/secret），连接时按当前连接的账号取
 #define IPATKeyAnyVpnAddTotp   @"IPAToolPanelAnyVpnAddTotp"  // 动作行：添加 TOTP 密钥
 #define IPATKeyAnyVpnDelTotp   @"IPAToolPanelAnyVpnDelTotp"  // 动作行：删除最后一条 TOTP 密钥
+#define IPATKeyAnyVpnCopyLog   @"IPAToolPanelAnyVpnCopyLog"  // 动作行：复制连接日志到剪贴板
 
 #define IPATKeyButtonFrame @"IPAToolPanelButtonFrame"  // 悬浮按钮位置，NSStringFromCGRect
 

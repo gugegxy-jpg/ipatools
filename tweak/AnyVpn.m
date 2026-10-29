@@ -885,6 +885,9 @@ static void cb_protect_socket(void *privdata, int fd) {
     }
     [rows addObject:@{IPATRowKey: IPATKeyAnyVpnAddProfile, IPATRowTitle: @"＋ 添加连接",
                       IPATRowKind: IPATRowKindAction}];
+    [rows addObject:@{IPATRowKey: IPATKeyAnyVpnCopyLog, IPATRowTitle: @"⧉ 复制连接日志",
+                      IPATRowKind: IPATRowKindAction,
+                      IPATRowNote: @"排障用：复制最近 300 行日志，直接粘贴发送"}];
     // 连接/断开直接用面板顶部的「VPN 隧道」主开关（handleDidChange 里驱动），
     // 不再放「立即连接/断开」动作行——功能重复且把面板搞得很长
 
@@ -980,6 +983,8 @@ static void cb_protect_socket(void *privdata, int fd) {
         [self addTotpAction];
     } else if ([key isEqualToString:IPATKeyAnyVpnDelTotp]) {
         [self deleteLastTotpAction];
+    } else if ([key isEqualToString:IPATKeyAnyVpnCopyLog]) {
+        [self copyLogAction];
     }
     [self registerPanel];
 }
@@ -1029,6 +1034,27 @@ static void cb_protect_socket(void *privdata, int fd) {
     [self saveTotpEntries:entries];
     [self toast:[NSString stringWithFormat:@"已删除 %@ 的 TOTP 密钥", user]];
     [self registerPanel];
+}
+
+/// 复制连接日志尾部到剪贴板（排障用，同 Android 端日志导出）
+- (void)copyLogAction {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+        NSString *path = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                             NSUserDomainMask, YES).firstObject
+                          stringByAppendingPathComponent:@"ipatool.log"];
+        NSString *text = [NSString stringWithContentsOfFile:path
+                                                   encoding:NSUTF8StringEncoding error:nil];
+        // 只取尾部 300 行，剪贴板塞几十 KB 足够排障且不卡 UI
+        NSMutableArray<NSString *> *lines = [[text componentsSeparatedByString:@"\n"] mutableCopy];
+        if (lines.count > 300)
+            lines = [[lines subarrayWithIndex:lines.count - 300] mutableCopy];
+        NSString *out = [lines componentsJoinedByString:@"\n"];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [UIPasteboard generalPasteboard].string = out;
+            [self toast:[NSString stringWithFormat:@"已复制 %lu 行日志到剪贴板",
+                         (unsigned long)lines.count]];
+        });
+    });
 }
 
 /// 屏幕上弹一条几秒消失的提示（面板端渲染）；可能从后台线程调用，跳主线程
@@ -1112,6 +1138,34 @@ static void cb_protect_socket(void *privdata, int fd) {
         NSRange colon = [host rangeOfString:@":"];
         if (colon.location != NSNotFound) host = [host substringToIndex:colon.location];
         g_certKey = [NSString stringWithFormat:@"IPATAnyVpnCertHash_%@", host];
+
+        // DNS 预检：198.18.0.0/15 是 Surge/小火箭/Clash 等 fake-ip 模式的保留网段。
+        // 域名解析成这个段说明被设备上的代理软件劫持了，直连假 IP 必然超时，
+        // 最后只会得到一个误导性的"认证失败"——在这里就明确报出来
+        struct addrinfo fakeHints = {.ai_family = AF_INET};
+        struct addrinfo *fakeRes = NULL;
+        if (getaddrinfo(host.UTF8String, NULL, &fakeHints, &fakeRes) == 0 && fakeRes) {
+            BOOL fakeIp = NO;
+            char ipbuf[INET_ADDRSTRLEN] = {0};
+            for (struct addrinfo *ai = fakeRes; ai; ai = ai->ai_next) {
+                if (ai->ai_family != AF_INET || !ai->ai_addr) continue;
+                uint32_t be = ((struct sockaddr_in *)ai->ai_addr)->sin_addr.s_addr;
+                uint32_t iph = ntohl(be);
+                if ((iph & 0xFFFE0000u) == 0xC6120000u) {   // 198.18.0.0/15
+                    fakeIp = YES;
+                    struct sockaddr_in *sa = (struct sockaddr_in *)ai->ai_addr;
+                    inet_ntop(AF_INET, &sa->sin_addr, ipbuf, sizeof ipbuf);
+                    break;
+                }
+            }
+            freeaddrinfo(fakeRes);
+            if (fakeIp) {
+                [self fail:[NSString stringWithFormat:
+                    @"域名解析到了代理软件的 fake-IP（%@）——请关闭 Surge/小火箭等代理，"
+                    "或把该域名设为直连", [NSString stringWithUTF8String:ipbuf]]];
+                return;
+            }
+        }
 
         if (openconnect_init_ssl() != 0) {
             [self fail:@"SSL 初始化失败"];
