@@ -118,12 +118,15 @@ static NSString *const kSoloXChartJS =
 
     // 初始状态：先看 NSUserDefaults（面板写过的），再看 Info.plist，都没有就默认全开
     _masterOn = [self boolForKey:IPATKeySoloXEnabled plistSub:@"Enabled" dflt:NO];
-    _showCPU = [self boolForKey:IPATKeySoloXCPU dflt:YES];
-    _showMEM = [self boolForKey:IPATKeySoloXMEM dflt:YES];
-    _showNET = [self boolForKey:IPATKeySoloXNET dflt:YES];
-    _showFPS = [self boolForKey:IPATKeySoloXFPS dflt:YES];
-    _showBAT = [self boolForKey:IPATKeySoloXBAT dflt:YES];
-    _showTEMP = [self boolForKey:IPATKeySoloXTEMP dflt:YES];
+    // 子项开关已从面板移除（只留总开关），全部恒开；
+    // 清掉历史版本可能存下的 NO，避免某项被旧数据藏掉
+    _showCPU = _showMEM = _showNET = _showFPS = _showBAT = _showTEMP = YES;
+    [[NSUserDefaults standardUserDefaults] removeObjectForKey:IPATKeySoloXCPU];
+    [[NSUserDefaults standardUserDefaults] removeObjectForKey:IPATKeySoloXMEM];
+    [[NSUserDefaults standardUserDefaults] removeObjectForKey:IPATKeySoloXNET];
+    [[NSUserDefaults standardUserDefaults] removeObjectForKey:IPATKeySoloXFPS];
+    [[NSUserDefaults standardUserDefaults] removeObjectForKey:IPATKeySoloXBAT];
+    [[NSUserDefaults standardUserDefaults] removeObjectForKey:IPATKeySoloXTEMP];
 
     [self buildWindow];
     [self registerPanel];
@@ -297,12 +300,7 @@ static NSString *const kSoloXChartJS =
         IPATRegMasterKey: IPATKeySoloXEnabled,
         IPATRegEnabled: @(_masterOn),
         IPATRegRows: @[
-            @{IPATRowKey: IPATKeySoloXCPU,  IPATRowTitle: @"CPU",  IPATRowKind: IPATRowKindSwitch, IPATRowValue: @(_showCPU)},
-            @{IPATRowKey: IPATKeySoloXMEM,  IPATRowTitle: @"内存", IPATRowKind: IPATRowKindSwitch, IPATRowValue: @(_showMEM)},
-            @{IPATRowKey: IPATKeySoloXNET,  IPATRowTitle: @"网络", IPATRowKind: IPATRowKindSwitch, IPATRowValue: @(_showNET)},
-            @{IPATRowKey: IPATKeySoloXFPS,  IPATRowTitle: @"FPS",  IPATRowKind: IPATRowKindSwitch, IPATRowValue: @(_showFPS)},
-            @{IPATRowKey: IPATKeySoloXBAT,  IPATRowTitle: @"电量", IPATRowKind: IPATRowKindSwitch, IPATRowValue: @(_showBAT)},
-            @{IPATRowKey: IPATKeySoloXTEMP, IPATRowTitle: @"温度", IPATRowKind: IPATRowKindSwitch, IPATRowValue: @(_showTEMP)},
+            // CPU/内存/网络/FPS/电量/温度子开关已简化掉：恒开
             @{IPATRowKey: IPATKeySoloXExport, IPATRowTitle: @"导出报告", IPATRowKind: IPATRowKindAction},
         ],
     };
@@ -334,15 +332,8 @@ static NSString *const kSoloXChartJS =
     if (![note.userInfo[IPATChgId] isEqualToString:IPATFeatureSoloX]) return;
     NSNumber *en = note.userInfo[IPATChgEnabled];
     if (en) _masterOn = en.boolValue;
-    NSDictionary *vals = note.userInfo[IPATChgValues];
-    if ([vals isKindOfClass:[NSDictionary class]]) {
-        if (vals[IPATKeySoloXCPU])  _showCPU  = [vals[IPATKeySoloXCPU]  boolValue];
-        if (vals[IPATKeySoloXMEM])  _showMEM  = [vals[IPATKeySoloXMEM]  boolValue];
-        if (vals[IPATKeySoloXNET])  _showNET  = [vals[IPATKeySoloXNET]  boolValue];
-        if (vals[IPATKeySoloXFPS])  _showFPS  = [vals[IPATKeySoloXFPS]  boolValue];
-        if (vals[IPATKeySoloXBAT])  _showBAT  = [vals[IPATKeySoloXBAT]  boolValue];
-        if (vals[IPATKeySoloXTEMP]) _showTEMP = [vals[IPATKeySoloXTEMP] boolValue];
-    }
+    // 子项开关已移除，全部恒开，不再读面板值
+    _showCPU = _showMEM = _showNET = _showFPS = _showBAT = _showTEMP = YES;
     [self applyVisibility];
 }
 
