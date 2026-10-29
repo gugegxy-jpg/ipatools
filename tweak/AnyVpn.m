@@ -222,6 +222,7 @@ static NSString *g_certKey = nil;     // TOFU 指纹存 NSUserDefaults 用的键
 static long  g_otpWindow = -1;          // 上次生成码的时间窗（30s）
 static char  g_lastOtp[8] = {0};
 static int   g_otpRejects = 0;          // 动态码连续被拒次数
+static BOOL  g_usedOtpThisAttempt = NO; // 本轮尝试里动态码是否已被使用过
 static BOOL  g_staticPasswordSubmitted = NO;  // 固定密码是否已交（跨表单记忆）
 #define MAX_OTP_REJECTS 3
 
@@ -258,13 +259,29 @@ static void totp_generate(const char *secret, long counter, char out[8]) {
     snprintf(out, 8, "%06u", bin % 1000000);
 }
 
-// 动态码生成入口：同窗口内复用上次生成的码（重试同一张表单时不能换码）
-static const char *otp_value(void) {
+// 动态码生成入口（对齐 Android 端 AuthSession.otp()）：
+//  - 同窗口内已有码且本轮刚被拒（hadError）→ sleep 到下一窗口再生成新码，
+//    避免把失效/重复的动态码连续提交触发账号锁定；
+//  - 同窗口但没报错（同一次尝试里的后续复用）→ 直接复用上次生成的码；
+//  - 跨窗口 → 生成新码
+static const char *otp_value(BOOL hadError) {
+    if (!g_totpSecret.length) return "";
     long win = (long)(time(NULL) / 30);
-    if (win != g_otpWindow) {
-        totp_generate(g_totpSecret.UTF8String ?: "", win, g_lastOtp);
-        g_otpWindow = win;
+    if (g_lastOtp[0] && win == g_otpWindow) {
+        if (hadError || g_usedOtpThisAttempt) {
+            long remain = 30 - (long)(time(NULL) % 30) + 1;
+            IPATAppendLogLine([NSString stringWithFormat:
+                @"[anyvpn] 动态码仍在当前窗口，等待 %lds 换新码", remain]);
+            sleep((int)remain);
+            win = (long)(time(NULL) / 30);
+        } else {
+            g_usedOtpThisAttempt = YES;
+            return g_lastOtp;
+        }
     }
+    totp_generate(g_totpSecret.UTF8String ?: "", win, g_lastOtp);
+    g_otpWindow = win;
+    g_usedOtpThisAttempt = YES;
     return g_lastOtp;
 }
 
@@ -345,17 +362,16 @@ static int cb_validate_peer_cert(void *privdata, const char *reason) {
 // 三段式「账号 -> 动态码 -> 密码」，动态码字段用 message/字段名判别、当场生成，
 // 被拒同窗口不换码、连续被拒到上限停止（防账号锁定）
 static int cb_auth_form(void *privdata, struct oc_auth_form *form) {
-    if (form->message && form->message[0])
-        IPATAppendLogLine([NSString stringWithFormat:@"[anyvpn] 表单：%s", form->message]);
+    const char *message = form->message ?: "";
+    const char *errtext = form->error ?: "";
+    if (message[0])
+        IPATAppendLogLine([NSString stringWithFormat:@"[anyvpn] 表单：%s", message]);
 
-    // 网关报错是针对上一轮提交的：之前交过动态码的话记一次拒绝
-    if (form->error && form->error[0] && g_otpWindow >= 0) g_otpRejects++;
-
-    // 预扫描：有没有 TOKEN 字段、用户名字段（用户名再现 = 整个认证重来，密码进度清零）
+    // 预扫描：TOKEN 字段、密码字段数、用户名字段（用户名再现 = 整个认证重来）
     BOOL tokenFieldExists = NO;
     int passwordCount = 0;
     BOOL usernameAgain = NO;
-    BOOL askingOtp = otp_prompt_match(form->message);
+    BOOL askingOtp = otp_prompt_match(message);
     for (struct oc_form_opt *o = form->opts; o; o = o->next) {
         if (!o->name) continue;
         if (o->type == OC_FORM_OPT_TOKEN) tokenFieldExists = YES;
@@ -367,7 +383,9 @@ static int cb_auth_form(void *privdata, struct oc_auth_form *form) {
 
     // 网关要验证码但没配密钥：不能拿固定密码冒充（必被拒还会触发账号锁定）
     if (askingOtp && !g_totpSecret.length) {
-        anyvpn_status_notify(@"网关要求动态验证码，但本连接未配置 TOTP 密钥 —— 请在悬浮窗里补上");
+        anyvpn_status_notify([NSString stringWithFormat:
+            @"网关要求验证码，但账号 \"%@\" 未配置 TOTP 密钥 —— 请在悬浮窗「TOTP 密钥」里补上",
+            g_cfgUser ?: @""]);
         return OC_FORM_RESULT_CANCELLED;
     }
     if (g_otpRejects >= MAX_OTP_REJECTS) {
@@ -376,10 +394,15 @@ static int cb_auth_form(void *privdata, struct oc_auth_form *form) {
         return OC_FORM_RESULT_CANCELLED;
     }
 
-    BOOL allKnown = YES;
+    // 本张表单报的 error 是针对上一轮提交的结果；本轮刚生成的码还没发出去，
+    // 不能被算作"被拒"——所以 here 先记住"之前生成过码"，末尾再据此累计拒绝数
+    BOOL hadOtpBefore = (g_lastOtp[0] != 0);
+
     int passwordIndex = 0;
+    int filled = 0;          // 实际填上的字段数（对齐 Android 端 filled）
+    BOOL authgroupFilled = NO;
     for (struct oc_form_opt *o = form->opts; o; o = o->next) {
-        if (o->type == OC_FORM_OPT_HIDDEN || !o->name) continue;
+        if (o->type == OC_FORM_OPT_HIDDEN || !o->name) continue;  // 隐藏字段交由库处理
         NSString *name = [NSString stringWithUTF8String:o->name];
         if (o->type == OC_FORM_OPT_SELECT) {
             struct oc_form_opt_select *sel = (struct oc_form_opt_select *)o;
@@ -399,12 +422,15 @@ static int cb_auth_form(void *privdata, struct oc_auth_form *form) {
             if (o == (struct oc_form_opt *)form->authgroup_opt) {
                 // 认证组是专用字段，走 authgroup_selection
                 form->authgroup_selection = pick >= 0 ? pick : 0;
+                authgroupFilled = YES;
                 continue;
             }
             // 普通下拉：按组名匹配，没配或没匹配上就选第一个
             int use = pick >= 0 ? pick : 0;
-            if (use < sel->nr_choices && sel->choices[use]->name)
+            if (use < sel->nr_choices && sel->choices[use]->name) {
                 openconnect_set_option_value(o, sel->choices[use]->name);
+                filled++;
+            }
             continue;
         }
         NSString *val = nil;
@@ -412,35 +438,50 @@ static int cb_auth_form(void *privdata, struct oc_auth_form *form) {
             val = g_cfgUser;
         } else if (o->type == OC_FORM_OPT_TOKEN) {
             // Cisco 专用一次性口令字段：直接填动态码
-            val = @(otp_value());
-        } else if (o->type == OC_FORM_OPT_PASSWORD || o->type == OC_FORM_OPT_TEXT) {
-            // 密码类字段判定：同一张表单多个密码字段按位置分（先固定密码后动态码）；
-            // 提示语在要动态码 → 这张填码；固定密码已交过 → 这张是验证码段
+            val = @(otp_value(errtext[0] != 0));
+        } else if (o->type == OC_FORM_OPT_PASSWORD) {
+            // 密码字段判定（对齐 Android 端 isOtp 的 when 顺序）：
+            // 有 TOKEN 字段 → 密码；同表单多密码字段按位置分（先密码后动态码）；
+            // 提示语在要动态码 → 填码；固定密码已交过 → 这张是验证码段
+            int idx = passwordIndex++;
             BOOL isOtp;
             if (tokenFieldExists) isOtp = NO;
-            else if (passwordCount >= 2) isOtp = (passwordIndex != 0);
+            else if (!g_totpSecret.length) isOtp = NO;
+            else if (passwordCount >= 2) isOtp = (idx != 0);
             else if (askingOtp) isOtp = YES;
             else if (g_staticPasswordSubmitted) isOtp = YES;
             else isOtp = NO;
-            passwordIndex++;
-            if (isOtp && g_totpSecret.length) {
-                val = @(otp_value());
+            if (isOtp) {
+                val = @(otp_value(errtext[0] != 0));
                 IPATAppendLogLine([NSString stringWithFormat:@"[anyvpn] 动态码填入字段 %@", name]);
-            } else if (o->type == OC_FORM_OPT_PASSWORD && g_cfgPass.length) {
+            } else if (g_cfgPass.length) {
                 val = g_cfgPass;
-                g_staticPasswordSubmitted = YES;   // 交出固定密码，记住进度
-            } else if (o->type == OC_FORM_OPT_TEXT) {
-                // 未知文本字段：识别不了，按必填处理取消（与旧逻辑一致）
-                allKnown = NO;
             }
-        } else if (o->type == OC_FORM_OPT_TEXT || o->type == OC_FORM_OPT_PASSWORD) {
-            allKnown = NO;
         }
-        if (val) openconnect_set_option_value(o, val.UTF8String);
+        // TEXT：用户名之外的其他文本字段一律跳过（对齐 Android 端 else -> null），
+        // 不取消——填不上就提交空值让网关给出提示
+        if (val) {
+            openconnect_set_option_value(o, val.UTF8String);
+            filled++;
+        }
     }
-    if (!allKnown) {
-        IPATAppendLogLine(@"[anyvpn] 表单含无法自动回填的必填项，取消");
-        return OC_FORM_RESULT_CANCELLED;
+    // 交出固定密码（且该字段不是动态码字段）→ 记住进度
+    // （上面的实现里只有非 OTP 的密码分支会置位，语义与 Android 端一致）
+
+    // 网关报错且上一轮生成过动态码 → 记一次拒绝
+    if (errtext[0] && hadOtpBefore) g_otpRejects++;
+
+    // 一张表单都没填上：字段结构超出预期时取消，避免 openconnect 反复重放同一张表单
+    if (filled == 0 && !authgroupFilled) {
+        if (!message[0] && !errtext[0]) {
+            anyvpn_status_notify(@"表单无提示信息且未识别出可填字段，停止连接");
+            return OC_FORM_RESULT_CANCELLED;
+        }
+        if (passwordCount == 0 && !tokenFieldExists) {
+            anyvpn_status_notify(@"表单未识别出可填字段（无密码/验证码项），停止连接");
+            return OC_FORM_RESULT_CANCELLED;
+        }
+        // 有 message/error 提示且有密码类字段：提交空值，让网关给出具体错误
     }
     return OC_FORM_RESULT_OK;
 }
@@ -584,13 +625,19 @@ static void cb_protect_socket(void *privdata, int fd) {
     [[NSUserDefaults standardUserDefaults] setObject:entries forKey:IPATKeyAnyVpnTotp];
 }
 
-/// 连接账号对应的 TOTP 密钥（大小写不敏感）；找不到返回 nil
+/// 连接账号对应的 TOTP 密钥（对齐 Android 端 TotpVault.normalize：trim + 忽略大小写）
 - (NSString *)totpSecretForUser:(NSString *)user {
-    if (!user.length) return nil;
+    NSString *key = [user stringByTrimmingCharactersInSet:
+        [NSCharacterSet whitespaceAndNewlineCharacterSet]].lowercaseString;
+    if (key.length == 0) return nil;
     for (NSDictionary *e in [self totpEntries]) {
         if (![e isKindOfClass:[NSDictionary class]]) continue;
-        NSString *u = e[@"user"];
-        if ([u caseInsensitiveCompare:user] == NSOrderedSame) return e[@"secret"];
+        NSString *u = [e[@"user"] stringByTrimmingCharactersInSet:
+            [NSCharacterSet whitespaceAndNewlineCharacterSet]].lowercaseString;
+        if ([u isEqualToString:key]) {
+            return [e[@"secret"] stringByTrimmingCharactersInSet:
+                [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        }
     }
     return nil;
 }
@@ -911,8 +958,10 @@ static void cb_protect_socket(void *privdata, int fd) {
     [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     [alert addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *a) {
-        NSString *user = alert.textFields[0].text ?: @"";
-        NSString *secret = alert.textFields[1].text ?: @"";
+        NSString *user = [alert.textFields[0].text stringByTrimmingCharactersInSet:
+            [NSCharacterSet whitespaceAndNewlineCharacterSet]] ?: @"";
+        NSString *secret = [alert.textFields[1].text stringByTrimmingCharactersInSet:
+            [NSCharacterSet whitespaceAndNewlineCharacterSet]] ?: @"";
         if (user.length == 0 || secret.length == 0) {
             [self toast:@"账号和密钥都要填"];
             return;
@@ -987,6 +1036,7 @@ static void cb_protect_socket(void *privdata, int fd) {
     g_otpWindow = -1;
     g_lastOtp[0] = 0;
     g_otpRejects = 0;
+    g_usedOtpThisAttempt = NO;
     g_staticPasswordSubmitted = NO;
     self.running = YES;
     [self status:@"连接中…"];
