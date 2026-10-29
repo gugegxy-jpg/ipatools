@@ -54,6 +54,10 @@ struct sockaddr_ctl {
 #ifndef CTLIOCGINFO
 #define CTLIOCGINFO _IOWR('N', 3, struct ctl_info)  /* 由名字查 id */
 #endif
+/* AF_SYSTEM 域的 control 协议号（iOS 的 sys/socket.h 不带；xnu 固定为 2） */
+#ifndef SYSPROTO_CONTROL
+#define SYSPROTO_CONTROL 2
+#endif
 #endif
 #import <net/if.h>
 // net/if_utun.h 同样只有 macOS SDK 有
@@ -171,8 +175,8 @@ static int route_add(int s, const char *dest, const char *gw) {
     ro.rt_dst = *(struct sockaddr *)&sin;
     if (!make_sin(&sin, gw)) return -1;
     ro.rt_gateway = *(struct sockaddr *)&sin;
-    if (!make_sin(&sin, dest ? "255.255.255.255" : "128.0.0.0")) return -1;
-    ro.rt_genmask = *(struct sockaddr *)&sin;
+    // BSD ortentry 没有 genmask 字段（部分掩码路由需 PF_ROUTE 消息接口，
+    // 老式 ioctl 只支持 host/默认路由；dest 为空即默认路由 0.0.0.0）
     return ioctl(s, SIOCADDRT, &ro) == 0 ? 0 : -1;
 }
 
@@ -185,8 +189,6 @@ static int route_del(int s, const char *dest, const char *gw) {
     ro.rt_dst = *(struct sockaddr *)&sin;
     if (!make_sin(&sin, gw)) return -1;
     ro.rt_gateway = *(struct sockaddr *)&sin;
-    if (!make_sin(&sin, dest ? "255.255.255.255" : "128.0.0.0")) return -1;
-    ro.rt_genmask = *(struct sockaddr *)&sin;
     return ioctl(s, SIOCDELRT, &ro) == 0 ? 0 : -1;
 }
 
@@ -279,7 +281,9 @@ static int cb_auth_form(void *privdata, struct oc_auth_form *form) {
             g_cfgUser.length) val = g_cfgUser;
         else if ([name rangeOfString:@"pass" options:NSCaseInsensitiveSearch].length &&
                  g_cfgPass.length) val = g_cfgPass;
-        else if (o->flags & OC_FORM_OPT_NONBLANK) {
+        else if (o->type == OC_FORM_OPT_TEXT || o->type == OC_FORM_OPT_PASSWORD) {
+            // v9.12 没有 OC_FORM_OPT_NONBLANK 宏了（旧版 API），
+            // 文本/密码类型的表单项就当作可能必填
             allKnown = NO;
             IPATAppendLogLine([NSString stringWithFormat:
                 @"[anyvpn] 表单必填项 %@ 无法自动回填（请在 Info.plist 配置 User/Password）", name]);
