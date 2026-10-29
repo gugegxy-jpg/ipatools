@@ -122,6 +122,10 @@ else
       rm -f ./*.o
       # 用 tweak/ 下的 lwipopts.h / arch/cc.h / arch/perf.h（本脚本在 tweak/anyvpn/ 下）
       EXTRA_INC="-I$HERE/.."
+      # lwIP 的 udp_connect 与 openconnect ssl.c 的同名符号冲突（两者都要进
+      # 同一个 dylib），链接期 duplicate symbol。把 lwIP 的重命名（声明/定义/
+      # 调用方需一致：build.sh 的 AnyVpn flags 里也带同样的 -D）
+      EXTRA_INC="$EXTRA_INC -Dudp_connect=ipat_lwip_udp_connect"
       for f in ../src/core/*.c ../src/core/ipv4/*.c; do
         [ -e "$f" ] || continue
         $CC -c "$f" -I../src/include $EXTRA_INC -o "$(basename "${f%.c}").o" >>"$LOGF" 2>&1 \

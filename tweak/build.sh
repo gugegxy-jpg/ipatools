@@ -122,9 +122,12 @@ frameworks_for_source() {
     # -I$HERE 是给 lwipopts.h / arch/cc.h 用的（lwIP 要求它们在搜索路径上）
     AnyVpn)
       local pre="$HERE/anyvpn/prebuilt"
+      # -D 与 build-openconnect-ios.sh 的 lwIP 编译保持一致（lwIP 的
+      # udp_connect 与 openconnect ssl.c 的同名符号冲突）
       printf '%s\n' -I"$HERE" -I"$pre/include" \
         "$pre/lib/libopenconnect.a" "$pre/lib/libssl.a" \
-        "$pre/lib/libcrypto.a" "$pre/lib/libxml2.a" "$pre/lib/liblwip.a" -lz -liconv
+        "$pre/lib/libcrypto.a" "$pre/lib/libxml2.a" "$pre/lib/liblwip.a" \
+        -lz -liconv -Dudp_connect=ipat_lwip_udp_connect
       ;;
   esac
 }
