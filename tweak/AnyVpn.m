@@ -666,34 +666,6 @@ static void cb_protect_socket(void *privdata, int fd) {
     [self saveTotpEntries:entries];
 }
 
-/// 把单个 profile 字段的编辑（面板 text 行）写回 profiles 数组
-- (void)applyProfileFieldEdit:(NSString *)key value:(NSString *)value {
-    // 行键格式：IPATAnyVpnProf:<id>:<field>
-    NSString *prefix = @"IPATAnyVpnProf:";
-    if (![key hasPrefix:prefix]) return;
-    NSString *rest = [key substringFromIndex:prefix.length];
-    NSRange sep = [rest rangeOfString:@":"];
-    if (sep.location == NSNotFound || sep.location == 0) return;
-    NSString *pid = [rest substringToIndex:sep.location];
-    NSString *field = [rest substringFromIndex:NSMaxRange(sep)];
-    if (![@[ @"name", @"server", @"user", @"password", @"authgroup", @"totp" ] containsObject:field]) return;
-
-    NSMutableArray<NSDictionary *> *profs = [[self profiles] mutableCopy];
-    NSMutableArray *out = [NSMutableArray array];
-    for (NSDictionary *p in profs) {
-        if (![p isKindOfClass:[NSDictionary class]]) continue;
-        if ([p[@"id"] isEqualToString:pid]) {
-            NSMutableDictionary *np = [p mutableCopy];
-            np[field] = value;
-            if ([field isEqualToString:@"name"]) np[@"id"] = p[@"id"];  // id 不随名称变
-            [out addObject:np];
-        } else {
-            [out addObject:p];
-        }
-    }
-    [self saveProfiles:out];
-}
-
 #pragma mark 注册到游戏内悬浮窗
 
 /// 弹系统输入框前先让悬浮窗躲开（与文件功能的系统界面同一套路）
@@ -725,7 +697,7 @@ static void cb_protect_socket(void *privdata, int fd) {
 - (void)addProfileAction {
     UIAlertController *alert = [UIAlertController
         alertControllerWithTitle:@"添加连接"
-                         message:@"填服务器地址（账号/密码之后可在面板里改）"
+                         message:@"连接名称用于在面板里切换；服务器必填"
                   preferredStyle:UIAlertControllerStyleAlert];
     [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
         tf.placeholder = @"连接名称（如 公司 VPN）";
@@ -742,6 +714,9 @@ static void cb_protect_socket(void *privdata, int fd) {
         tf.placeholder = @"密码（可留空稍后填）";
         tf.secureTextEntry = YES;
     }];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"认证组（可留空 = 自动选第一个）";
+    }];
     [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     [alert addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *a) {
@@ -750,18 +725,104 @@ static void cb_protect_socket(void *privdata, int fd) {
             [self toast:@"服务器地址不能为空"];
             return;
         }
+        NSString *name = alert.textFields[0].text.length ? alert.textFields[0].text : server;
+        // 名称即标识（面板分段存的就是名称），重名会在编辑时互相覆盖，这里先挡掉
+        for (NSDictionary *q in [self profiles]) {
+            if ([q isKindOfClass:[NSDictionary class]] &&
+                [q[@"name"] caseInsensitiveCompare:name] == NSOrderedSame) {
+                [self toast:@"已存在同名连接"];
+                return;
+            }
+        }
         NSMutableDictionary *p = [NSMutableDictionary dictionary];
-        p[@"id"] = [[NSUUID UUID] UUIDString];
-        p[@"name"] = (alert.textFields[0].text.length ? alert.textFields[0].text : server);
+        p[@"id"] = name;   // 名称即标识
+        p[@"name"] = name;
         p[@"server"] = server;
         p[@"user"] = alert.textFields[2].text ?: @"";
         p[@"password"] = alert.textFields[3].text ?: @"";
-        p[@"authgroup"] = @"";
+        p[@"authgroup"] = alert.textFields[4].text ?: @"";
         NSMutableArray *profs = [[self profiles] mutableCopy];
         [profs addObject:p];
         [self saveProfiles:profs];
-        [[NSUserDefaults standardUserDefaults] setObject:p[@"id"] forKey:IPATKeyAnyVpnActive];
-        [self toast:[NSString stringWithFormat:@"已添加 %@", p[@"name"]]];
+        [[NSUserDefaults standardUserDefaults] setObject:name forKey:IPATKeyAnyVpnActive];
+        [self toast:[NSString stringWithFormat:@"已添加 %@", name]];
+        [self registerPanel];
+    }]];
+    [self presentAlert:alert];
+}
+
+/// 编辑当前连接的参数（名称/服务器/账号/密码/认证组），改名会同步切换标识
+- (void)editActiveProfileAction {
+    NSDictionary<NSString *, NSString *> *p = [self activeProfile];
+    if (!p) return;
+    UIAlertController *alert = [UIAlertController
+        alertControllerWithTitle:[NSString stringWithFormat:@"编辑「%@」", p[@"name"] ?: @""]
+                         message:@"改完点保存立即生效；改名会影响面板里显示的名称"
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.text = p[@"name"] ?: @"";
+        tf.placeholder = @"连接名称";
+    }];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.text = p[@"server"] ?: @"";
+        tf.placeholder = @"服务器";
+        tf.autocorrectionType = UITextAutocorrectionTypeNo;
+        tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    }];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.text = p[@"user"] ?: @"";
+        tf.placeholder = @"账号";
+    }];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.text = p[@"password"] ?: @"";
+        tf.placeholder = @"密码";
+        tf.secureTextEntry = YES;
+    }];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.text = p[@"authgroup"] ?: @"";
+        tf.placeholder = @"认证组（空 = 自动选第一个）";
+    }];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        NSString *oldId = p[@"id"];
+        NSString *newName = [alert.textFields[0].text stringByTrimmingCharactersInSet:
+            [NSCharacterSet whitespaceAndNewlineCharacterSet]] ?: @"";
+        NSString *server = alert.textFields[1].text ?: @"";
+        if (newName.length == 0 || server.length == 0) {
+            [self toast:@"名称和服务器不能为空"];
+            return;
+        }
+        // 改名时查重（排除自己）
+        for (NSDictionary *q in [self profiles]) {
+            if (![q isKindOfClass:[NSDictionary class]]) continue;
+            if ([q[@"id"] isEqualToString:oldId]) continue;
+            if ([q[@"name"] caseInsensitiveCompare:newName] == NSOrderedSame) {
+                [self toast:@"已存在同名连接"];
+                return;
+            }
+        }
+        NSMutableArray *out = [NSMutableArray array];
+        for (NSDictionary *q in [self profiles]) {
+            if (![q isKindOfClass:[NSDictionary class]]) continue;
+            if ([q[@"id"] isEqualToString:oldId]) {
+                NSMutableDictionary *np = [q mutableCopy];
+                np[@"id"] = newName;
+                np[@"name"] = newName;
+                np[@"server"] = server;
+                np[@"user"] = alert.textFields[2].text ?: @"";
+                np[@"password"] = alert.textFields[3].text ?: @"";
+                np[@"authgroup"] = alert.textFields[4].text ?: @"";
+                [out addObject:np];
+            } else {
+                [out addObject:q];
+            }
+        }
+        [self saveProfiles:out];
+        // 当前选中的就是这条 → 同步 active 标识
+        if ([[self activeProfileId] isEqualToString:oldId])
+            [[NSUserDefaults standardUserDefaults] setObject:newName forKey:IPATKeyAnyVpnActive];
+        [self toast:@"已保存"];
         [self registerPanel];
     }]];
     [self presentAlert:alert];
@@ -793,39 +854,23 @@ static void cb_protect_socket(void *privdata, int fd) {
     NSMutableArray *rows = [NSMutableArray array];
     NSArray<NSDictionary *> *profs = [self profiles];
 
-    // 「连接」分段：一个 profile 一段，选中值存 IPATKeyAnyVpnActive
+    // 「连接」分段：只显示 VPN 名称，点名称即切换（开关开着会自动重连到新的）。
+    // 各连接的参数不在主列表平铺，点「编辑当前连接」弹窗修改
     if (profs.count > 0) {
         NSMutableArray *names = [NSMutableArray array];
         for (NSDictionary *p in profs)
             if ([p isKindOfClass:[NSDictionary class]])
                 [names addObject:p[@"name"] ?: p[@"server"] ?: @"?"];
+        NSDictionary<NSString *, NSString *> *ap = [self activeProfile];
+        NSString *cur = ap[@"name"] ?: names.firstObject;
         [rows addObject:@{IPATRowKey: IPATKeyAnyVpnActive, IPATRowTitle: @"连接",
                           IPATRowKind: IPATRowKindSegment,
                           IPATRowOptions: names, IPATRowValues: names,
-                          IPATRowValue: names.firstObject,
-                          IPATRowNote: @"多个连接时点这里切换"}];
-        // 每个 profile 的可编辑参数（行键带 profile id，改完同步回 profiles）
-        NSString *aid = [self activeProfileId];
-        for (NSDictionary *p in profs) {
-            if (![p isKindOfClass:[NSDictionary class]]) continue;
-            NSString *pid = p[@"id"] ?: @"";
-            NSString *title = p[@"name"] ?: pid;
-            NSString *sec = p[@"password"] ?: @"";
-            [rows addObject:@{IPATRowKey: [NSString stringWithFormat:@"IPATAnyVpnProf:%@:server", pid],
-                              IPATRowTitle: [NSString stringWithFormat:@"[%@] 服务器", title],
-                              IPATRowKind: IPATRowKindText, IPATRowValue: p[@"server"] ?: @""}];
-            [rows addObject:@{IPATRowKey: [NSString stringWithFormat:@"IPATAnyVpnProf:%@:user", pid],
-                              IPATRowTitle: [NSString stringWithFormat:@"[%@] 账号", title],
-                              IPATRowKind: IPATRowKindText, IPATRowValue: p[@"user"] ?: @""}];
-            [rows addObject:@{IPATRowKey: [NSString stringWithFormat:@"IPATAnyVpnProf:%@:password", pid],
-                              IPATRowTitle: [NSString stringWithFormat:@"[%@] 密码", title],
-                              IPATRowKind: IPATRowKindText, IPATRowValue: sec,
-                              IPATRowSecure: @YES}];
-            [rows addObject:@{IPATRowKey: [NSString stringWithFormat:@"IPATAnyVpnProf:%@:authgroup", pid],
-                              IPATRowTitle: [NSString stringWithFormat:@"[%@] 认证组", title],
-                              IPATRowKind: IPATRowKindText, IPATRowValue: p[@"authgroup"] ?: @""}];
-        }
-        [rows addObject:@{IPATRowKey: IPATKeyAnyVpnDelProfile, IPATRowTitle: @"删除当前连接",
+                          IPATRowValue: cur,
+                          IPATRowNote: @"点名称切换连接"}];
+        [rows addObject:@{IPATRowKey: IPATKeyAnyVpnEditProfile, IPATRowTitle: @"✎ 编辑当前连接",
+                          IPATRowKind: IPATRowKindAction}];
+        [rows addObject:@{IPATRowKey: IPATKeyAnyVpnDelProfile, IPATRowTitle: @"－ 删除当前连接",
                           IPATRowKind: IPATRowKindAction}];
     }
     [rows addObject:@{IPATRowKey: IPATKeyAnyVpnAddProfile, IPATRowTitle: @"＋ 添加连接",
@@ -901,10 +946,6 @@ static void cb_protect_socket(void *privdata, int fd) {
             [self status:[NSString stringWithFormat:@"已选择连接：%@", p[@"name"] ?: @""]];
         }
     }
-    // 面板 text 行（profile 字段编辑）→ 写回 profiles 主存储
-    for (NSString *k in values)
-        if ([k hasPrefix:@"IPATAnyVpnProf:"] && [values[k] isKindOfClass:[NSString class]])
-            [self applyProfileFieldEdit:k value:values[k]];
     // 面板 TOTP 行（账号/密钥编辑）→ 写回密钥表
     for (NSString *k in values)
         if ([k hasPrefix:@"IPATAnyVpnTotp:"] && [values[k] isKindOfClass:[NSString class]])
@@ -921,6 +962,8 @@ static void cb_protect_socket(void *privdata, int fd) {
     NSString *key = note.userInfo[IPATActKey];
     if ([key isEqualToString:IPATKeyAnyVpnAddProfile]) {
         [self addProfileAction];
+    } else if ([key isEqualToString:IPATKeyAnyVpnEditProfile]) {
+        [self editActiveProfileAction];
     } else if ([key isEqualToString:IPATKeyAnyVpnDelProfile]) {
         [self deleteActiveProfileAction];
     } else if ([key isEqualToString:IPATKeyAnyVpnAddTotp]) {

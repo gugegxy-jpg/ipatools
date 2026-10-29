@@ -170,6 +170,7 @@ static void IPATAppendLogLine(NSString *line) {
 #define IPATKeyAnyVpnProfiles  @"IPAToolPanelAnyVpnProfiles"  // 连接列表 NSArray<NSDictionary>（id/name/server/user/password/authgroup）
 #define IPATKeyAnyVpnActive    @"IPAToolPanelAnyVpnActive"    // 当前选中的连接 id，NSString（空 = 第一个）
 #define IPATKeyAnyVpnAddProfile @"IPAToolPanelAnyVpnAddProfile"    // 动作行：添加连接
+#define IPATKeyAnyVpnEditProfile @"IPAToolPanelAnyVpnEditProfile"  // 动作行：编辑当前连接
 #define IPATKeyAnyVpnDelProfile @"IPAToolPanelAnyVpnDelProfile"    // 动作行：删除当前连接
 #define IPATKeyAnyVpnTotp      @"IPAToolPanelAnyVpnTotp"     // TOTP 密钥表（账号级）：NSArray<NSDictionary>（user/secret），连接时按当前连接的账号取
 #define IPATKeyAnyVpnAddTotp   @"IPAToolPanelAnyVpnAddTotp"  // 动作行：添加 TOTP 密钥
