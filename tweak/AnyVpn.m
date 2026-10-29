@@ -1312,7 +1312,10 @@ static void cb_protect_socket(void *privdata, int fd) {
             }
             strlcpy(ifname, "t2s", IFNAMSIZ);
         }
-        if (!self.noDTLS) openconnect_setup_dtls(g_vpninfo, 60);
+        // DTLS（UDP 443）在很多网络里握不上手（实测 DTLS handshake timed out），
+        // 且断连循环的总发生在 DTLS 初始化之后——先强制禁用，走纯 CSTP(TCP)。
+        // CSTP-only 带宽低但稳定，确认稳定后再修 DTLS 路径
+        openconnect_disable_dtls(g_vpninfo);
 
         // 路由：root 才能加。有 split_include 按网关下发的走；否则 /1 两段接管全部
         if (root) {
