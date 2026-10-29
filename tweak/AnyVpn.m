@@ -367,18 +367,28 @@ static int cb_auth_form(void *privdata, struct oc_auth_form *form) {
     if (message[0])
         IPATAppendLogLine([NSString stringWithFormat:@"[anyvpn] 表单：%s", message]);
 
-    // 预扫描：TOKEN 字段、密码字段数、用户名字段（用户名再现 = 整个认证重来）
+    // 预扫描：TOKEN 字段、密码字段数、用户名字段（用户名再现 = 整个认证重来）；
+    // 同时把字段清单打进日志——排障时一眼看出哪个字段没被识别
     BOOL tokenFieldExists = NO;
     int passwordCount = 0;
     BOOL usernameAgain = NO;
     BOOL askingOtp = otp_prompt_match(message);
+    NSMutableArray<NSString *> *fieldDesc = [NSMutableArray array];
     for (struct oc_form_opt *o = form->opts; o; o = o->next) {
         if (!o->name) continue;
         if (o->type == OC_FORM_OPT_TOKEN) tokenFieldExists = YES;
         if (o->type == OC_FORM_OPT_PASSWORD) passwordCount++;
         if (is_username_field(o->name, o->label)) usernameAgain = YES;
         if (o->label && otp_prompt_match(o->label)) askingOtp = YES;
+        const char *tn = (o->type == OC_FORM_OPT_TEXT) ? "text"
+                       : (o->type == OC_FORM_OPT_PASSWORD) ? "password"
+                       : (o->type == OC_FORM_OPT_SELECT) ? "select"
+                       : (o->type == OC_FORM_OPT_TOKEN) ? "token"
+                       : (o->type == OC_FORM_OPT_HIDDEN) ? "hidden" : "other";
+        [fieldDesc addObject:[NSString stringWithFormat:@"%s(%s)", o->name, tn]];
     }
+    IPATAppendLogLine([NSString stringWithFormat:@"[anyvpn] 表单字段：%@，密码字段=%d，要验证码=%d",
+                       [fieldDesc componentsJoinedByString:@" "], passwordCount, askingOtp]);
     if (usernameAgain) g_staticPasswordSubmitted = NO;
 
     // 网关要验证码但没配密钥：不能拿固定密码冒充（必被拒还会触发账号锁定）
