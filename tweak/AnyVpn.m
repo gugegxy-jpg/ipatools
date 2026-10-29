@@ -521,6 +521,7 @@ static void cb_protect_socket(void *privdata, int fd) {
 @property (nonatomic, assign) BOOL autoConnect;
 @property (nonatomic, assign) BOOL noDTLS;
 @property (nonatomic, assign) BOOL running;
+@property (nonatomic, assign) BOOL pendingReconnect;  // 切换连接后等 cleanup 完自动重连
 @end
 
 @implementation AnyVPNController
@@ -755,8 +756,8 @@ static void cb_protect_socket(void *privdata, int fd) {
         NSMutableArray *profs = [[self profiles] mutableCopy];
         [profs addObject:p];
         [self saveProfiles:profs];
-        [[NSUserDefaults standardUserDefaults] setObject:name forKey:IPATKeyAnyVpnActive];
-        [self toast:[NSString stringWithFormat:@"已添加 %@", name]];
+        // 不改当前选中的线路——添加 ≠ 切换，用户要换就自己在分段上点
+        [self toast:[NSString stringWithFormat:@"已添加 %@（在「连接」里点它切换）", name]];
         [self registerPanel];
     }]];
     [self presentAlert:alert];
@@ -960,13 +961,19 @@ static void cb_protect_socket(void *privdata, int fd) {
             [self status:[NSString stringWithFormat:@"已选择连接：%@", p[@"name"] ?: @""]];
         }
     }
+    // （activeChanged && running 的重连在下面）
     // 面板 TOTP 行（账号/密钥编辑）→ 写回密钥表
     for (NSString *k in values)
         if ([k hasPrefix:@"IPATAnyVpnTotp:"] && [values[k] isKindOfClass:[NSString class]])
             [self applyTotpEdit:k value:values[k]];
     BOOL enabled = note.userInfo[IPATChgEnabled] ? [note.userInfo[IPATChgEnabled] boolValue] : self.masterOn;
     self.masterOn = enabled;
-    if (activeChanged && self.running) [self stopConnect];   // 换连接：断开旧隧道，下面自动重连新的
+    // 换连接时若隧道在跑：先断旧隧道（stopConnect 只发取消，running 要等
+    // cleanup 才置 NO，所以这里挂起重连意图，cleanup 完成后自动接上）
+    if (activeChanged && self.running) {
+        if (enabled) self.pendingReconnect = YES;
+        [self stopConnect];
+    }
     if (enabled && !self.running) [self startConnect];
     if (!enabled && self.running) [self stopConnect];
     [self registerPanel];
@@ -1335,6 +1342,15 @@ static void cb_protect_socket(void *privdata, int fd) {
     }
     g_cmd_fd = -1;
     [self registerPanel];   // 刷新主开关状态显示
+    // 切换连接时挂起的重连意图：旧隧道拆干净了，接上新连接
+    if (self.pendingReconnect) {
+        self.pendingReconnect = NO;
+        if (self.masterOn) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (self.masterOn && !self.running) [self startConnect];
+            });
+        }
+    }
 }
 
 @end
