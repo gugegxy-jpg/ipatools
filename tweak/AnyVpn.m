@@ -1198,9 +1198,10 @@ static void cb_protect_socket(void *privdata, int fd) {
         }
         g_cmd_fd = openconnect_setup_cmd_pipe(g_vpninfo);
 
-        // 认证：可能多轮触发表单回调（账号 -> 动态码 -> 密码）
+        // 认证：可能多轮触发表单回调（账号 -> 动态码 -> 密码）。
+        // obtain_cookie 失败可能是 DNS/网络/证书/表单任一环节，统一让用户看日志
         if (openconnect_obtain_cookie(g_vpninfo) != 0) {
-            [self fail:@"认证失败（看日志：表单字段没配置或密码错）"];
+            [self fail:@"连接网关失败（DNS/网络/证书/认证，点「复制连接日志」查原因）"];
             return;
         }
         if (openconnect_make_cstp_connection(g_vpninfo) != 0) {
