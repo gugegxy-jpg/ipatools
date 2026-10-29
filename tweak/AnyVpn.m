@@ -390,21 +390,219 @@ static void cb_protect_socket(void *privdata, int fd) {
     }
 }
 
+#pragma mark 多连接配置（profiles 存 NSUserDefaults，本机持久化）
+
+// profiles：NSArray<NSDictionary>，每项 {id, name, server, user, password, authGroup}
+// active：NSString = 当前选中的 profile id（空 = 第一个）
+// 行键 IPATAnyVpnProf:<id>:<field> 是面板的展示缓存，主存储是 profiles 数组
+
+- (NSArray<NSDictionary *> *)profiles {
+    id v = [[NSUserDefaults standardUserDefaults] objectForKey:IPATKeyAnyVpnProfiles];
+    return [v isKindOfClass:[NSArray class]] ? v : @[];
+}
+
+- (void)saveProfiles:(NSArray<NSDictionary *> *)profs {
+    [[NSUserDefaults standardUserDefaults] setObject:profs forKey:IPATKeyAnyVpnProfiles];
+}
+
+- (NSString *)activeProfileId {
+    NSString *a = [[NSUserDefaults standardUserDefaults] stringForKey:IPATKeyAnyVpnActive];
+    return a ?: @"";
+}
+
+/// 当前选中的 profile；activeId 无效时回落第一个，都没有返回 nil
+- (NSDictionary<NSString *, NSString *> *)activeProfile {
+    NSArray<NSDictionary *> *profs = [self profiles];
+    if (profs.count == 0) return nil;
+    NSString *aid = [self activeProfileId];
+    for (NSDictionary *p in profs)
+        if ([p isKindOfClass:[NSDictionary class]] && [p[@"id"] isEqualToString:aid]) return p;
+    return profs.firstObject;
+}
+
+/// 把单个 profile 字段的编辑（面板 text 行）写回 profiles 数组
+- (void)applyProfileFieldEdit:(NSString *)key value:(NSString *)value {
+    // 行键格式：IPATAnyVpnProf:<id>:<field>
+    NSString *prefix = @"IPATAnyVpnProf:";
+    if (![key hasPrefix:prefix]) return;
+    NSString *rest = [key substringFromIndex:prefix.length];
+    NSRange sep = [rest rangeOfString:@":"];
+    if (sep.location == NSNotFound || sep.location == 0) return;
+    NSString *pid = [rest substringToIndex:sep.location];
+    NSString *field = [rest substringFromIndex:NSMaxRange(sep)];
+    if (![@[ @"name", @"server", @"user", @"password", @"authgroup" ] containsObject:field]) return;
+
+    NSMutableArray<NSDictionary *> *profs = [[self profiles] mutableCopy];
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSDictionary *p in profs) {
+        if (![p isKindOfClass:[NSDictionary class]]) continue;
+        if ([p[@"id"] isEqualToString:pid]) {
+            NSMutableDictionary *np = [p mutableCopy];
+            np[field] = value;
+            if ([field isEqualToString:@"name"]) np[@"id"] = p[@"id"];  // id 不随名称变
+            [out addObject:np];
+        } else {
+            [out addObject:p];
+        }
+    }
+    [self saveProfiles:out];
+}
+
 #pragma mark 注册到游戏内悬浮窗
 
+/// 弹系统输入框前先让悬浮窗躲开（与文件功能的系统界面同一套路）
+- (void)presentAlert:(UIAlertController *)alert {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[NSNotificationCenter defaultCenter] postNotificationName:IPATControlVisibilityNotification
+                                                            object:nil
+                                                          userInfo:@{IPATVisVisible: @NO}];
+        UIWindow *win = IPATAppKeyWindowExcluding(nil);
+        UIViewController *vc = win.rootViewController ?: [UIApplication sharedApplication].keyWindow.rootViewController;
+        while (vc.presentedViewController) vc = vc.presentedViewController;
+        if (!vc) {
+            [[NSNotificationCenter defaultCenter] postNotificationName:IPATControlVisibilityNotification
+                                                                object:nil
+                                                              userInfo:@{IPATVisVisible: @YES}];
+            return;
+        }
+        [vc presentViewController:alert animated:YES completion:nil];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            // 输入框盖在游戏画面上时悬浮窗保持隐藏，关闭后喊回来
+            [[NSNotificationCenter defaultCenter] postNotificationName:IPATControlVisibilityNotification
+                                                                object:nil
+                                                              userInfo:@{IPATVisVisible: @YES}];
+        });
+    });
+}
+
+- (void)addProfileAction {
+    UIAlertController *alert = [UIAlertController
+        alertControllerWithTitle:@"添加连接"
+                         message:@"填服务器地址（账号/密码之后可在面板里改）"
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"连接名称（如 公司 VPN）";
+    }];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"服务器 如 https://vpn.example.com";
+        tf.autocorrectionType = UITextAutocorrectionTypeNo;
+        tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    }];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"账号（可留空稍后填）";
+    }];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"密码（可留空稍后填）";
+        tf.secureTextEntry = YES;
+    }];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        NSString *server = alert.textFields[1].text ?: @"";
+        if (server.length == 0) {
+            [self toast:@"服务器地址不能为空"];
+            return;
+        }
+        NSMutableDictionary *p = [NSMutableDictionary dictionary];
+        p[@"id"] = [[NSUUID UUID] UUIDString];
+        p[@"name"] = (alert.textFields[0].text.length ? alert.textFields[0].text : server);
+        p[@"server"] = server;
+        p[@"user"] = alert.textFields[2].text ?: @"";
+        p[@"password"] = alert.textFields[3].text ?: @"";
+        p[@"authgroup"] = @"";
+        NSMutableArray *profs = [[self profiles] mutableCopy];
+        [profs addObject:p];
+        [self saveProfiles:profs];
+        [[NSUserDefaults standardUserDefaults] setObject:p[@"id"] forKey:IPATKeyAnyVpnActive];
+        [self toast:[NSString stringWithFormat:@"已添加 %@", p[@"name"]]];
+        [self registerPanel];
+    }]];
+    [self presentAlert:alert];
+}
+
+- (void)deleteActiveProfileAction {
+    NSDictionary<NSString *, NSString *> *p = [self activeProfile];
+    if (!p) return;
+    UIAlertController *alert = [UIAlertController
+        alertControllerWithTitle:@"删除连接"
+                         message:[NSString stringWithFormat:@"删除「%@」？", p[@"name"] ?: @""]
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive
+                                            handler:^(UIAlertAction *a) {
+        NSString *pid = p[@"id"];
+        NSMutableArray *out = [NSMutableArray array];
+        for (NSDictionary *q in [self profiles])
+            if (![q[@"id"] isEqualToString:pid]) [out addObject:q];
+        [self saveProfiles:out];
+        [[NSUserDefaults standardUserDefaults] removeObjectForKey:IPATKeyAnyVpnActive];
+        [self toast:@"已删除"];
+        [self registerPanel];
+    }]];
+    [self presentAlert:alert];
+}
+
 - (void)registerPanel {
+    NSMutableArray *rows = [NSMutableArray array];
+    NSArray<NSDictionary *> *profs = [self profiles];
+
+    // 「连接」分段：一个 profile 一段，选中值存 IPATKeyAnyVpnActive
+    if (profs.count > 0) {
+        NSMutableArray *names = [NSMutableArray array];
+        for (NSDictionary *p in profs)
+            if ([p isKindOfClass:[NSDictionary class]])
+                [names addObject:p[@"name"] ?: p[@"server"] ?: @"?"];
+        [rows addObject:@{IPATRowKey: IPATKeyAnyVpnActive, IPATRowTitle: @"连接",
+                          IPATRowKind: IPATRowKindSegment,
+                          IPATRowOptions: names, IPATRowValues: names,
+                          IPATRowValue: names.firstObject,
+                          IPATRowNote: @"多个连接时点这里切换"}];
+        // 每个 profile 的可编辑参数（行键带 profile id，改完同步回 profiles）
+        NSString *aid = [self activeProfileId];
+        for (NSDictionary *p in profs) {
+            if (![p isKindOfClass:[NSDictionary class]]) continue;
+            NSString *pid = p[@"id"] ?: @"";
+            NSString *title = p[@"name"] ?: pid;
+            NSString *sec = p[@"password"] ?: @"";
+            [rows addObject:@{IPATRowKey: [NSString stringWithFormat:@"IPATAnyVpnProf:%@:server", pid],
+                              IPATRowTitle: [NSString stringWithFormat:@"[%@] 服务器", title],
+                              IPATRowKind: IPATRowKindText, IPATRowValue: p[@"server"] ?: @""}];
+            [rows addObject:@{IPATRowKey: [NSString stringWithFormat:@"IPATAnyVpnProf:%@:user", pid],
+                              IPATRowTitle: [NSString stringWithFormat:@"[%@] 账号", title],
+                              IPATRowKind: IPATRowKindText, IPATRowValue: p[@"user"] ?: @""}];
+            [rows addObject:@{IPATRowKey: [NSString stringWithFormat:@"IPATAnyVpnProf:%@:password", pid],
+                              IPATRowTitle: [NSString stringWithFormat:@"[%@] 密码", title],
+                              IPATRowKind: IPATRowKindText, IPATRowValue: sec,
+                              IPATRowSecure: @YES}];
+            [rows addObject:@{IPATRowKey: [NSString stringWithFormat:@"IPATAnyVpnProf:%@:authgroup", pid],
+                              IPATRowTitle: [NSString stringWithFormat:@"[%@] 认证组", title],
+                              IPATRowKind: IPATRowKindText, IPATRowValue: p[@"authgroup"] ?: @""}];
+        }
+        [rows addObject:@{IPATRowKey: IPATKeyAnyVpnDelProfile, IPATRowTitle: @"删除当前连接",
+                          IPATRowKind: IPATRowKindAction}];
+    }
+    [rows addObject:@{IPATRowKey: IPATKeyAnyVpnAddProfile, IPATRowTitle: @"＋ 添加连接",
+                      IPATRowKind: IPATRowKindAction}];
+    [rows addObject:@{IPATRowKey: IPATKeyAnyVpnAuto,   IPATRowTitle: @"启动自动连接", IPATRowKind: IPATRowKindSwitch, IPATRowValue: @(self.autoConnect)}];
+    [rows addObject:@{IPATRowKey: IPATKeyAnyVpnNoDTLS, IPATRowTitle: @"禁用 DTLS",   IPATRowKind: IPATRowKindSwitch, IPATRowValue: @(self.noDTLS)}];
+    [rows addObject:@{IPATRowKey: IPATKeyAnyVpnConnect, IPATRowTitle: @"立即连接",   IPATRowKind: IPATRowKindAction}];
+    [rows addObject:@{IPATRowKey: IPATKeyAnyVpnDisc,    IPATRowTitle: @"立即断开",   IPATRowKind: IPATRowKindAction}];
+
+    NSString *detail;
+    if (profs.count == 0) {
+        detail = @"AnyConnect 协议：先点「＋ 添加连接」配置服务器和账号，再点「立即连接」";
+    } else {
+        detail = @"选中连接后点「立即连接」；行内可直接改服务器/账号/密码";
+    }
+
     NSDictionary *reg = @{
         IPATRegId: IPATFeatureAnyVpn,
         IPATRegTitle: @"VPN 隧道",
-        IPATRegDetail: @"AnyConnect 协议（OpenConnect），服务器在注入时用 --anyvpn-server 配置",
+        IPATRegDetail: detail,
         IPATRegMasterKey: IPATKeyAnyVpnEnabled,
         IPATRegEnabled: @(self.masterOn),
-        IPATRegRows: @[
-            @{IPATRowKey: IPATKeyAnyVpnAuto,   IPATRowTitle: @"启动自动连接", IPATRowKind: IPATRowKindSwitch, IPATRowValue: @(self.autoConnect)},
-            @{IPATRowKey: IPATKeyAnyVpnNoDTLS, IPATRowTitle: @"禁用 DTLS",   IPATRowKind: IPATRowKindSwitch, IPATRowValue: @(self.noDTLS)},
-            @{IPATRowKey: IPATKeyAnyVpnConnect, IPATRowTitle: @"立即连接",   IPATRowKind: IPATRowKindAction},
-            @{IPATRowKey: IPATKeyAnyVpnDisc,    IPATRowTitle: @"立即断开",   IPATRowKind: IPATRowKindAction},
-        ],
+        IPATRegRows: rows,
     };
     [[NSNotificationCenter defaultCenter] postNotificationName:IPATControlRegisterNotification
                                                         object:nil
@@ -420,8 +618,23 @@ static void cb_protect_socket(void *privdata, int fd) {
     NSDictionary *values = note.userInfo[IPATChgValues] ?: @{};
     if (values[IPATKeyAnyVpnAuto]) self.autoConnect = [values[IPATKeyAnyVpnAuto] boolValue];
     if (values[IPATKeyAnyVpnNoDTLS]) self.noDTLS = [values[IPATKeyAnyVpnNoDTLS] boolValue];
+    BOOL activeChanged = NO;
+    if (values[IPATKeyAnyVpnActive]) {
+        NSString *aid = values[IPATKeyAnyVpnActive];
+        if (![aid isEqualToString:[self activeProfileId]]) {
+            [[NSUserDefaults standardUserDefaults] setObject:aid forKey:IPATKeyAnyVpnActive];
+            activeChanged = YES;
+            NSDictionary<NSString *, NSString *> *p = [self activeProfile];
+            [self status:[NSString stringWithFormat:@"已选择连接：%@", p[@"name"] ?: @""]];
+        }
+    }
+    // 面板 text 行（profile 字段编辑）→ 写回 profiles 主存储
+    for (NSString *k in values)
+        if ([k hasPrefix:@"IPATAnyVpnProf:"] && [values[k] isKindOfClass:[NSString class]])
+            [self applyProfileFieldEdit:k value:values[k]];
     BOOL enabled = note.userInfo[IPATChgEnabled] ? [note.userInfo[IPATChgEnabled] boolValue] : self.masterOn;
     self.masterOn = enabled;
+    if (activeChanged && self.running) [self stopConnect];   // 换连接：断开旧隧道，下面自动重连新的
     if (enabled && !self.running) [self startConnect];
     if (!enabled && self.running) [self stopConnect];
     [self registerPanel];
@@ -437,8 +650,19 @@ static void cb_protect_socket(void *privdata, int fd) {
         self.masterOn = NO;
         [[NSUserDefaults standardUserDefaults] setBool:NO forKey:IPATKeyAnyVpnEnabled];
         [self stopConnect];
+    } else if ([key isEqualToString:IPATKeyAnyVpnAddProfile]) {
+        [self addProfileAction];
+    } else if ([key isEqualToString:IPATKeyAnyVpnDelProfile]) {
+        [self deleteActiveProfileAction];
     }
     [self registerPanel];
+}
+
+/// 屏幕上弹一条几秒消失的提示（面板端渲染）
+- (void)toast:(NSString *)text {
+    [[NSNotificationCenter defaultCenter] postNotificationName:IPATControlToastNotification
+                                                        object:nil
+                                                      userInfo:@{IPATToastText: text}];
 }
 
 - (void)status:(NSString *)text {
@@ -452,14 +676,20 @@ static void cb_protect_socket(void *privdata, int fd) {
 #pragma mark 连接 / 断开
 
 - (BOOL)configured {
-    g_cfgServer = [self plist:@"Server" default:nil];
+    // 优先级：面板保存的 profiles（选中的连接） -> Info.plist 注入时的初始值
+    NSDictionary<NSString *, NSString *> *p = [self activeProfile];
+    g_cfgServer = p[@"server"].length ? p[@"server"]
+                                      : [self plist:@"Server" default:nil];
     if (!g_cfgServer.length) {
-        [self status:@"未配置服务器：注入时请加 --anyvpn-server"];
+        [self status:@"未配置服务器：打开悬浮窗 VPN 分组，点「＋ 添加连接」"];
+        [self toast:@"未配置服务器，先在悬浮窗添加连接"];
         return NO;
     }
-    g_cfgUser  = [self plist:@"User" default:@""];
-    g_cfgPass  = [self plist:@"Password" default:@""];
-    g_cfgGroup = [self plist:@"AuthGroup" default:@""];
+    g_cfgUser  = p[@"user"].length     ? p[@"user"]     : [self plist:@"User" default:@""];
+    g_cfgPass  = p[@"password"].length ? p[@"password"] : [self plist:@"Password" default:@""];
+    g_cfgGroup = p[@"authgroup"].length ? p[@"authgroup"] : [self plist:@"AuthGroup" default:@""];
+    NSDictionary<NSString *, NSString *> *ap = [self activeProfile];
+    if (ap) [self status:[NSString stringWithFormat:@"正在连接 %@ …", ap[@"name"] ?: @""]];
     return YES;
 }
 
@@ -613,6 +843,8 @@ static void cb_protect_socket(void *privdata, int fd) {
         [self status:[NSString stringWithFormat:@"已连接 %@（IP %@ / %@%s）",
                       server, ip->addr ?: "", ifname,
                       root ? "" : "，非越狱模式：接管本 App 直连流量"]];
+        [self toast:[NSString stringWithFormat:@"✅ VPN 已连接 %@（IP %@）",
+                     [self activeProfile][@"name"] ?: server, ip->addr ?: @""]];
 
         // 主循环：断线重连参数与 Android 端一致
         openconnect_mainloop(g_vpninfo, 300, 10);
@@ -641,6 +873,7 @@ static void cb_protect_socket(void *privdata, int fd) {
 
 - (void)fail:(NSString *)msg {
     [self status:msg];
+    [self toast:[NSString stringWithFormat:@"❌ %@", msg]];
     [self cleanup];
 }
 

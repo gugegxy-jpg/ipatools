@@ -82,6 +82,8 @@ static void IPATAppendLogLine(NSString *line) {
 #define IPATControlActionNotification @"IPATControlAction"
 /// 功能 -> 面板：请临时隐藏/显示悬浮窗（要弹系统界面时别挡着）。userInfo 见 IPATVis*
 #define IPATControlVisibilityNotification @"IPATControlVisibility"
+/// 功能 -> 面板：屏幕上弹一条几秒消失的短提示（连接成功/失败等）。userInfo 见 IPATToast*
+#define IPATControlToastNotification @"IPATControlToast"
 
 #pragma mark - 功能标识
 
@@ -107,6 +109,7 @@ static void IPATAppendLogLine(NSString *line) {
 #define IPATRowOptions @"options"   // segment 的显示项 @[NSString]
 #define IPATRowValues @"values"     // segment 的取值 @[NSString]，与 options 一一对应
 #define IPATRowNote @"note"         // 行下方的小字说明，可选
+#define IPATRowSecure @"secure"     // @(YES)：text 行输入框打码、显示值打点
 
 // 行类型
 #define IPATRowKindSwitch @"switch"    // 右侧开关，值写 NSUserDefaults
@@ -114,6 +117,9 @@ static void IPATAppendLogLine(NSString *line) {
 // 动作行：整行可点，点了面板会收起并发 IPATControlActionNotification
 // （动作行不写 NSUserDefaults，也不需要 IPATRowValue）
 #define IPATRowKindAction @"action"
+// 文本输入行：整行可点，弹输入框，保存到 NSUserDefaults 并通知功能侧
+// （IPATRowValue 是当前值/占位提示，IPATRowSecure = @(YES) 时打码）
+#define IPATRowKindText @"text"
 
 #pragma mark - 变更通知（IPATControlDidChangeNotification 的 userInfo）
 
@@ -124,6 +130,11 @@ static void IPATAppendLogLine(NSString *line) {
 #pragma mark - 状态通知（IPATControlStatusNotification 的 userInfo）
 
 #define IPATStaDetail @"detail"     // 一行状态文字
+
+#pragma mark - 短提示（IPATControlToastNotification 的 userInfo）
+// 连接成功 / 失败这类「用户必须看到」的结果，面板会在屏幕上弹一条几秒消失的提示
+
+#define IPATToastText @"text"       // 提示文字
 
 #pragma mark - 动作通知（IPATControlActionNotification 的 userInfo）
 
@@ -155,6 +166,11 @@ static void IPATAppendLogLine(NSString *line) {
 
 #define IPATKeyFilesEnabled @"IPAToolPanelFilesEnabled"  // 已弃用：文件功能常开，只看 Info.plist 的 Enabled
 #define IPATKeyFilesImportDir @"IPAToolPanelFilesImportDir"  // 仅 plist：导入的默认落地目录（相对沙盒）
+
+#define IPATKeyAnyVpnProfiles  @"IPAToolPanelAnyVpnProfiles"  // 连接列表 NSArray<NSDictionary>（id/name/server/user/password/authgroup）
+#define IPATKeyAnyVpnActive    @"IPAToolPanelAnyVpnActive"    // 当前选中的连接 id，NSString（空 = 第一个）
+#define IPATKeyAnyVpnAddProfile @"IPAToolPanelAnyVpnAddProfile"    // 动作行：添加连接
+#define IPATKeyAnyVpnDelProfile @"IPAToolPanelAnyVpnDelProfile"    // 动作行：删除当前连接
 
 #define IPATKeyButtonFrame @"IPAToolPanelButtonFrame"  // 悬浮按钮位置，NSStringFromCGRect
 

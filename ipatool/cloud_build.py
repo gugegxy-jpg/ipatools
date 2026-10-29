@@ -15,6 +15,7 @@ import re
 import shutil
 import socket
 import subprocess
+import tempfile
 import time
 import webbrowser
 import zipfile
@@ -70,9 +71,22 @@ def _curl(method, url, headers, body, timeout, ip=None):
         cmd += ["--connect-to", f"{host}:443:{ip}:443"]
     for k, v in headers.items():
         cmd += ["-H", f"{k}: {v}"]
-    if body is not None:
-        cmd += ["--data-binary", body]
-    p = subprocess.run(cmd, capture_output=True, timeout=timeout + 15)
+    tmp_path = None
+    try:
+        if body is not None:
+            # Windows 命令行有长度上限（WinError 206），大 body 必须走临时文件
+            data = body if isinstance(body, bytes) else body.encode("utf-8")
+            with tempfile.NamedTemporaryFile("wb", delete=False, suffix=".bin") as tf:
+                tf.write(data)
+                tmp_path = tf.name
+            cmd += ["--data-binary", "@" + tmp_path]
+        p = subprocess.run(cmd, capture_output=True, timeout=timeout + 15)
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
     if p.returncode != 0:
         raise RuntimeError(p.stderr.decode("utf-8", "replace").strip()[:200])
     text = p.stdout.decode("utf-8", "replace")

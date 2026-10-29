@@ -238,6 +238,10 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
                        name:IPATControlStatusNotification
                      object:nil];
         [center addObserver:self
+                   selector:@selector(handleToast:)
+                       name:IPATControlToastNotification
+                     object:nil];
+        [center addObserver:self
                    selector:@selector(handleDidBecomeActive)
                        name:UIApplicationDidBecomeActiveNotification
                      object:nil];
@@ -839,6 +843,9 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
     if ([kind isEqualToString:IPATRowKindAction]) {
         return [self addActionRow:row key:key featureId:featureId y:y width:width note:note];
     }
+    if ([kind isEqualToString:IPATRowKindText]) {
+        return [self addTextRow:row key:key featureId:featureId y:y width:width note:note];
+    }
 
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(IPATCpInset + 2.0, y,
                                                                contentWidth - 110.0, IPATCpRowHeight)];
@@ -940,6 +947,129 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
 }
 
 #pragma mark 交互
+
+/// 文本输入行：左侧标题、右侧当前值（secure 行打点显示），点整行弹输入框。
+/// 保存到 NSUserDefaults（本机持久化），并通知功能侧立即重新读取。
+- (CGFloat)addTextRow:(NSDictionary *)row key:(NSString *)key featureId:(NSString *)featureId
+                     y:(CGFloat)y width:(CGFloat)width note:(NSString *)note {
+    CGFloat contentWidth = width - IPATCpInset * 2;
+    BOOL secure = [row[IPATRowSecure] boolValue];
+
+    UIButton *tap = [UIButton buttonWithType:UIButtonTypeSystem];
+    tap.frame = CGRectMake(IPATCpInset, y, contentWidth, IPATCpRowHeight);
+    tap.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+    tap.titleLabel.font = [UIFont systemFontOfSize:13.0];
+    tap.titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    [tap setTitle:(row[IPATRowTitle] ?: key) forState:UIControlStateNormal];
+    [tap setTitleColor:[UIColor colorWithWhite:1.0 alpha:0.92] forState:UIControlStateNormal];
+    tap.tag = (NSInteger)self.rowModels.count;
+    [tap addTarget:self action:@selector(handleTextTap:)
+     forControlEvents:UIControlEventTouchUpInside];
+    [self.contentView addSubview:tap];
+
+    NSString *current = IPATCpStoredString(key, row[IPATRowValue]) ?: @"";
+    UILabel *value = [[UILabel alloc] initWithFrame:CGRectMake(width - IPATCpInset - 150.0, y,
+                                                              150.0, IPATCpRowHeight)];
+    value.font = [UIFont systemFontOfSize:12.0];
+    value.textColor = [UIColor colorWithWhite:1.0 alpha:0.5];
+    value.textAlignment = NSTextAlignmentRight;
+    value.lineBreakMode = NSLineBreakByTruncatingMiddle;
+    value.userInteractionEnabled = NO;
+    value.text = current.length ? (secure ? @"●●●●●●" : current) : @"未设置";
+    [self.contentView addSubview:value];
+
+    NSMutableDictionary *model = [row mutableCopy];
+    model[IPATCpRowFeature] = featureId;
+    [self.rowModels addObject:model];
+
+    y += IPATCpRowHeight;
+    if ([note isKindOfClass:[NSString class]] && note.length > 0) {
+        UILabel *noteLabel = [[UILabel alloc] initWithFrame:CGRectMake(IPATCpInset + 2.0, y - 4.0,
+                                                                      contentWidth - 110.0,
+                                                                      IPATCpNoteHeight)];
+        noteLabel.font = [UIFont systemFontOfSize:10.0];
+        noteLabel.textColor = [UIColor colorWithWhite:1.0 alpha:0.42];
+        noteLabel.text = note;
+        [self.contentView addSubview:noteLabel];
+        y += IPATCpNoteHeight;
+    }
+    return y;
+}
+
+/// 文本行被点：在面板自己的 window 上弹输入框（windowLevel 高于系统 Alert，
+/// 不会被游戏画面盖住），保存后刷新显示并通知功能侧
+- (void)handleTextTap:(UIButton *)button {
+    NSInteger index = button.tag;
+    if (index < 0 || index >= (NSInteger)self.rowModels.count) return;
+    NSDictionary *model = self.rowModels[(NSUInteger)index];
+    NSString *key = model[IPATRowKey];
+    if (key.length == 0) return;
+    BOOL secure = [model[IPATRowSecure] boolValue];
+    NSString *title = model[IPATRowTitle] ?: key;
+
+    UIAlertController *alert = [UIAlertController
+        alertControllerWithTitle:title
+                         message:@"配置保存在本机（NSUserDefaults），重启后仍生效"
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.text = IPATCpStoredString(key, model[IPATRowValue]) ?: @"";
+        tf.placeholder = title;
+        tf.secureTextEntry = secure;
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+        tf.autocorrectionType = UITextAutocorrectionTypeNo;
+        tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    }];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消"
+                                              style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"保存"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        NSString *text = alert.textFields.firstObject.text ?: @"";
+        IPATCpStore(key, text);
+        [self notifyFeature:model[IPATCpRowFeature]];
+        if (self.expanded) {
+            [self rebuildContent];
+            [self layoutPanel];
+        }
+    }]];
+    UIViewController *vc = self.window.rootViewController;
+    [vc presentViewController:alert animated:YES completion:nil];
+}
+
+/// 功能侧发来的短提示（连接成功 / 失败等），屏幕中上部弹一条几秒消失
+- (void)handleToast:(NSNotification *)note {
+    NSString *text = note.userInfo[IPATToastText];
+    if (![text isKindOfClass:[NSString class]] || text.length == 0) return;
+    if (!self.window) return;
+
+    UILabel *toast = [[UILabel alloc] initWithFrame:CGRectZero];
+    toast.text = text;
+    toast.font = [UIFont systemFontOfSize:13.0 weight:UIFontWeightMedium];
+    toast.textColor = [UIColor whiteColor];
+    toast.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.78];
+    toast.textAlignment = NSTextAlignmentCenter;
+    toast.numberOfLines = 2;
+    toast.layer.cornerRadius = 10.0;
+    toast.layer.masksToBounds = YES;
+    [toast sizeToFit];
+    CGRect f = toast.frame;
+    f.size.width = MIN(f.size.width + 32.0, self.window.bounds.size.width - 40.0);
+    f.size.height = MAX(f.size.height + 20.0, 44.0);
+    f.origin.x = (self.window.bounds.size.width - f.size.width) / 2.0;
+    f.origin.y = self.window.bounds.size.height * 0.12;
+    toast.frame = f;
+    toast.alpha = 0.0;
+    [self.window addSubview:toast];
+
+    [UIView animateWithDuration:0.25 animations:^{ toast.alpha = 1.0; }
+        completion:^(BOOL done) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.6 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                [UIView animateWithDuration:0.4 animations:^{ toast.alpha = 0.0; }
+                    completion:^(BOOL finished) { [toast removeFromSuperview]; }];
+            });
+        }];
+}
 
 - (void)handleControlChanged:(UIControl *)control {
     NSInteger index = control.tag;
