@@ -1042,6 +1042,7 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
 
 /// 功能侧发来的短提示（连接成功 / 失败等），屏幕中上部弹一条几秒消失
 - (void)handleToast:(NSNotification *)note {
+    if ([self onMainNotify:note sel:_cmd]) return;
     NSString *text = note.userInfo[IPATToastText];
     if (![text isKindOfClass:[NSString class]] || text.length == 0) return;
     if (!self.window) return;
@@ -1145,6 +1146,7 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
 
 /// 功能侧要弹系统界面（文件 App 等）时让悬浮窗先躲开，结束再喊回来
 - (void)handleVisibility:(NSNotification *)note {
+    if ([self onMainNotify:note sel:_cmd]) return;
     id visible = note.userInfo[IPATVisVisible];
     if (![visible respondsToSelector:@selector(boolValue)]) return;
     BOOL show = [visible boolValue];
@@ -1156,7 +1158,17 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
 
 #pragma mark 通知
 
+// 功能 dylib 的通知可能从后台线程发来（openconnect 回调、连接线程），
+// UIKit 一律只能在主线程碰；这里统一先跳回主线程再处理
+- (BOOL)onMainNotify:(NSNotification *)note sel:(SEL)sel {
+    if ([NSThread isMainThread]) return NO;
+    NSNotification *n = note;
+    dispatch_async(dispatch_get_main_queue(), ^{ [self performSelector:sel withObject:n]; });
+    return YES;
+}
+
 - (void)handleRegister:(NSNotification *)note {
+    if ([self onMainNotify:note sel:_cmd]) return;
     NSDictionary *userInfo = note.userInfo;
     if (![userInfo isKindOfClass:[NSDictionary class]]) return;
     NSString *featureId = userInfo[IPATRegId];
@@ -1173,6 +1185,7 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
 }
 
 - (void)handleStatus:(NSNotification *)note {
+    if ([self onMainNotify:note sel:_cmd]) return;
     NSDictionary *userInfo = note.userInfo;
     if (![userInfo isKindOfClass:[NSDictionary class]]) return;
     NSString *featureId = userInfo[IPATRegId];

@@ -283,13 +283,16 @@ static BOOL otp_prompt_match(const char *text) {
 }
 
 // C 层发状态（面板状态行 + 落盘日志）；cb_auth_form 在类声明之前，不能直接
-// 引用 AnyVPNController，走通知协议
+// 引用 AnyVPNController，走通知协议。面板可能从后台线程收到通知后直接碰 UI，
+// 所以这里统一跳主线程再发
 static void anyvpn_status_notify(NSString *text) {
     IPATAppendLogLine([NSString stringWithFormat:@"[anyvpn] %@", text]);
-    [[NSNotificationCenter defaultCenter] postNotificationName:IPATControlStatusNotification
-                                                        object:nil
-                                                      userInfo:@{IPATRegId: IPATFeatureAnyVpn,
-                                                                 IPATStaDetail: text}];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[NSNotificationCenter defaultCenter] postNotificationName:IPATControlStatusNotification
+                                                            object:nil
+                                                          userInfo:@{IPATRegId: IPATFeatureAnyVpn,
+                                                                     IPATStaDetail: text}];
+    });
 }
 
 // 用户名字段识别，对齐 Android 端 isUsernameField：name 含 user/login，
@@ -824,9 +827,12 @@ static void cb_protect_socket(void *privdata, int fd) {
         IPATRegEnabled: @(self.masterOn),
         IPATRegRows: rows,
     };
-    [[NSNotificationCenter defaultCenter] postNotificationName:IPATControlRegisterNotification
-                                                        object:nil
-                                                      userInfo:reg];
+    // cleanup 在连接线程里调 registerPanel，通知必须主线程发（面板要重建 UI）
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[NSNotificationCenter defaultCenter] postNotificationName:IPATControlRegisterNotification
+                                                            object:nil
+                                                          userInfo:reg];
+    });
 }
 
 - (void)handleDiscover:(NSNotification *)note {
@@ -931,19 +937,23 @@ static void cb_protect_socket(void *privdata, int fd) {
     [self registerPanel];
 }
 
-/// 屏幕上弹一条几秒消失的提示（面板端渲染）
+/// 屏幕上弹一条几秒消失的提示（面板端渲染）；可能从后台线程调用，跳主线程
 - (void)toast:(NSString *)text {
-    [[NSNotificationCenter defaultCenter] postNotificationName:IPATControlToastNotification
-                                                        object:nil
-                                                      userInfo:@{IPATToastText: text}];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[NSNotificationCenter defaultCenter] postNotificationName:IPATControlToastNotification
+                                                            object:nil
+                                                          userInfo:@{IPATToastText: text}];
+    });
 }
 
 - (void)status:(NSString *)text {
     IPATAppendLogLine([NSString stringWithFormat:@"[anyvpn] %@", text]);
-    [[NSNotificationCenter defaultCenter] postNotificationName:IPATControlStatusNotification
-                                                        object:nil
-                                                      userInfo:@{IPATRegId: IPATFeatureAnyVpn,
-                                                                 IPATStaDetail: text}];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[NSNotificationCenter defaultCenter] postNotificationName:IPATControlStatusNotification
+                                                            object:nil
+                                                          userInfo:@{IPATRegId: IPATFeatureAnyVpn,
+                                                                     IPATStaDetail: text}];
+    });
 }
 
 #pragma mark 连接 / 断开
