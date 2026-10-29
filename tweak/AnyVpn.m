@@ -66,7 +66,30 @@ struct sockaddr_ctl {
 #define UTUN_UNIT_NAME          "utun"
 #define UTUN_UNIT_NUMBER_OFFSET 9
 #endif
+// iPhoneOS SDK 不带 net/route.h（macOS 才有），按 xnu ABI 自备老式 BSD 路由
+// ioctl 所需的 ortentry；哪天 SDK 带了则优先用系统的
+#if __has_include(<net/route.h>)
 #import <net/route.h>
+#else
+struct ifnet;   /* ortentry 里只有指针字段，用户态无需完整定义 */
+struct ortentry {
+    u_long          rt_hash;
+    struct sockaddr rt_dst;
+    struct sockaddr rt_gateway;
+    short           rt_flags;
+    short           rt_refcnt;
+    u_long          rt_use;
+    struct ifnet   *rt_ifp;
+};
+#ifndef RTF_UP
+#define RTF_UP      0x1
+#define RTF_GATEWAY 0x2
+#endif
+#ifndef SIOCADDRT
+#define SIOCADDRT   _IOWR('r', 10, struct ortentry)
+#define SIOCDELRT   _IOWR('r', 11, struct ortentry)
+#endif
+#endif
 #import <netinet/in.h>
 #import <arpa/inet.h>
 #import <unistd.h>
