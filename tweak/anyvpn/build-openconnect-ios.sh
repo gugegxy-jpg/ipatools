@@ -125,7 +125,7 @@ else
       for f in ../src/core/*.c ../src/core/ipv4/*.c; do
         [ -e "$f" ] || continue
         $CC -c "$f" -I../src/include $EXTRA_INC -o "$(basename "${f%.c}").o" >>"$LOGF" 2>&1 \
-          || { echo "lwIP 编译失败: $f"; tail -40 "$LOGF"; exit 1; }
+          || { echo "lwIP 编译失败: $f"; grep -B2 -A6 'error:' "$LOGF" | tail -60; exit 1; }
       done
       xcrun -sdk iphoneos ar rcs "$PREFIX/lib/liblwip.a" ./*.o
     popd >/dev/null
