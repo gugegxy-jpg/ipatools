@@ -830,6 +830,8 @@ static void cb_protect_socket(void *privdata, int fd) {
     }
     [rows addObject:@{IPATRowKey: IPATKeyAnyVpnAddProfile, IPATRowTitle: @"＋ 添加连接",
                       IPATRowKind: IPATRowKindAction}];
+    // 连接/断开直接用面板顶部的「VPN 隧道」主开关（handleDidChange 里驱动），
+    // 不再放「立即连接/断开」动作行——功能重复且把面板搞得很长
 
     // TOTP 密钥表（账号级，对齐 Android 端 TotpVault）：连接时按当前连接的
     // 账号自动取对应密钥；「账号」清空保存即删除该条
@@ -854,16 +856,14 @@ static void cb_protect_socket(void *privdata, int fd) {
         [rows addObject:@{IPATRowKey: IPATKeyAnyVpnDelTotp, IPATRowTitle: @"－ 删除最后一个 TOTP 密钥",
                           IPATRowKind: IPATRowKindAction}];
     }
-    [rows addObject:@{IPATRowKey: IPATKeyAnyVpnAuto,   IPATRowTitle: @"启动自动连接", IPATRowKind: IPATRowKindSwitch, IPATRowValue: @(self.autoConnect)}];
+    [rows addObject:@{IPATRowKey: IPATKeyAnyVpnAuto,   IPATRowTitle: @"注入后自动连接", IPATRowKind: IPATRowKindSwitch, IPATRowValue: @(self.autoConnect)}];
     [rows addObject:@{IPATRowKey: IPATKeyAnyVpnNoDTLS, IPATRowTitle: @"禁用 DTLS",   IPATRowKind: IPATRowKindSwitch, IPATRowValue: @(self.noDTLS)}];
-    [rows addObject:@{IPATRowKey: IPATKeyAnyVpnConnect, IPATRowTitle: @"立即连接",   IPATRowKind: IPATRowKindAction}];
-    [rows addObject:@{IPATRowKey: IPATKeyAnyVpnDisc,    IPATRowTitle: @"立即断开",   IPATRowKind: IPATRowKindAction}];
 
     NSString *detail;
     if (profs.count == 0) {
-        detail = @"AnyConnect 协议：先点「＋ 添加连接」配置服务器和账号，再点「立即连接」";
+        detail = @"AnyConnect 协议：先点「＋ 添加连接」配置服务器和账号，然后打开顶部开关连接";
     } else {
-        detail = @"选中连接后点「立即连接」；行内可直接改服务器/账号/密码";
+        detail = @"选中连接后打开顶部开关连接；行内可直接改服务器/账号/密码";
     }
 
     NSDictionary *reg = @{
@@ -919,15 +919,7 @@ static void cb_protect_socket(void *privdata, int fd) {
 
 - (void)handleAction:(NSNotification *)note {
     NSString *key = note.userInfo[IPATActKey];
-    if ([key isEqualToString:IPATKeyAnyVpnConnect]) {
-        self.masterOn = YES;
-        [[NSUserDefaults standardUserDefaults] setBool:YES forKey:IPATKeyAnyVpnEnabled];
-        [self startConnect];
-    } else if ([key isEqualToString:IPATKeyAnyVpnDisc]) {
-        self.masterOn = NO;
-        [[NSUserDefaults standardUserDefaults] setBool:NO forKey:IPATKeyAnyVpnEnabled];
-        [self stopConnect];
-    } else if ([key isEqualToString:IPATKeyAnyVpnAddProfile]) {
+    if ([key isEqualToString:IPATKeyAnyVpnAddProfile]) {
         [self addProfileAction];
     } else if ([key isEqualToString:IPATKeyAnyVpnDelProfile]) {
         [self deleteActiveProfileAction];
