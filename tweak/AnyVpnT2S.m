@@ -183,7 +183,8 @@ static err_t t2s_netif_init(struct netif *nif) {
     nif->name[0] = 't';
     nif->name[1] = 'n';
     nif->output = t2s_output;
-    nif->flags = NETIF_FLAG_POINTTOPOINT | NETIF_FLAG_LINK_UP;
+    // lwIP 2.x 删掉了 NETIF_FLAG_POINTTOPOINT（1.x 的 flag）；本接口无链路层
+    nif->flags = NETIF_FLAG_LINK_UP;
     return ERR_OK;
 }
 
