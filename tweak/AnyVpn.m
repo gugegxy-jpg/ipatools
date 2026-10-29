@@ -568,6 +568,54 @@ static void cb_protect_socket(void *privdata, int fd) {
     return profs.firstObject;
 }
 
+#pragma mark TOTP 密钥表（账号级，对齐 Android 端 TotpVault：按账号取密钥）
+
+// 存储：NSArray<NSDictionary>，每项 {user, secret}；连接时按当前连接的账号匹配
+
+- (NSArray<NSDictionary *> *)totpEntries {
+    id v = [[NSUserDefaults standardUserDefaults] objectForKey:IPATKeyAnyVpnTotp];
+    return [v isKindOfClass:[NSArray class]] ? v : @[];
+}
+
+- (void)saveTotpEntries:(NSArray<NSDictionary *> *)entries {
+    [[NSUserDefaults standardUserDefaults] setObject:entries forKey:IPATKeyAnyVpnTotp];
+}
+
+/// 连接账号对应的 TOTP 密钥（大小写不敏感）；找不到返回 nil
+- (NSString *)totpSecretForUser:(NSString *)user {
+    if (!user.length) return nil;
+    for (NSDictionary *e in [self totpEntries]) {
+        if (![e isKindOfClass:[NSDictionary class]]) continue;
+        NSString *u = e[@"user"];
+        if ([u caseInsensitiveCompare:user] == NSOrderedSame) return e[@"secret"];
+    }
+    return nil;
+}
+
+/// 把面板 TOTP 行（IPATAnyVpnTotp:<i>:user|secret）的编辑写回密钥表；
+/// 账号清空 = 删除该条
+- (void)applyTotpEdit:(NSString *)key value:(NSString *)value {
+    NSString *prefix = @"IPATAnyVpnTotp:";
+    if (![key hasPrefix:prefix]) return;
+    NSString *rest = [key substringFromIndex:prefix.length];
+    NSRange sep = [rest rangeOfString:@":"];
+    if (sep.location == NSNotFound) return;
+    NSInteger idx = [rest substringToIndex:sep.location].integerValue;
+    NSString *field = [rest substringFromIndex:NSMaxRange(sep)];
+    if (field.length == 0) return;
+
+    NSMutableArray<NSDictionary *> *entries = [[self totpEntries] mutableCopy];
+    if (idx < 0 || idx >= (NSInteger)entries.count) return;
+    NSMutableDictionary *e = [entries[idx] mutableCopy];
+    e[field] = value;
+    if ([field isEqualToString:@"user"] && value.length == 0) {
+        [entries removeObjectAtIndex:idx];   // 账号清空 = 删除该条
+    } else {
+        entries[idx] = e;
+    }
+    [self saveTotpEntries:entries];
+}
+
 /// 把单个 profile 字段的编辑（面板 text 行）写回 profiles 数组
 - (void)applyProfileFieldEdit:(NSString *)key value:(NSString *)value {
     // 行键格式：IPATAnyVpnProf:<id>:<field>
@@ -644,11 +692,6 @@ static void cb_protect_socket(void *privdata, int fd) {
         tf.placeholder = @"密码（可留空稍后填）";
         tf.secureTextEntry = YES;
     }];
-    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.placeholder = @"TOTP 密钥（可选，Base32）";
-        tf.autocorrectionType = UITextAutocorrectionTypeNo;
-        tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
-    }];
     [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     [alert addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *a) {
@@ -663,7 +706,6 @@ static void cb_protect_socket(void *privdata, int fd) {
         p[@"server"] = server;
         p[@"user"] = alert.textFields[2].text ?: @"";
         p[@"password"] = alert.textFields[3].text ?: @"";
-        p[@"totp"] = alert.textFields[4].text ?: @"";
         p[@"authgroup"] = @"";
         NSMutableArray *profs = [[self profiles] mutableCopy];
         [profs addObject:p];
@@ -732,16 +774,36 @@ static void cb_protect_socket(void *privdata, int fd) {
             [rows addObject:@{IPATRowKey: [NSString stringWithFormat:@"IPATAnyVpnProf:%@:authgroup", pid],
                               IPATRowTitle: [NSString stringWithFormat:@"[%@] 认证组", title],
                               IPATRowKind: IPATRowKindText, IPATRowValue: p[@"authgroup"] ?: @""}];
-            [rows addObject:@{IPATRowKey: [NSString stringWithFormat:@"IPATAnyVpnProf:%@:totp", pid],
-                              IPATRowTitle: [NSString stringWithFormat:@"[%@] TOTP 密钥", title],
-                              IPATRowKind: IPATRowKindText, IPATRowValue: p[@"totp"] ?: @"",
-                              IPATRowNote: @"Base32 密钥（Google Authenticator 那串）；网关要动态码时填"}];
         }
         [rows addObject:@{IPATRowKey: IPATKeyAnyVpnDelProfile, IPATRowTitle: @"删除当前连接",
                           IPATRowKind: IPATRowKindAction}];
     }
     [rows addObject:@{IPATRowKey: IPATKeyAnyVpnAddProfile, IPATRowTitle: @"＋ 添加连接",
                       IPATRowKind: IPATRowKindAction}];
+
+    // TOTP 密钥表（账号级，对齐 Android 端 TotpVault）：连接时按当前连接的
+    // 账号自动取对应密钥；「账号」清空保存即删除该条
+    NSArray<NSDictionary *> *totps = [self totpEntries];
+    for (NSInteger i = 0; i < (NSInteger)totps.count; i++) {
+        NSDictionary *e = totps[i];
+        if (![e isKindOfClass:[NSDictionary class]]) continue;
+        NSString *u = e[@"user"] ?: @"";
+        [rows addObject:@{IPATRowKey: [NSString stringWithFormat:@"IPATAnyVpnTotp:%ld:user", (long)i],
+                          IPATRowTitle: [NSString stringWithFormat:@"TOTP 账号 %ld", (long)(i + 1)],
+                          IPATRowKind: IPATRowKindText, IPATRowValue: u,
+                          IPATRowNote: @"清空并保存 = 删除该条"}];
+        [rows addObject:@{IPATRowKey: [NSString stringWithFormat:@"IPATAnyVpnTotp:%ld:secret", (long)i],
+                          IPATRowTitle: [NSString stringWithFormat:@"[%@] TOTP 密钥", u.length ? u : @"?"],
+                          IPATRowKind: IPATRowKindText, IPATRowValue: e[@"secret"] ?: @"",
+                          IPATRowSecure: @YES,
+                          IPATRowNote: @"Base32 密钥（Google Authenticator 那串）"}];
+    }
+    [rows addObject:@{IPATRowKey: IPATKeyAnyVpnAddTotp, IPATRowTitle: @"＋ 添加 TOTP 密钥",
+                      IPATRowKind: IPATRowKindAction}];
+    if (totps.count > 0) {
+        [rows addObject:@{IPATRowKey: IPATKeyAnyVpnDelTotp, IPATRowTitle: @"－ 删除最后一个 TOTP 密钥",
+                          IPATRowKind: IPATRowKindAction}];
+    }
     [rows addObject:@{IPATRowKey: IPATKeyAnyVpnAuto,   IPATRowTitle: @"启动自动连接", IPATRowKind: IPATRowKindSwitch, IPATRowValue: @(self.autoConnect)}];
     [rows addObject:@{IPATRowKey: IPATKeyAnyVpnNoDTLS, IPATRowTitle: @"禁用 DTLS",   IPATRowKind: IPATRowKindSwitch, IPATRowValue: @(self.noDTLS)}];
     [rows addObject:@{IPATRowKey: IPATKeyAnyVpnConnect, IPATRowTitle: @"立即连接",   IPATRowKind: IPATRowKindAction}];
@@ -790,6 +852,10 @@ static void cb_protect_socket(void *privdata, int fd) {
     for (NSString *k in values)
         if ([k hasPrefix:@"IPATAnyVpnProf:"] && [values[k] isKindOfClass:[NSString class]])
             [self applyProfileFieldEdit:k value:values[k]];
+    // 面板 TOTP 行（账号/密钥编辑）→ 写回密钥表
+    for (NSString *k in values)
+        if ([k hasPrefix:@"IPATAnyVpnTotp:"] && [values[k] isKindOfClass:[NSString class]])
+            [self applyTotpEdit:k value:values[k]];
     BOOL enabled = note.userInfo[IPATChgEnabled] ? [note.userInfo[IPATChgEnabled] boolValue] : self.masterOn;
     self.masterOn = enabled;
     if (activeChanged && self.running) [self stopConnect];   // 换连接：断开旧隧道，下面自动重连新的
@@ -812,7 +878,56 @@ static void cb_protect_socket(void *privdata, int fd) {
         [self addProfileAction];
     } else if ([key isEqualToString:IPATKeyAnyVpnDelProfile]) {
         [self deleteActiveProfileAction];
+    } else if ([key isEqualToString:IPATKeyAnyVpnAddTotp]) {
+        [self addTotpAction];
+    } else if ([key isEqualToString:IPATKeyAnyVpnDelTotp]) {
+        [self deleteLastTotpAction];
     }
+    [self registerPanel];
+}
+
+/// 添加一条 TOTP 密钥（账号 + Base32 密钥）
+- (void)addTotpAction {
+    UIAlertController *alert = [UIAlertController
+        alertControllerWithTitle:@"添加 TOTP 密钥"
+                         message:@"填该密钥所属的账号（要与连接里填的账号一致）"
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"账号";
+        tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
+        tf.autocorrectionType = UITextAutocorrectionTypeNo;
+    }];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"TOTP 密钥（Base32，如 JBSWY3DPEHPK3PXP）";
+        tf.autocapitalizationType = UITextAutocapitalizationTypeAllCharacters;
+        tf.autocorrectionType = UITextAutocorrectionTypeNo;
+    }];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        NSString *user = alert.textFields[0].text ?: @"";
+        NSString *secret = alert.textFields[1].text ?: @"";
+        if (user.length == 0 || secret.length == 0) {
+            [self toast:@"账号和密钥都要填"];
+            return;
+        }
+        NSMutableArray *entries = [[self totpEntries] mutableCopy];
+        [entries addObject:@{@"user": user, @"secret": secret}];
+        [self saveTotpEntries:entries];
+        [self toast:[NSString stringWithFormat:@"已添加 %@ 的 TOTP 密钥", user]];
+        [self registerPanel];
+    }]];
+    [self presentAlert:alert];
+}
+
+/// 删除最后一条 TOTP 密钥
+- (void)deleteLastTotpAction {
+    NSMutableArray *entries = [[self totpEntries] mutableCopy];
+    if (entries.count == 0) return;
+    NSString *user = entries.lastObject[@"user"] ?: @"";
+    [entries removeLastObject];
+    [self saveTotpEntries:entries];
+    [self toast:[NSString stringWithFormat:@"已删除 %@ 的 TOTP 密钥", user]];
     [self registerPanel];
 }
 
@@ -846,7 +961,10 @@ static void cb_protect_socket(void *privdata, int fd) {
     g_cfgUser  = p[@"user"].length     ? p[@"user"]     : [self plist:@"User" default:@""];
     g_cfgPass  = p[@"password"].length ? p[@"password"] : [self plist:@"Password" default:@""];
     g_cfgGroup = p[@"authgroup"].length ? p[@"authgroup"] : [self plist:@"AuthGroup" default:@""];
-    g_totpSecret = p[@"totp"].length    ? p[@"totp"]    : [self plist:@"TotpSecret" default:@""];
+    // TOTP 密钥是账号级凭据（对齐 Android 端 TotpVault.get(username)）：
+    // 按当前连接的账号从密钥表取，找不到再回落 Info.plist 的 TotpSecret
+    g_totpSecret = [self totpSecretForUser:g_cfgUser]
+                   ?: [self plist:@"TotpSecret" default:@""];
     NSDictionary<NSString *, NSString *> *ap = [self activeProfile];
     if (ap) [self status:[NSString stringWithFormat:@"正在连接 %@ …", ap[@"name"] ?: @""]];
     return YES;

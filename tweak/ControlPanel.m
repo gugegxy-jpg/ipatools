@@ -872,7 +872,7 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
                                                                  : NSNotFound;
         segmented.selectedSegmentIndex = (index == NSNotFound) ? 0 : index;
         control = segmented;
-    } else {
+    } else if ([kind isEqualToString:IPATRowKindSwitch]) {
         UISwitch *toggle = [[UISwitch alloc] init];
         toggle.onTintColor = [UIColor colorWithRed:0.16 green:0.62 blue:0.36 alpha:1.0];
         toggle.on = IPATCpStoredBool(key, [row[IPATRowValue] boolValue]);
@@ -880,6 +880,10 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
                                   y + (IPATCpRowHeight - toggle.bounds.size.height) / 2.0,
                                   toggle.bounds.size.width, toggle.bounds.size.height);
         control = toggle;
+    } else {
+        // 未知行类型（新版功能 dylib + 旧版面板，或协议演进）：按动作行渲染。
+        // 千万不能默认画开关——开关会把 BOOL 写进字符串配置键，污染数据
+        return [self addActionRow:row key:key featureId:featureId y:y width:width note:note];
     }
 
     control.tag = (NSInteger)self.rowModels.count;
