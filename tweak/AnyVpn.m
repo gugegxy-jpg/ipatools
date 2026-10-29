@@ -1007,11 +1007,13 @@ static void cb_protect_socket(void *privdata, int fd) {
             close(rs);
         }
 
+        // ip->addr 是 const char*，喂给 %@ 前必须包成 NSString（类型不匹配还会运行时崩）
+        NSString *ipStr = ip->addr ? @(ip->addr) : @"";
         [self status:[NSString stringWithFormat:@"已连接 %@（IP %@ / %@%s）",
-                      server, ip->addr ?: "", ifname,
+                      server, ipStr, @(ifname),
                       root ? "" : "，非越狱模式：接管本 App 直连流量"]];
         [self toast:[NSString stringWithFormat:@"✅ VPN 已连接 %@（IP %@）",
-                     [self activeProfile][@"name"] ?: server, ip->addr ?: @""]];
+                     [self activeProfile][@"name"] ?: server, ipStr]];
 
         // 主循环：断线重连参数与 Android 端一致
         openconnect_mainloop(g_vpninfo, 300, 10);
