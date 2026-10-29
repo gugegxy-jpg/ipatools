@@ -707,9 +707,13 @@ static void cb_protect_socket(void *privdata, int fd) {
 }
 
 - (void)addProfileAction {
+    // 沿用当前连接的账号/密码/认证组做默认值：多网关场景下这些通常相同，
+    // 只需要改名称和服务器，省去重复输入
+    NSDictionary<NSString *, NSString *> *prev = [self activeProfile];
     UIAlertController *alert = [UIAlertController
         alertControllerWithTitle:@"添加连接"
-                         message:@"连接名称用于在面板里切换；服务器必填"
+                         message:(prev ? @"已沿用当前连接的账号/密码/认证组，只需填名称和服务器"
+                                       : @"连接名称用于在面板里切换；服务器必填")
                   preferredStyle:UIAlertControllerStyleAlert];
     [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
         tf.placeholder = @"连接名称（如 公司 VPN）";
@@ -721,13 +725,16 @@ static void cb_protect_socket(void *privdata, int fd) {
     }];
     [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
         tf.placeholder = @"账号（可留空稍后填）";
+        tf.text = prev[@"user"] ?: @"";
     }];
     [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
         tf.placeholder = @"密码（可留空稍后填）";
         tf.secureTextEntry = YES;
+        tf.text = prev[@"password"] ?: @"";
     }];
     [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
         tf.placeholder = @"认证组（可留空 = 自动选第一个）";
+        tf.text = prev[@"authgroup"] ?: @"";
     }];
     [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     [alert addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault
