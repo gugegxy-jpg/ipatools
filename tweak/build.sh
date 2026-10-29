@@ -163,6 +163,7 @@ build_target() {
   #    CGBitmapContextCreate / CGAffineTransform* / CGRectGet* 必须显式链接 CoreGraphics；
   # 2) 必须用 if ! 显式判失败：build_target 是作为 `... || status=1` 的左操作数调用的，
   #    在那种上下文里 bash 会禁用函数内的 set -e，链接失败会被静默吞掉（还会误报"已生成"）。
+  # IPAT_BUILD_NUM：面板上显示构建号，用户一眼确认设备里加载的是不是最新 dylib
   if ! xcrun -sdk iphoneos clang \
     -dynamiclib -fobjc-arc -O2 \
     "${ARCH_FLAGS[@]}" \
@@ -170,6 +171,7 @@ build_target() {
     -isysroot "$SDK" \
     -framework Foundation -framework UIKit -framework CoreGraphics \
     -framework QuartzCore \
+    -DIPAT_BUILD_NUM="\"$GITHUB_RUN_NUMBER\"" \
     ${extra[@]+"${extra[@]}"} \
     -install_name "@executable_path/Frameworks/$name.dylib" \
     -o "$out" "${srcs[@]}"; then
