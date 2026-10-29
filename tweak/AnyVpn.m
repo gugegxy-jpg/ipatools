@@ -1139,8 +1139,36 @@ static void cb_protect_socket(void *privdata, int fd) {
     [self status:@"正在断开…"];
 }
 
+// 连接线程入口：整轮重试（对齐 Android 端 MAX_CONNECT_ATTEMPTS=3 /
+// RETRY_DELAY_MS=2000）。认证失败（典型：TOTP 时间窗尾部被网关 401）下一轮
+// 重新认证会生成新码，往往第二次就过
 - (void)runSession {
     @autoreleasepool {
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            if (!self.masterOn) return;
+            if (attempt > 1) {
+                [self status:[NSString stringWithFormat:@"第 %d 次尝试失败，2 秒后重试（共 3 次）",
+                              attempt - 1]];
+                [NSThread sleepForTimeInterval:2.0];
+                if (!self.masterOn) return;
+            }
+            if ([self runSessionOnce]) return;   // 走完 mainloop 正常断开
+        }
+        [self fail:@"连续 3 次连接失败，已停止（点「复制连接日志」查原因）"];
+    }
+}
+
+// 单次完整连接尝试。返回 YES = 走完 mainloop 正常断开（结束重试）；
+// NO = 本轮失败（fail: 里已 cleanup，可重试）
+- (BOOL)runSessionOnce {
+    @autoreleasepool {
+        // 每次尝试都是全新认证，TOTP 状态机必须重置
+        g_otpWindow = -1;
+        g_lastOtp[0] = 0;
+        g_otpRejects = 0;
+        g_usedOtpThisAttempt = NO;
+        g_staticPasswordSubmitted = NO;
+
         NSString *underlying = [self plist:@"UnderlyingIface" default:@"en0"];
         g_underlying_idx = ifindex_of(underlying.UTF8String);
         NSString *server = g_cfgServer;
@@ -1178,13 +1206,13 @@ static void cb_protect_socket(void *privdata, int fd) {
                 [self fail:[NSString stringWithFormat:
                     @"域名解析到了代理软件的 fake-IP（%@）——请关闭 Surge/小火箭等代理，"
                     "或把该域名设为直连", [NSString stringWithUTF8String:ipbuf]]];
-                return;
+                return NO;
             }
         }
 
         if (openconnect_init_ssl() != 0) {
             [self fail:@"SSL 初始化失败"];
-            return;
+            return NO;
         }
         NSString *ua = [self plist:@"UserAgent" default:@"AnyConnect Darwin/5.0.05042"];
         g_vpninfo = openconnect_vpninfo_new((char *)ua.UTF8String,
@@ -1192,7 +1220,7 @@ static void cb_protect_socket(void *privdata, int fd) {
                                             cb_auth_form, cb_progress, NULL);
         if (!g_vpninfo) {
             [self fail:@"vpninfo 创建失败"];
-            return;
+            return NO;
         }
         openconnect_set_protocol(g_vpninfo, "anyconnect");
         // 注意：不用 openconnect 的 --token-mode=totp（对齐 Android 端决策）——
@@ -1208,7 +1236,7 @@ static void cb_protect_socket(void *privdata, int fd) {
         if (self.noDTLS) openconnect_disable_dtls(g_vpninfo);
         if (openconnect_parse_url(g_vpninfo, server.UTF8String) != 0) {
             [self fail:[NSString stringWithFormat:@"服务器地址解析失败：%@", server]];
-            return;
+            return NO;
         }
         g_cmd_fd = openconnect_setup_cmd_pipe(g_vpninfo);
 
@@ -1216,11 +1244,11 @@ static void cb_protect_socket(void *privdata, int fd) {
         // obtain_cookie 失败可能是 DNS/网络/证书/表单任一环节，统一让用户看日志
         if (openconnect_obtain_cookie(g_vpninfo) != 0) {
             [self fail:@"连接网关失败（DNS/网络/证书/认证，点「复制连接日志」查原因）"];
-            return;
+            return NO;
         }
         if (openconnect_make_cstp_connection(g_vpninfo) != 0) {
             [self fail:@"CSTP 隧道建立失败"];
-            return;
+            return NO;
         }
 
         const struct oc_ip_info *ip = NULL;
@@ -1228,7 +1256,7 @@ static void cb_protect_socket(void *privdata, int fd) {
         openconnect_get_ip_info(g_vpninfo, &ip, &cstp, &dtls);
         if (!ip || !ip->addr) {
             [self fail:@"网关没下发 IP 信息"];
-            return;
+            return NO;
         }
 
         // TUN 两种模式：
@@ -1241,32 +1269,33 @@ static void cb_protect_socket(void *privdata, int fd) {
             g_tun_fd = create_utun(ifname);
             if (g_tun_fd < 0) {
                 [self fail:@"utun 创建失败"];
-                return;
+                return NO;
             }
             if (ifconfig_tun(ifname, ip->addr,
                              ip->gateway_addr ? ip->gateway_addr : ip->addr,
                              ip->netmask ? ip->netmask : "255.255.255.0") != 0) {
                 [self fail:[NSString stringWithFormat:@"utun(%s) 地址配置失败（SIOCAIFADDR）",
                             ifname]];
-                return;
+                return NO;
             }
             if (openconnect_setup_tun_fd(g_vpninfo, g_tun_fd) != 0) {
                 [self fail:@"tun fd 交给 openconnect 失败"];
-                return;
+                return NO;
             }
         } else {
             int sp[2];
-            // 必须用 SEQPACKET：openconnect 的 tun 读是按包边界的（一次 read =
-            // 一个完整 IP 包）。SOCK_STREAM 是字节流会粘包，openconnect 读出
-            // 畸形包 → 服务端解析失败断 CSTP → 表现为几秒一断的连接循环
-            if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sp) != 0) {
-                [self fail:@"socketpair 创建失败（SEQPACKET）"];
-                return;
+            // 必须保包边界：openconnect 的 tun 读是按包边界的（一次 read = 一个
+            // 完整 IP 包）。SOCK_STREAM 是字节流会粘包 → 服务端收到畸形包秒断
+            // CSTP。iOS 的 XNU 不支持 AF_UNIX SEQPACKET，用 DGRAM（同样一次
+            // write = 一次 read 一个包，语义等价）
+            if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sp) != 0) {
+                [self fail:@"socketpair 创建失败（DGRAM）"];
+                return NO;
             }
             if (openconnect_setup_tun_fd(g_vpninfo, sp[0]) != 0) {
                 close(sp[0]); close(sp[1]);
                 [self fail:@"tun fd 交给 openconnect 失败"];
-                return;
+                return NO;
             }
             NSString *err = nil;
             NSMutableArray<NSString *> *dns = [NSMutableArray array];
@@ -1279,7 +1308,7 @@ static void cb_protect_socket(void *privdata, int fd) {
                                 dns, &err)) {
                 close(sp[1]);
                 [self fail:[NSString stringWithFormat:@"非越狱引擎启动失败：%@", err ?: @""]];
-                return;
+                return NO;
             }
             strlcpy(ifname, "t2s", IFNAMSIZ);
         }
@@ -1316,6 +1345,7 @@ static void cb_protect_socket(void *privdata, int fd) {
         [self teardownRoutesIfNeeded:ip];
         [self status:@"已断开"];
         [self cleanup];
+        return YES;
     }
 }
 

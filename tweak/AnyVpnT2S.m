@@ -166,7 +166,7 @@ static err_t t2s_output(struct netif *nif, struct pbuf *p, const ip4_addr_t *ipa
         memcpy(linear + total, q->payload, q->len);
         total += q->len;
     }
-    // g_ocFd 是 SOCK_SEQPACKET：一次 write 必须是完整一个 IP 包（openconnect
+    // g_ocFd 是 AF_UNIX SOCK_DGRAM：一次 write 必须是完整一个 IP 包（openconnect
     // 按包边界 read）。不存在部分写——缓冲满（EAGAIN/ENOBUFS）就整包丢弃，
     // 靠 lwIP TCP 重传兜底；UDP 丢了就丢了
     ssize_t n = write(g_ocFd, linear, total);
@@ -189,7 +189,7 @@ static err_t t2s_netif_init(struct netif *nif) {
 
 static void t2s_feed_lwip(void) {
     static uint8_t pkt[65535];
-    // g_ocFd 是 SOCK_SEQPACKET：每次 read 恰好取出一个完整 IP 包（不会粘包/
+    // g_ocFd 是 AF_UNIX SOCK_DGRAM：每次 read 恰好取出一个完整 IP 包（不会粘包/
     // 残包），drain 到 EAGAIN 为止
     for (;;) {
         ssize_t n = read(g_ocFd, pkt, sizeof pkt);
