@@ -731,18 +731,13 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
     hint.text = @"点空白收起";
     [self.contentView addSubview:hint];
 
-    // 相邻功能区块之间画一条分割线：多 dylib 注入后行数一多，
+    // 相邻功能区块之间画一条分界线：多 dylib 注入后行数一多，
     // 光靠空隙分不清哪几行是谁的
     NSArray<NSString *> *ids = [self sortedFeatureIds];
     for (NSUInteger i = 0; i < ids.count; i++) {
         y = [self addSection:self.features[ids[i]] y:y width:width];
         if (i + 1 < ids.count) {
-            UIView *sep = [[UIView alloc]
-                initWithFrame:CGRectMake(IPATCpInset, y + 2.0, width - IPATCpInset * 2,
-                                         1.0 / [UIScreen mainScreen].scale)];
-            sep.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.14];
-            [self.contentView addSubview:sep];
-            y += 10.0;   // 分割线 + 两侧间隙
+            y = [self addFeatureDivider:y width:width];
         }
     }
 
@@ -789,6 +784,25 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
         if (![ids containsObject:featureId]) [ids addObject:featureId];
     }
     return ids;
+}
+
+/// 功能区块之间的分界线：两端淡出的渐变亮线，上下留白充足。
+/// 区块内部已不再画线，全面板只有这一种线，一眼就是「功能之间的分界」
+- (CGFloat)addFeatureDivider:(CGFloat)y width:(CGFloat)width {
+    UIView *sep = [[UIView alloc] initWithFrame:CGRectMake(IPATCpInset, y + 8.0,
+                                                           width - IPATCpInset * 2, 1.5)];
+    sep.userInteractionEnabled = NO;
+    CAGradientLayer *grad = [CAGradientLayer layer];
+    grad.frame = sep.bounds;
+    grad.colors = @[(id)[UIColor colorWithWhite:1.0 alpha:0.0].CGColor,
+                    (id)[UIColor colorWithWhite:1.0 alpha:0.30].CGColor,
+                    (id)[UIColor colorWithWhite:1.0 alpha:0.0].CGColor];
+    grad.locations = @[@0.0, @0.5, @1.0];
+    grad.startPoint = CGPointMake(0.0, 0.5);
+    grad.endPoint = CGPointMake(1.0, 0.5);
+    [sep.layer addSublayer:grad];
+    [self.contentView addSubview:sep];
+    return y + 22.0;   // 线上 8 + 线 1.5 + 线下 12.5
 }
 
 - (CGFloat)addSection:(NSDictionary *)reg y:(CGFloat)y width:(CGFloat)width {
@@ -838,12 +852,6 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
 
     NSArray *rows = reg[IPATRegRows];
     if (![rows isKindOfClass:[NSArray class]] || rows.count == 0) return y + 6.0;
-
-    UIView *line = [[UIView alloc] initWithFrame:CGRectMake(IPATCpInset, y, contentWidth,
-                                                            1.0 / [UIScreen mainScreen].scale)];
-    line.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.12];
-    [self.contentView addSubview:line];
-    y += 1.0;
 
     for (NSDictionary *row in rows) {
         if (![row isKindOfClass:[NSDictionary class]]) continue;
