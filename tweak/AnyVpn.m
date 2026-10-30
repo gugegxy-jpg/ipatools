@@ -1139,22 +1139,28 @@ static void cb_protect_socket(void *privdata, int fd) {
         NSFileManager *fm = [NSFileManager defaultManager];
         NSString *text = [NSString stringWithContentsOfFile:path
                                                    encoding:NSUTF8StringEncoding error:nil];
-        NSString *note = nil;
-        if (!text) {
-            // 最常见原因：覆盖安装把沙盒清空了，日志文件被删
-            note = [NSString stringWithFormat:@"日志文件不存在（%@）——刚覆盖安装过？先启动一次游戏再复制",
-                    path.lastPathComponent];
+        NSMutableArray<NSString *> *lines = [[text componentsSeparatedByString:@"\n"] mutableCopy];
+        // 内存副本补齐：文件被沙盒清空/轮转/写失败时，至少还有本次会话的日志
+        NSArray<NSString *> *mem = [IPATLogMemoryBuffer() copy];
+        NSMutableSet<NSString *> *seen = [NSMutableSet setWithArray:lines ?: @[]];
+        for (NSString *l in mem) {
+            if (l.length && ![seen containsObject:l]) {
+                [seen addObject:l];
+                [lines addObject:l];
+            }
         }
         // 只取尾部 300 行，剪贴板塞几十 KB 足够排障且不卡 UI
-        NSMutableArray<NSString *> *lines = [[text componentsSeparatedByString:@"\n"] mutableCopy];
         if (lines.count > 300)
             lines = [[lines subarrayWithRange:NSMakeRange(lines.count - 300, 300)] mutableCopy];
         NSString *out = [lines componentsJoinedByString:@"\n"];
         unsigned long long size = [[fm attributesOfItemAtPath:path error:nil][NSFileSize] unsignedLongLongValue];
         dispatch_async(dispatch_get_main_queue(), ^{
             [UIPasteboard generalPasteboard].string = out;
-            if (note) {
-                [self toast:note];
+            if (lines.count == 0) {
+                [self toast:@"没有任何日志：本进程没产生过日志（功能 dylib 可能没加载）"];
+            } else if (!text) {
+                [self toast:[NSString stringWithFormat:@"已复制 %lu 行（来自内存，日志文件不存在）",
+                             (unsigned long)lines.count]];
             } else {
                 [self toast:[NSString stringWithFormat:@"已复制 %lu 行日志到剪贴板（文件 %.1f KB）",
                              (unsigned long)lines.count, (double)size / 1024.0]];

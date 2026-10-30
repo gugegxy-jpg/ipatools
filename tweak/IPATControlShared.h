@@ -25,6 +25,17 @@
 
 #pragma mark - 日志
 
+/// 内存里的日志环形缓冲（最近 600 行）。
+/// 文件链路（Documents/ipatool.log）会因为沙盒被覆盖安装清空、超限轮转、
+/// 写入失败等原因变空——排查最需要日志的时候它偏偏没了，所以内存里再留一份，
+/// 「复制日志」时与文件内容合并，保证任何情况下都不会出现「0 行」。
+static NSMutableArray<NSString *> *IPATLogMemoryBuffer(void) {
+    static NSMutableArray<NSString *> *buf;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ buf = [NSMutableArray array]; });
+    return buf;
+}
+
 /// 除了 NSLog，再往 App 沙盒里写一份（Documents/ipatool.log）。
 /// 没有 Mac / Xcode 时没法看系统日志，落盘之后可以直接在面板里
 ///「文件 → 找到 ipatool.log → 导出」把日志拿出来。
@@ -41,14 +52,37 @@ static void IPATAppendLogLine(NSString *line) {
         formatter.dateFormat = @"MM-dd HH:mm:ss";
         formatter.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
     });
+
+    // 内存副本（与文件内容互为备份）
+    @synchronized (IPATLogMemoryBuffer()) {
+        NSMutableArray<NSString *> *buf = IPATLogMemoryBuffer();
+        [buf addObject:line ?: @""];
+        if (buf.count > 600) {
+            [buf removeObjectsInRange:NSMakeRange(0, buf.count - 600)];
+        }
+    }
+
     if (logPath.length == 0 || !formatter) return;
 
     NSFileManager *manager = [NSFileManager defaultManager];
-    // 别让日志无限长：超过 4MB 就从头再来（原来 512KB 太小，排查期间
-    // 几轮连接就打满，日志整段消失，看着像“不产生新的了”）
+    // 别让日志无限长：超过 4MB 就截掉头部、保留尾部 1MB（原来 512KB 太小，
+    // 排查期间几轮连接就打满，日志整段消失，看着像“不产生新的了”）
     NSDictionary *attrs = [manager attributesOfItemAtPath:logPath error:nil];
-    if (attrs && [attrs[NSFileSize] unsignedLongLongValue] > 4 * 1024 * 1024) {
-        [manager removeItemAtPath:logPath error:nil];
+    unsigned long long fileSize = attrs ? [attrs[NSFileSize] unsignedLongLongValue] : 0;
+    if (fileSize > 4 * 1024 * 1024) {
+        NSFileHandle *rh = [NSFileHandle fileHandleForReadingAtPath:logPath];
+        if (rh) {
+            unsigned long long keep = 1024 * 1024;
+            @try {
+                [rh seekToFileOffset:fileSize - keep];
+                NSData *tail = [rh readDataOfLength:(NSUInteger)keep];
+                [rh closeFile];
+                [manager removeItemAtPath:logPath error:nil];
+                [tail writeToFile:logPath atomically:YES];
+            } @catch (NSException *exception) {
+                [rh closeFile];
+            }
+        }
     }
     NSString *text = [NSString stringWithFormat:@"%@ %@\n",
                       [formatter stringFromDate:[NSDate date]], line];
