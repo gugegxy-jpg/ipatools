@@ -295,9 +295,13 @@ static NSString *const kSoloXChartJS =
     if (portrait) {
         CGFloat safeTop = 0;
         if (@available(iOS 11.0, *)) {
-            // 优先读游戏窗口的安全区（未旋转、数值可靠），拿不到再读自己的
-            safeTop = app ? app.safeAreaInsets.top : _window.safeAreaInsets.top;
-            if (safeTop <= 0) safeTop = _window.safeAreaInsets.top;
+            // 优先读游戏窗口的安全区（未旋转、数值可靠），拿不到再读自己的。
+            // 两种来源都可能给出未结算的异常值（窗口刚重建/scene 刚激活时），
+            // 超过 200pt 的一律不采用——顶条被推出屏幕外比贴顶更糟
+            UIWindow *src = app ?: _window;
+            safeTop = src.safeAreaInsets.top;
+            if (safeTop <= 0 || safeTop > 200) safeTop = _window.safeAreaInsets.top;
+            if (safeTop <= 0 || safeTop > 200) safeTop = 0;
         }
         top = MAX(top, safeTop + 4.0);
     }
@@ -325,7 +329,13 @@ static NSString *const kSoloXChartJS =
     _fps.hidden = !_showFPS;
     _bat.hidden = !_showBAT;
     _temp.hidden = !_showTEMP;
-    if (_masterOn) [self align];
+    if (_masterOn) {
+        [self align];
+        // 首次显示时窗口/scene 的几何和安全区可能还没结算完，同步 align 算出的
+        // 位置可能是错的（性能条整个跑到屏幕外，表现为「不显示任何数据」）。
+        // 延迟再对齐一次；转屏通知已有同样的 alignLate 兜底
+        [self alignLate];
+    }
 }
 
 #pragma mark - 注册到游戏内悬浮窗
