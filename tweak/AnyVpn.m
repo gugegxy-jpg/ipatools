@@ -1136,17 +1136,29 @@ static void cb_protect_socket(void *privdata, int fd) {
         NSString *path = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
                              NSUserDomainMask, YES).firstObject
                           stringByAppendingPathComponent:@"ipatool.log"];
+        NSFileManager *fm = [NSFileManager defaultManager];
         NSString *text = [NSString stringWithContentsOfFile:path
                                                    encoding:NSUTF8StringEncoding error:nil];
+        NSString *note = nil;
+        if (!text) {
+            // 最常见原因：覆盖安装把沙盒清空了，日志文件被删
+            note = [NSString stringWithFormat:@"日志文件不存在（%@）——刚覆盖安装过？先启动一次游戏再复制",
+                    path.lastPathComponent];
+        }
         // 只取尾部 300 行，剪贴板塞几十 KB 足够排障且不卡 UI
         NSMutableArray<NSString *> *lines = [[text componentsSeparatedByString:@"\n"] mutableCopy];
         if (lines.count > 300)
             lines = [[lines subarrayWithRange:NSMakeRange(lines.count - 300, 300)] mutableCopy];
         NSString *out = [lines componentsJoinedByString:@"\n"];
+        unsigned long long size = [[fm attributesOfItemAtPath:path error:nil][NSFileSize] unsignedLongLongValue];
         dispatch_async(dispatch_get_main_queue(), ^{
             [UIPasteboard generalPasteboard].string = out;
-            [self toast:[NSString stringWithFormat:@"已复制 %lu 行日志到剪贴板",
-                         (unsigned long)lines.count]];
+            if (note) {
+                [self toast:note];
+            } else {
+                [self toast:[NSString stringWithFormat:@"已复制 %lu 行日志到剪贴板（文件 %.1f KB）",
+                             (unsigned long)lines.count, (double)size / 1024.0]];
+            }
         });
     });
 }

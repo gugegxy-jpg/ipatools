@@ -44,9 +44,10 @@ static void IPATAppendLogLine(NSString *line) {
     if (logPath.length == 0 || !formatter) return;
 
     NSFileManager *manager = [NSFileManager defaultManager];
-    // 别让日志无限长：超过 512KB 就从头再来
+    // 别让日志无限长：超过 4MB 就从头再来（原来 512KB 太小，排查期间
+    // 几轮连接就打满，日志整段消失，看着像“不产生新的了”）
     NSDictionary *attrs = [manager attributesOfItemAtPath:logPath error:nil];
-    if (attrs && [attrs[NSFileSize] unsignedLongLongValue] > 512 * 1024) {
+    if (attrs && [attrs[NSFileSize] unsignedLongLongValue] > 4 * 1024 * 1024) {
         [manager removeItemAtPath:logPath error:nil];
     }
     NSString *text = [NSString stringWithFormat:@"%@ %@\n",
