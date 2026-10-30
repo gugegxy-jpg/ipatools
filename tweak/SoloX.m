@@ -74,6 +74,17 @@ static NSString *const kSoloXChartJS =
 - (void)refreshMetrics;
 @end
 
+/// 根控制器：允许转到「游戏现在这个方向」。用裸 UIViewController 的话窗口的
+/// 方向策略回落到 App 的 Info.plist——横屏游戏里窗口被系统锁成竖屏，
+/// 性能条就竖着挂在屏幕边上。与悬浮面板（IPATCpRootController）同一套做法
+@interface SoloXRootVC : UIViewController
+@end
+
+@implementation SoloXRootVC
+- (BOOL)shouldAutorotate { return YES; }
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return IPATAppOrientationMask(); }
+@end
+
 @implementation SoloXMonitor {
     UIWindow *_window;
     UIView *_bar;
@@ -207,7 +218,7 @@ static NSString *const kSoloXChartJS =
     _window.backgroundColor = [UIColor clearColor];
     _window.hidden = YES;   // 先隐藏；等 App 真正进入前台（didBecomeActive）后由 applyVisibility 显示，
                             // 否则 launch 阶段挂在未激活窗口上会一直不显示，要手动开关一次才出
-    _window.rootViewController = [[UIViewController alloc] init];
+    _window.rootViewController = [[SoloXRootVC alloc] init];
 
     UIView *rootView = _window.rootViewController.view;
 
