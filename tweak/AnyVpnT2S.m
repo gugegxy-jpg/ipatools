@@ -179,31 +179,40 @@ static err_t t2s_output(struct netif *nif, struct pbuf *p, const ip4_addr_t *ipa
         }
         return ERR_BUF;
     }
-    static uint8_t linear[TCP_MSS + 40];
+    // 关键：openconnect 在 Apple 平台编译进 TUN_HAS_AF_PREFIX（tun.c 里
+    // __APPLE__ 下无条件 #define TUNSIFHEAD）——os_read_tun 从 tun fd 读包时
+    // 会把数据前 4 字节当 utun 地址族头剥掉。所以这里必须给每个 IP 包前加
+    // 4 字节 htonl(AF_INET) 前缀一次 write 出去；否则 IP 头前 4 字节
+    // （45 00 ..）被当前缀吃掉，网关收到版本号=5 的畸形包立刻杀会话
+    //（表现：会话一旦发出第一个 tun 包就 0~3 秒内被干净断开）
+    static uint8_t linear[4 + TCP_MSS + 40];
     total = 0;
     for (struct pbuf *q = p; q; q = q->next) {
-        if (total + q->len > sizeof linear) return ERR_BUF;
-        memcpy(linear + total, q->payload, q->len);
+        if (4 + total + q->len > sizeof linear) return ERR_BUF;
+        memcpy(linear + 4 + total, q->payload, q->len);
         total += q->len;
     }
+    uint32_t afPrefix = htonl(2 /*AF_INET*/);
+    memcpy(linear, &afPrefix, 4);
     // 诊断：前 10 个出站包打印协议/源/目的——定位「网关收到包就杀会话」的元凶
-    // （lwIP 无链路层，linear[0] 起就是 IPv4 头：byte9=协议，12-15=源，16-19=目的）
+    // （linear+4 起才是 IPv4 头：byte9=协议，12-15=源，16-19=目的）
+    const uint8_t *iph = linear + 4;
     static int pktLogs = 0;
     if (pktLogs < 10 && total >= 20) {
         pktLogs++;
         char src[16], dst[16];
         snprintf(src, sizeof src, "%u.%u.%u.%u",
-                 linear[12], linear[13], linear[14], linear[15]);
+                 iph[12], iph[13], iph[14], iph[15]);
         snprintf(dst, sizeof dst, "%u.%u.%u.%u",
-                 linear[16], linear[17], linear[18], linear[19]);
+                 iph[16], iph[17], iph[18], iph[19]);
         T2SLog(@"出站包#%d：%u 字节 proto=%u %s -> %s",
-               pktLogs, (unsigned)total, linear[9], src, dst);
+               pktLogs, (unsigned)total, iph[9], src, dst);
     }
-    // g_ocFd 是 AF_UNIX SOCK_DGRAM：一次 write 必须是完整一个 IP 包（openconnect
+    // g_ocFd 是 AF_UNIX SOCK_DGRAM：一次 write 必须是完整一个包（openconnect
     // 按包边界 read）。不存在部分写——缓冲满（EAGAIN/ENOBUFS）就整包丢弃，
     // 靠 lwIP TCP 重传兜底；UDP 丢了就丢了
-    ssize_t n = write(g_ocFd, linear, total);
-    if (n == (ssize_t)total) {
+    ssize_t n = write(g_ocFd, linear, total + 4);
+    if (n == (ssize_t)(total + 4)) {
         g_statOutPkts++;
         g_statOutBytes += total;
         return ERR_OK;
@@ -235,6 +244,14 @@ static void t2s_feed_lwip(void) {
             return;   // EAGAIN：无更多数据；对端关闭同样退出
         }
         if (n == 0) return;
+        // openconnect 往 tun fd 回写时带 4 字节 utun AF 前缀（见 t2s_output
+        // 注释），剥掉再喂 lwIP；只放行 AF_INET（本引擎未启用 IPv6）
+        if (n < 4 + 20) continue;
+        uint32_t afVal;
+        memcpy(&afVal, pkt, 4);
+        if (ntohl(afVal) != 2 /*AF_INET*/) continue;
+        memmove(pkt, pkt + 4, (size_t)n - 4);
+        n -= 4;
         g_statInPkts++;
         g_statInBytes += (unsigned long long)n;
         struct pbuf *p = pbuf_alloc(PBUF_RAW, (u16_t)n, PBUF_RAM);
