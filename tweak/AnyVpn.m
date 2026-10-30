@@ -541,6 +541,11 @@ static void cb_protect_socket(void *privdata, int fd) {
     if ((self = [super init])) {
         _masterOn = NO;
         _running = NO;
+        // 连接状态不跨进程存活：上次若连着时杀掉 App，残留的开关值会变成
+        // 「显示开着但没有真实连接」的幽灵开关，启动时一律回落为关。
+        // （IPATKeyAnyVpnEnabled 只反映当前连接状态，不是用户设置；
+        //   初始默认值走 Info.plist 的 Enabled，由 applyConfig 读）
+        [[NSUserDefaults standardUserDefaults] removeObjectForKey:IPATKeyAnyVpnEnabled];
         [self applyConfig];
         [[NSNotificationCenter defaultCenter] addObserver:self
                                                  selector:@selector(handleChange:)
