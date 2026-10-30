@@ -88,7 +88,9 @@ static NSString *const kSoloXChartJS =
 @implementation SoloXMonitor {
     UIWindow *_window;
     UIView *_bar;
-    NSLayoutConstraint *_barTop;   // 性能条顶部距离（竖屏要让出刘海/灵动岛）
+    // 性能条的 frame 完全由 align() 直接计算（不用 Auto Layout）——
+    // 首次显示时窗口几何/安全区晚于约束结算，Auto Layout 会把标签排到底板
+    // 可视区外（表现：只有半透底板没有数据，转个屏才好），手动 frame 一步到位
     UILabel *_cpu, *_mem, *_net, *_fps, *_bat, *_temp;
     CADisplayLink *_link;
     NSInteger _frameCount;
@@ -223,22 +225,11 @@ static NSString *const kSoloXChartJS =
     UIView *rootView = _window.rootViewController.view;
 
     _bar = [[UIView alloc] init];
-    _bar.translatesAutoresizingMaskIntoConstraints = NO;
+    // frame 由 align() 直接算（见类注释），不参与 Auto Layout
     _bar.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.55];
     _bar.layer.cornerRadius = 6;            // 自身小圆角，避免和屏幕圆角打架
     _bar.clipsToBounds = YES;
     [rootView addSubview:_bar];
-    // 钉在窗口自身 bounds 上（align 把窗口铺满屏幕，scene 负责把它转到正确方向）；
-    // 不用 safeAreaLayoutGuide，避免随界面方向变化时安全区计算错位。
-    // 顶部距离由 align() 动态算：竖屏让出刘海/灵动岛，横屏贴顶 8pt。
-    // 两侧留 16pt 空白，避免被屏幕物理圆角把性能条两侧圆角裁掉。
-    _barTop = [_bar.topAnchor constraintEqualToAnchor:rootView.topAnchor constant:8];
-    [NSLayoutConstraint activateConstraints:@[
-        _barTop,
-        [_bar.leadingAnchor constraintEqualToAnchor:rootView.leadingAnchor constant:16],
-        [_bar.trailingAnchor constraintEqualToAnchor:rootView.trailingAnchor constant:-16],
-        [_bar.heightAnchor constraintEqualToConstant:22],
-    ]];
 
     UIFont *font = [UIFont monospacedDigitSystemFontOfSize:11 weight:UIFontWeightMedium];
     UIColor *fg = [UIColor colorWithRed:0.40 green:1.0 blue:0.50 alpha:1.0];   // 绿色字体
@@ -305,7 +296,10 @@ static NSString *const kSoloXChartJS =
         }
         top = MAX(top, safeTop + 4.0);
     }
-    _barTop.constant = top;
+    // 直接摆 frame：窗口 bounds 是「未旋转的竖屏尺寸」，top 永远是刘海那一侧
+    _bar.frame = CGRectMake(16.0, top,
+                            MAX(120.0, _window.bounds.size.width - 32.0), 22.0);
+    [_bar layoutIfNeeded];   // 让内部 stack 的约束立刻结算，不等下一帧
 }
 
 /// 转屏动画约 0.4s，动画期间读到的 safeAreaInsets 还是旧的；
