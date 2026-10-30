@@ -135,6 +135,9 @@ static UDPSession *g_udpSess;
 // 流量计数（诊断用）：out = 客户端→隧道（t2s_output），in = 隧道→客户端（t2s_feed_lwip）
 static unsigned long long g_statOutPkts, g_statOutBytes;
 static unsigned long long g_statInPkts, g_statInBytes;
+// 诊断：游戏发起的 IPv6 连接数（引擎只接管 IPv4，这些全部直连物理网络，
+// 出口环境不变的头号嫌疑）
+static unsigned long long g_statV6Bypass;
 
 // 受保护 fd（openconnect 自己的 socket，绝不劫持）
 #define PROTECTED_MAX 128
@@ -782,6 +785,21 @@ static BOOL t2s_wire_fd(int fd, BOOL isTCP, const struct sockaddr_in *dest) {
 }
 
 static int hooked_connect(int fd, const struct sockaddr *sa, socklen_t len) {
+    // 诊断：引擎就绪期间游戏发起的 IPv6 连接全部直连物理网络（引擎只接管 IPv4），
+    // 这是「连上 VPN 但出口环境不变」的头号嫌疑——先计数/采样确认规模
+    if (g_hooksInstalled && sa && sa->sa_family == AF_INET6 && g_ready && !isProtectedFD(fd)) {
+        g_statV6Bypass++;
+        static int v6Logs = 0;
+        if (v6Logs < 5 && len >= (socklen_t)sizeof(struct sockaddr_in6)) {
+            v6Logs++;
+            char buf[INET6_ADDRSTRLEN] = {0};
+            uint16_t port = 0;
+            const struct sockaddr_in6 *d6 = (const struct sockaddr_in6 *)sa;
+            inet_ntop(AF_INET6, &d6->sin6_addr, buf, sizeof buf);
+            port = ntohs(d6->sin6_port);
+            T2SLog(@"IPv6 直连 #%d：[%s]:%u（未进隧道）", v6Logs, buf, port);
+        }
+    }
     if (g_hooksInstalled && sa && sa->sa_family == AF_INET && g_ready && !isProtectedFD(fd) &&
         len >= (socklen_t)sizeof(struct sockaddr_in)) {
         const struct sockaddr_in *d = (const struct sockaddr_in *)sa;
@@ -800,6 +818,9 @@ static int hooked_connect(int fd, const struct sockaddr *sa, socklen_t len) {
 
 static ssize_t hooked_sendto(int fd, const void *buf, size_t n, int flags,
                              const struct sockaddr *sa, socklen_t slen) {
+    if (g_hooksInstalled && sa && sa->sa_family == AF_INET6 && g_ready && !isProtectedFD(fd)) {
+        g_statV6Bypass++;
+    }
     if (g_hooksInstalled && sa && sa->sa_family == AF_INET && g_ready && !isProtectedFD(fd) &&
         slen >= (socklen_t)sizeof(struct sockaddr_in)) {
         const struct sockaddr_in *d = (const struct sockaddr_in *)sa;
@@ -858,9 +879,9 @@ void T2SStatsLog(const char *tag) {
     int tcp = 0, udp = 0;
     for (TCPSession *s = g_tcpSess; s; s = s->next) tcp++;
     for (UDPSession *u = g_udpSess; u; u = u->next) udp++;
-    T2SLog(@"[%s] 出 %llu 包/%lluKB，入 %llu 包/%lluKB，TCP 会话 %d，UDP 会话 %d",
+    T2SLog(@"[%s] 出 %llu 包/%lluKB，入 %llu 包/%lluKB，TCP 会话 %d，UDP 会话 %d，IPv6 直连 %llu",
            tag, g_statOutPkts, g_statOutBytes / 1024,
-           g_statInPkts, g_statInBytes / 1024, tcp, udp);
+           g_statInPkts, g_statInBytes / 1024, tcp, udp, g_statV6Bypass);
 }
 
 void T2SInstallHooks(void) {
