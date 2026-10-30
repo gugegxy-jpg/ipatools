@@ -522,6 +522,7 @@ static void cb_protect_socket(void *privdata, int fd) {
 @property (nonatomic, assign) BOOL noDTLS;
 @property (nonatomic, assign) BOOL running;
 @property (nonatomic, assign) BOOL pendingReconnect;  // 切换连接后等 cleanup 完自动重连
+@property (nonatomic, copy) NSString *selectedIdMemo; // 本进程已知的选中连接 id（检测面板切换用）
 @end
 
 @implementation AnyVPNController
@@ -615,8 +616,13 @@ static void cb_protect_socket(void *privdata, int fd) {
 }
 
 - (NSString *)activeProfileId {
+    // 面板发变更通知前已经把新值写进了 NSUserDefaults（同一个键），
+    // 这里绝不能再读存储键来判断「有没有变化」——读回来永远是新值。
+    // 用内存里的 memo 记住本进程已知的选中 id，才能检测出面板传来的切换。
+    if (self.selectedIdMemo) return self.selectedIdMemo;
     NSString *a = [[NSUserDefaults standardUserDefaults] stringForKey:IPATKeyAnyVpnActive];
-    return a ?: @"";
+    self.selectedIdMemo = a ?: @"";
+    return self.selectedIdMemo;
 }
 
 /// 当前选中的 profile；activeId 无效时回落第一个，都没有返回 nil
@@ -844,8 +850,10 @@ static void cb_protect_socket(void *privdata, int fd) {
         }
         [self saveProfiles:out];
         // 当前选中的就是这条 → 同步 active 标识
-        if ([[self activeProfileId] isEqualToString:oldId])
+        if ([[self activeProfileId] isEqualToString:oldId]) {
             [[NSUserDefaults standardUserDefaults] setObject:newName forKey:IPATKeyAnyVpnActive];
+            self.selectedIdMemo = newName;
+        }
         [self toast:@"已保存"];
         [self registerPanel];
     }]];
@@ -868,6 +876,7 @@ static void cb_protect_socket(void *privdata, int fd) {
             if (![q[@"id"] isEqualToString:pid]) [out addObject:q];
         [self saveProfiles:out];
         [[NSUserDefaults standardUserDefaults] removeObjectForKey:IPATKeyAnyVpnActive];
+        self.selectedIdMemo = @"";   // 回落到第一个连接
         [self toast:@"已删除"];
         [self registerPanel];
     }]];
@@ -968,6 +977,7 @@ static void cb_protect_socket(void *privdata, int fd) {
         NSString *aid = values[IPATKeyAnyVpnActive];
         if (![aid isEqualToString:[self activeProfileId]]) {
             [[NSUserDefaults standardUserDefaults] setObject:aid forKey:IPATKeyAnyVpnActive];
+            self.selectedIdMemo = aid;
             activeChanged = YES;
             NSDictionary<NSString *, NSString *> *p = [self activeProfile];
             [self status:[NSString stringWithFormat:@"已选择连接：%@", p[@"name"] ?: @""]];
