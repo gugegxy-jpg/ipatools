@@ -1359,19 +1359,19 @@ static void cb_protect_socket(void *privdata, int fd) {
         //  - root（越狱）：建 utun 配地址加路由，系统级接管（老路径）
         //  - 非 root：socketpair 掉包，openconnect 的 tun 对端接 lwIP 用户态
         //    TCP/IP 栈 + fishhook 劫持宿主流量（见 AnyVpnT2S）
-        char ifname[IFNAMSIZ] = {0};
+        char tunname[IFNAMSIZ] = {0};
         BOOL root = (geteuid() == 0);
         if (root) {
-            g_tun_fd = create_utun(ifname);
+            g_tun_fd = create_utun(tunname);
             if (g_tun_fd < 0) {
                 [self fail:@"utun 创建失败"];
                 return NO;
             }
-            if (ifconfig_tun(ifname, ip->addr,
+            if (ifconfig_tun(tunname, ip->addr,
                              ip->gateway_addr ? ip->gateway_addr : ip->addr,
                              ip->netmask ? ip->netmask : "255.255.255.0") != 0) {
                 [self fail:[NSString stringWithFormat:@"utun(%s) 地址配置失败（SIOCAIFADDR）",
-                            ifname]];
+                            tunname]];
                 return NO;
             }
             if (openconnect_setup_tun_fd(g_vpninfo, g_tun_fd) != 0) {
@@ -1406,7 +1406,7 @@ static void cb_protect_socket(void *privdata, int fd) {
                 [self fail:[NSString stringWithFormat:@"非越狱引擎启动失败：%@", err ?: @""]];
                 return NO;
             }
-            strlcpy(ifname, "t2s", IFNAMSIZ);
+            strlcpy(tunname, "t2s", IFNAMSIZ);
         }
         // DTLS（UDP 443）在很多网络里握不上手（实测 DTLS handshake timed out），
         // 且断连循环的总发生在 DTLS 初始化之后——先强制禁用，走纯 CSTP(TCP)。
@@ -1435,7 +1435,7 @@ static void cb_protect_socket(void *privdata, int fd) {
         NSString *ipStr = ip->addr ? @(ip->addr) : @"";
         // %s 会把 UTF-8 中文按 Latin-1 解码（日志乱码），一律用 %@ + @() 包裹
         [self status:[NSString stringWithFormat:@"已连接 %@（IP %@ / %@%@）",
-                      server, ipStr, @(ifname),
+                      server, ipStr, @(tunname),
                       root ? @"" : @"，非越狱模式：接管本 App 直连流量"]];
         [self toast:[NSString stringWithFormat:@"✅ VPN 已连接 %@（IP %@）",
                      [self activeProfile][@"name"] ?: server, ipStr]];
