@@ -731,8 +731,19 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
     hint.text = @"点空白收起";
     [self.contentView addSubview:hint];
 
-    for (NSString *featureId in [self sortedFeatureIds]) {
-        y = [self addSection:self.features[featureId] y:y width:width];
+    // 相邻功能区块之间画一条分割线：多 dylib 注入后行数一多，
+    // 光靠空隙分不清哪几行是谁的
+    NSArray<NSString *> *ids = [self sortedFeatureIds];
+    for (NSUInteger i = 0; i < ids.count; i++) {
+        y = [self addSection:self.features[ids[i]] y:y width:width];
+        if (i + 1 < ids.count) {
+            UIView *sep = [[UIView alloc]
+                initWithFrame:CGRectMake(IPATCpInset, y + 2.0, width - IPATCpInset * 2,
+                                         1.0 / [UIScreen mainScreen].scale)];
+            sep.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.14];
+            [self.contentView addSubview:sep];
+            y += 10.0;   // 分割线 + 两侧间隙
+        }
     }
 
     if (self.features.count == 0) {
@@ -745,9 +756,7 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
         [self.contentView addSubview:empty];
         y += 52;
     } else {
-        // 最后一块卡片底边在 y - 12（y 里含 14 行尾留白，卡片比内容高出 2pt），
-        // 说明文字离卡片 10pt 即可
-        UILabel *footer = [[UILabel alloc] initWithFrame:CGRectMake(IPATCpInset, y - 2,
+        UILabel *footer = [[UILabel alloc] initWithFrame:CGRectMake(IPATCpInset, y + 6,
                                                                     width - IPATCpInset * 2, 16)];
         footer.font = [UIFont systemFontOfSize:10.5];
         footer.textColor = [UIColor colorWithWhite:1.0 alpha:0.42];
@@ -782,26 +791,6 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
     return ids;
 }
 
-/// 预估一个功能区块的总高度，必须与 addSection 的排版公式严格一致
-///（卡片底板要先知道画多高）。
-- (CGFloat)measureSectionHeight:(NSDictionary *)reg {
-    CGFloat h = IPATCpHeaderHeight + 18.0;   // 标题行 + 状态行
-    NSArray *rows = reg[IPATRegRows];
-    if ([rows isKindOfClass:[NSArray class]] && rows.count > 0) {
-        h += 1.0;   // 分隔线
-        for (NSDictionary *row in rows) {
-            if (![row isKindOfClass:[NSDictionary class]]) continue;
-            h += IPATCpRowHeight;
-            NSString *note = row[IPATRowNote];
-            if ([note isKindOfClass:[NSString class]] && note.length > 0) h += IPATCpNoteHeight;
-        }
-        h += 14.0;  // 行尾留白（与 addSection 的 return 一致）
-    } else {
-        h += 10.0;
-    }
-    return h;
-}
-
 - (CGFloat)addSection:(NSDictionary *)reg y:(CGFloat)y width:(CGFloat)width {
     NSString *featureId = reg[IPATRegId] ?: @"";
     NSString *masterKey = reg[IPATRegMasterKey] ?: @"";
@@ -809,17 +798,6 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
     BOOL masterHidden = [reg[IPATRegMasterHidden] respondsToSelector:@selector(boolValue)]
         ? [reg[IPATRegMasterHidden] boolValue] : NO;
     CGFloat contentWidth = width - IPATCpInset * 2;
-
-    // 区块卡片：每个功能 dylib 一块圆角底板。多个 dylib 注入后行数一多，
-    // 全靠空隙分不清哪几行是谁的——有了底板一眼就是一个功能
-    UIView *card = [[UIView alloc] initWithFrame:CGRectMake(IPATCpInset, y - 6.0,
-                                                            contentWidth,
-                                                            [self measureSectionHeight:reg] + 8.0)];
-    card.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.055];
-    card.layer.cornerRadius = 10.0;
-    card.layer.borderWidth = 1.0 / [UIScreen mainScreen].scale;
-    card.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.07].CGColor;
-    [self.contentView addSubview:card];
 
     UILabel *name = [[UILabel alloc] initWithFrame:CGRectMake(IPATCpInset, y,
                                                               masterHidden ? contentWidth
@@ -859,7 +837,7 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
     y += 18.0;
 
     NSArray *rows = reg[IPATRegRows];
-    if (![rows isKindOfClass:[NSArray class]] || rows.count == 0) return y + 10.0;
+    if (![rows isKindOfClass:[NSArray class]] || rows.count == 0) return y + 6.0;
 
     UIView *line = [[UIView alloc] initWithFrame:CGRectMake(IPATCpInset, y, contentWidth,
                                                             1.0 / [UIScreen mainScreen].scale)];
@@ -871,7 +849,7 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
         if (![row isKindOfClass:[NSDictionary class]]) continue;
         y = [self addRow:row featureId:featureId y:y width:width];
     }
-    return y + 14.0;
+    return y + 8.0;
 }
 
 - (CGFloat)addRow:(NSDictionary *)row featureId:(NSString *)featureId y:(CGFloat)y width:(CGFloat)width {
