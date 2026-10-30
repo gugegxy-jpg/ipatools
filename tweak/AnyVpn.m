@@ -1174,6 +1174,10 @@ static void cb_protect_socket(void *privdata, int fd) {
                 if (!self.masterOn) return;
             }
             if ([self runSessionOnce]) return;   // 走完 mainloop 正常断开
+            // 本轮失败（多为 401）：这个动态码已经交给网关了，网关普遍有重放保护，
+            // 同一个码再交必被拒。标记已用，下轮尝试会在 otp_value 里等到
+            // 下一个 30s 窗口换新码再提交
+            g_usedOtpThisAttempt = YES;
         }
         [self fail:@"连续 3 次连接失败，已停止（点「复制连接日志」查原因）"];
     }
@@ -1183,11 +1187,10 @@ static void cb_protect_socket(void *privdata, int fd) {
 // NO = 本轮失败（fail: 里已 cleanup，可重试）
 - (BOOL)runSessionOnce {
     @autoreleasepool {
-        // 每次尝试都是全新认证，TOTP 状态机必须重置
-        g_otpWindow = -1;
-        g_lastOtp[0] = 0;
-        g_otpRejects = 0;
-        g_usedOtpThisAttempt = NO;
+        // 固定密码的提交记忆是「每轮尝试」级的，要重置；
+        // TOTP 的窗口/旧码/拒绝计数必须跨尝试保留——以前在这里整体重置，
+        // 重试会在同一个 30s 窗口里把已提交过的码原样再交一遍，
+        // 撞上网关重放保护 → 连续 401，直到窗口翻转才成功（表现为重试两次才连上）
         g_staticPasswordSubmitted = NO;
 
         NSString *underlying = [self plist:@"UnderlyingIface" default:@"en0"];
