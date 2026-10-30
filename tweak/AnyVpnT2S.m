@@ -186,6 +186,19 @@ static err_t t2s_output(struct netif *nif, struct pbuf *p, const ip4_addr_t *ipa
         memcpy(linear + total, q->payload, q->len);
         total += q->len;
     }
+    // 诊断：前 10 个出站包打印协议/源/目的——定位「网关收到包就杀会话」的元凶
+    // （lwIP 无链路层，linear[0] 起就是 IPv4 头：byte9=协议，12-15=源，16-19=目的）
+    static int pktLogs = 0;
+    if (pktLogs < 10 && total >= 20) {
+        pktLogs++;
+        char src[16], dst[16];
+        snprintf(src, sizeof src, "%u.%u.%u.%u",
+                 linear[12], linear[13], linear[14], linear[15]);
+        snprintf(dst, sizeof dst, "%u.%u.%u.%u",
+                 linear[16], linear[17], linear[18], linear[19]);
+        T2SLog(@"出站包#%d：%u 字节 proto=%u %s -> %s",
+               pktLogs, (unsigned)total, linear[9], src, dst);
+    }
     // g_ocFd 是 AF_UNIX SOCK_DGRAM：一次 write 必须是完整一个 IP 包（openconnect
     // 按包边界 read）。不存在部分写——缓冲满（EAGAIN/ENOBUFS）就整包丢弃，
     // 靠 lwIP TCP 重传兜底；UDP 丢了就丢了
@@ -347,6 +360,14 @@ static void t2s_tcp_accept(int newfd) {
         return;
     }
     s->pcb = pcb;
+    // 诊断：记录游戏接线目标（源 IP/端口可疑一眼可见）
+    static int acceptLogs = 0;
+    if (acceptLogs < 5) {
+        acceptLogs++;
+        T2SLog(@"TCP 接线 #%d：%u.%u.%u.%u:%u（fd %d）",
+               acceptLogs, (dip >> 24) & 0xFF, (dip >> 16) & 0xFF,
+               (dip >> 8) & 0xFF, dip & 0xFF, dport, newfd);
+    }
     s->next = g_tcpSess;
     g_tcpSess = s;
     target_del(g_tcpTargets, sport);
