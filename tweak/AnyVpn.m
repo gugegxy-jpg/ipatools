@@ -101,7 +101,7 @@ struct ortentry {
 #import <time.h>
 #import <ctype.h>
 #import <sys/sysctl.h>   // 默认路由探测（NET_RT_DUMP）
-#import <net/route.h>    // 同上：rt_msghdr / RTAX_*
+#import <sys/socket.h>   // NET_RT_DUMP / sockaddr 遍历
 #import <CommonCrypto/CommonHMAC.h>   // TOTP 的 HMAC-SHA1（系统库，无额外链接）
 
 #pragma mark - 配置键
@@ -206,7 +206,22 @@ static int ifindex_of(const char *ifname) {
 
 // 读内核路由表，找 IPv4 默认路由（0.0.0.0/0）所在网卡的 ifindex。
 // WiFi 下是 en0，蜂窝下是 pdp_ip0——绑死 en0 的话切到蜂窝后 VPN 自己的
-// connect() 直接 ENETUNREACH（实测问题：WiFi 能连、流量连不上）
+// connect() 直接 ENETUNREACH（实测问题：WiFi 能连、流量连不上）。
+// iOS SDK 没有 <net/route.h>，这里自带最小定义（只用到 rt_msghdr 头部
+// 固定偏移的字段，内核 ABI 多年未变；常量取值与 Darwin 一致）
+struct ipat_rt_msghdr {
+    u_short rtm_msglen;   // 本条消息总长（遍历步进用）
+    u_char  rtm_version;
+    u_char  rtm_type;
+    u_short rtm_index;    // 路由所在网卡 ifindex
+    int     rtm_flags;
+    int     rtm_addrs;    // sockaddr 位掩码
+};
+#define IPAT_RTM_VERSION 5
+#define IPAT_RTM_GET     4     // Darwin 的 RTM_GET
+#define IPAT_RTF_GATEWAY 0x2
+#define IPAT_RTA_DST     0x1
+
 static int default_route_ifindex(void) {
     int mib[6] = { CTL_NET, PF_ROUTE, 0, AF_INET, NET_RT_DUMP, 0 };
     size_t len = 0;
@@ -215,24 +230,19 @@ static int default_route_ifindex(void) {
     if (!buf) return 0;
     int idx = 0;
     if (sysctl(mib, 6, buf, &len, NULL, 0) == 0) {
-        for (char *p = buf; p + sizeof(struct rt_msghdr) <= buf + len; ) {
-            struct rt_msghdr *rtm = (struct rt_msghdr *)p;
-            if (rtm->rtm_msglen < (u_short)sizeof(struct rt_msghdr) ||
-                rtm->rtm_version != RTM_VERSION) break;
-            // 默认路由：带网关、目的 0.0.0.0
-            if (rtm->rtm_type == RTM_GET && (rtm->rtm_flags & RTF_GATEWAY) &&
-                (rtm->rtm_addrs & RTA_DST)) {
+        for (char *p = buf; p + sizeof(struct ipat_rt_msghdr) <= buf + len; ) {
+            struct ipat_rt_msghdr *rtm = (struct ipat_rt_msghdr *)p;
+            if (rtm->rtm_msglen < (u_short)sizeof(struct ipat_rt_msghdr) ||
+                rtm->rtm_version != IPAT_RTM_VERSION) break;
+            // 默认路由：带网关、目的 0.0.0.0（sockaddr 链按 sa_len 4 字节对齐遍历）
+            if (rtm->rtm_type == IPAT_RTM_GET && (rtm->rtm_flags & IPAT_RTF_GATEWAY) &&
+                (rtm->rtm_addrs & IPAT_RTA_DST)) {
                 struct sockaddr *sa = (struct sockaddr *)(rtm + 1);
                 struct sockaddr_in *dst = NULL;
-                for (int i = 0; i < RTAX_MAX; i++) {
-                    if (!(rtm->rtm_addrs & (1 << i))) continue;
-                    if (sa->sa_len == 0) break;
-                    if (i == RTAX_DST) dst = (struct sockaddr_in *)sa;
-                    sa = (struct sockaddr *)((char *)sa + ((sa->sa_len + 3) & ~3));
-                    if ((char *)sa > buf + len) break;
+                if (sa->sa_len > 0 && sa->sa_family == AF_INET) {
+                    dst = (struct sockaddr_in *)sa;
                 }
-                if (dst && dst->sin_family == AF_INET &&
-                    dst->sin_addr.s_addr == INADDR_ANY) {
+                if (dst && dst->sin_addr.s_addr == INADDR_ANY) {
                     idx = (int)rtm->rtm_index;
                     break;
                 }
