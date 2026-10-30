@@ -1337,9 +1337,10 @@ static void cb_protect_socket(void *privdata, int fd) {
 
         // ip->addr 是 const char*，喂给 %@ 前必须包成 NSString（类型不匹配还会运行时崩）
         NSString *ipStr = ip->addr ? @(ip->addr) : @"";
-        [self status:[NSString stringWithFormat:@"已连接 %@（IP %@ / %@%s）",
+        // %s 会把 UTF-8 中文按 Latin-1 解码（日志乱码），一律用 %@ + @() 包裹
+        [self status:[NSString stringWithFormat:@"已连接 %@（IP %@ / %@%@）",
                       server, ipStr, @(ifname),
-                      root ? "" : "，非越狱模式：接管本 App 直连流量"]];
+                      root ? @"" : @"，非越狱模式：接管本 App 直连流量"]];
         [self toast:[NSString stringWithFormat:@"✅ VPN 已连接 %@（IP %@）",
                      [self activeProfile][@"name"] ?: server, ipStr]];
 
