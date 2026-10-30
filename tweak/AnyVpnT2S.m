@@ -255,6 +255,20 @@ static void t2s_feed_lwip(void) {
         if (ntohl(afVal) != 2 /*AF_INET*/) continue;
         memmove(pkt, pkt + 4, (size_t)n - 4);
         n -= 4;
+        // 诊断：前 10 个入向包打印协议/源/目的——判断隧道内 UDP（DNS）到底
+        // 有没有回包：回包出现 = 我们 UDP 转发路径有 bug；完全不出现 = 网关
+        // 压根没回（线路 DNS 对隧道内来源不响应）
+        static int inLogs = 0;
+        if (inLogs < 10) {
+            inLogs++;
+            char src[16], dst[16];
+            snprintf(src, sizeof src, "%u.%u.%u.%u",
+                     pkt[12], pkt[13], pkt[14], pkt[15]);
+            snprintf(dst, sizeof dst, "%u.%u.%u.%u",
+                     pkt[16], pkt[17], pkt[18], pkt[19]);
+            T2SLog(@"入向包#%d：%u 字节 proto=%u %s -> %s",
+                   inLogs, (unsigned)n, pkt[9], src, dst);
+        }
         g_statInPkts++;
         g_statInBytes += (unsigned long long)n;
         struct pbuf *p = pbuf_alloc(PBUF_RAW, (u16_t)n, PBUF_RAM);
@@ -437,6 +451,13 @@ static void t2s_udp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
     size_t n = p->tot_len > sizeof pkt ? sizeof pkt : p->tot_len;
     pbuf_copy_partial(p, pkt, (u16_t)n, 0);
     pbuf_free(p);
+    // 诊断：隧道内 UDP 回包送达游戏侧 fd（DNS 回包是否走通这里一目了然）
+    static int udpBackLogs = 0;
+    if (udpBackLogs < 10) {
+        udpBackLogs++;
+        T2SLog(@"UDP 回包 #%d：%u 字节 -> 127.0.0.1:%u",
+               udpBackLogs, (unsigned)n, ntohs(u->client.sin_port));
+    }
     sendto(g_udpRelay, pkt, n, 0, (struct sockaddr *)&u->client, sizeof u->client);
 }
 
@@ -462,6 +483,15 @@ static void t2s_udp_accept(struct sockaddr_in *from) {
     u->pcb = pcb;
     u->next = g_udpSess;
     g_udpSess = u;
+    // 诊断：UDP 会话建立（游戏自带 DNS 客户端的关键证据链——它往哪些
+    // 服务器发 UDP、我们有没有承接）
+    static int udpSessLogs = 0;
+    if (udpSessLogs < 10) {
+        udpSessLogs++;
+        T2SLog(@"UDP 会话 #%d：127.0.0.1:%u -> %u.%u.%u.%u:%u",
+               udpSessLogs, ntohs(from->sin_port),
+               (dip >> 24) & 0xFF, (dip >> 16) & 0xFF, (dip >> 8) & 0xFF, dip & 0xFF, dport);
+    }
 }
 
 #pragma mark - DNS（隧道内解析）
