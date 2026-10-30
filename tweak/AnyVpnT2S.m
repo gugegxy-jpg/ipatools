@@ -494,7 +494,14 @@ static void t2s_udp_accept(struct sockaddr_in *from) {
     }
 }
 
-#pragma mark - DNS（隧道内解析）
+#pragma mark - DNS（隧道内解析：DNS over TCP 优先，UDP 兜底）
+//
+// 现场结论（#213 探针）：隧道内 UDP 查询发得出去（proto=17 → 192.168.100.5，
+// 报文格式也正确），但网关/内网 DNS 一个 UDP 回包都不给（入向包 23 条全是
+// proto=6），而隧道内 TCP 完全正常（内网 192.168.179.18:8080 双向通）。
+// 于是所有域名解析都回落系统 DNS → 拿到线上地址 → 「连哪条线都进同一个
+// 环境」，选线不生效。
+// 解法：按 RFC 7766 用 DNS over TCP（2 字节长度前缀），TCP 不通再回落 UDP。
 
 typedef struct {
     char name[256];
@@ -510,6 +517,59 @@ static struct udp_pcb *g_dnsPcb;
 static ip4_addr_t g_dnsServer;
 static uint16_t g_dnsTxid;
 static BOOL g_dnsPending;
+// 查询报文由 App 线程构建、引擎线程发送（TCP/UDP 两个通道共用同一份）
+static uint8_t g_dnsQuery[512];
+static size_t g_dnsQueryLen;
+static BOOL g_dnsTcpWant;     // 引擎线程：启动 DNS over TCP
+static BOOL g_dnsUdpWant;     // 引擎线程：补发 UDP 查询
+static BOOL g_dnsAbortTcp;    // 引擎线程：关掉已无用的 TCP 连接
+static struct tcp_pcb *g_dnsTcpPcb;
+static uint8_t g_dnsTcpQuery[512];
+static size_t g_dnsTcpQueryLen;
+static uint8_t g_dnsTcpBuf[1600];
+static size_t g_dnsTcpLen;
+
+// 从 DNS 应答里取第一个 A 记录（主机序）
+static BOOL t2s_dns_parse(const uint8_t *pkt, size_t n, uint32_t *outAddr) {
+    if (n < 12) return NO;
+    uint16_t qd = (uint16_t)((pkt[4] << 8) | pkt[5]);
+    uint16_t an = (uint16_t)((pkt[6] << 8) | pkt[7]);
+    size_t off = 12;
+    for (int i = 0; i < qd && off < n; i++) {          // 跳过 Question
+        while (off < n) { uint8_t l = pkt[off++]; if (!l) break; off += l; }
+        off += 4;
+    }
+    for (int i = 0; i < an && off + 10 <= n; i++) {    // 逐条 Answer
+        while (off < n) {
+            uint8_t l = pkt[off];
+            if (l & 0xC0) { off += 2; break; }         // 压缩指针
+            if (!l) { off += 1; break; }
+            off += 1 + l;
+        }
+        if (off + 10 > n) break;
+        uint16_t type = (uint16_t)((pkt[off] << 8) | pkt[off + 1]);
+        uint16_t rdlen = (uint16_t)((pkt[off + 8] << 8) | pkt[off + 9]);
+        off += 10;
+        if (type == 1 && rdlen == 4 && off + 4 <= n) { // A 记录
+            *outAddr = ((uint32_t)pkt[off] << 24) | ((uint32_t)pkt[off + 1] << 16) |
+                       ((uint32_t)pkt[off + 2] << 8) | pkt[off + 3];
+            return YES;
+        }
+        off += rdlen;
+    }
+    return NO;
+}
+
+// 结束一次 DNS 请求：ok=YES 时 outAddr 有效
+static void t2s_dns_finish(BOOL ok, uint32_t addr) {
+    pthread_mutex_lock(&g_dnsMutex);
+    if (g_dnsReq.state != 2) {
+        if (ok) { g_dnsReq.addr = addr; g_dnsReq.found = 1; }
+        g_dnsReq.state = 2;
+        pthread_cond_broadcast(&g_dnsCond);
+    }
+    pthread_mutex_unlock(&g_dnsMutex);
+}
 
 static void t2s_dns_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
                             const ip_addr_t *addr, u16_t port) {
@@ -521,57 +581,166 @@ static void t2s_dns_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
     pbuf_free(p);
     if (n < 12) return;
     uint16_t txid = (uint16_t)((pkt[0] << 8) | pkt[1]);
+    uint32_t addr4 = 0;
+    if (ntohs(txid) != g_dnsTxid) return;              // 不是本次查询的应答
+    if (!(pkt[2] & 0x80)) return;                      // 不是响应
+    if (!t2s_dns_parse(pkt, n, &addr4)) return;
+    t2s_dns_finish(YES, addr4);
+}
+
+// ---- DNS over TCP ----
+
+static void t2s_dns_tcp_close(struct tcp_pcb *pcb) {
+    if (!pcb) return;
+    tcp_arg(pcb, NULL);
+    tcp_recv(pcb, NULL);
+    if (tcp_close(pcb) != ERR_OK) tcp_abort(pcb);
+    g_dnsTcpPcb = NULL;
+}
+
+static err_t t2s_dns_tcp_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err) {
+    (void)arg;
+    if (!pcb) return ERR_OK;
+    if (err != ERR_OK) {                              // 出错
+        t2s_dns_tcp_close(pcb);
+        t2s_dns_finish(NO, 0);
+        return ERR_OK;
+    }
+    if (p == NULL) {                                  // 对端关闭
+        uint32_t a = 0;
+        BOOL ok = NO;
+        if (g_dnsTcpLen >= 2) {
+            uint16_t rlen = (uint16_t)((g_dnsTcpBuf[0] << 8) | g_dnsTcpBuf[1]);
+            if (g_dnsTcpLen >= 2u + rlen) ok = t2s_dns_parse(g_dnsTcpBuf + 2, rlen, &a);
+        }
+        t2s_dns_tcp_close(pcb);
+        t2s_dns_finish(ok, a);
+        return ERR_OK;
+    }
+    uint16_t len = p->tot_len;
+    if (g_dnsTcpLen + len <= sizeof g_dnsTcpBuf) {
+        pbuf_copy_partial(p, g_dnsTcpBuf + g_dnsTcpLen, len, 0);
+        g_dnsTcpLen += len;
+    }
+    pbuf_free(p);
+    if (g_dnsTcpLen >= 2) {                           // 2 字节长度前缀 + 应答
+        uint16_t rlen = (uint16_t)((g_dnsTcpBuf[0] << 8) | g_dnsTcpBuf[1]);
+        if (g_dnsTcpLen >= 2u + rlen) {
+            uint32_t a = 0;
+            if (t2s_dns_parse(g_dnsTcpBuf + 2, rlen, &a)) {
+                t2s_dns_tcp_close(pcb);
+                t2s_dns_finish(YES, a);
+                return ERR_OK;
+            }
+        }
+    }
+    return ERR_OK;
+}
+
+static err_t t2s_dns_tcp_connected(void *arg, struct tcp_pcb *pcb, err_t err) {
+    (void)arg;
+    if (!pcb) { t2s_dns_finish(NO, 0); return ERR_OK; }
+    if (err != ERR_OK) {
+        t2s_dns_tcp_close(pcb);
+        t2s_dns_finish(NO, 0);
+        return ERR_OK;
+    }
+    // DNS over TCP：2 字节长度前缀 + 查询报文
+    uint8_t buf[2 + sizeof g_dnsTcpQuery];
+    size_t qlen = g_dnsTcpQueryLen;
+    if (qlen > sizeof g_dnsTcpQuery) qlen = sizeof g_dnsTcpQuery;
+    buf[0] = (uint8_t)(qlen >> 8);
+    buf[1] = (uint8_t)(qlen & 0xFF);
+    memcpy(buf + 2, g_dnsTcpQuery, qlen);
+    if (tcp_write(pcb, buf, (u16_t)(2 + qlen), TCP_WRITE_FLAG_COPY) != ERR_OK) {
+        t2s_dns_tcp_close(pcb);
+        t2s_dns_finish(NO, 0);
+        return ERR_OK;
+    }
+    tcp_output(pcb);
+    return ERR_OK;
+}
+
+// 引擎线程：启动 DNS over TCP
+static void t2s_dns_start_tcp(void) {
+    if (g_dnsTcpPcb) return;
+    memcpy(g_dnsTcpQuery, g_dnsQuery, g_dnsQueryLen);
+    g_dnsTcpQueryLen = g_dnsQueryLen;
+    g_dnsTcpLen = 0;
+    struct tcp_pcb *pcb = tcp_new_ip_type(IPADDR_TYPE_V4);
+    if (!pcb) { t2s_dns_finish(NO, 0); return; }
+    tcp_arg(pcb, NULL);
+    tcp_recv(pcb, t2s_dns_tcp_recv);
+    ip_addr_t addr;
+    ip_addr_copy_from_ip4(addr, g_dnsServer);
+    if (tcp_connect(pcb, &addr, 53, t2s_dns_tcp_connected) != ERR_OK) {
+        tcp_abort(pcb);
+        t2s_dns_finish(NO, 0);
+        return;
+    }
+    g_dnsTcpPcb = pcb;
+}
+
+static void t2s_dns_poll(void) {
     pthread_mutex_lock(&g_dnsMutex);
-    if (g_dnsReq.state == 1 && txid == g_dnsTxid && (pkt[2] & 0x80)) {   // QR=响应
-        uint16_t qd = (uint16_t)((pkt[4] << 8) | pkt[5]);
-        uint16_t an = (uint16_t)((pkt[6] << 8) | pkt[7]);
-        size_t off = 12;
-        for (int i = 0; i < qd && off < n; i++) {          // 跳过 Question
-            while (off < n) { uint8_t l = pkt[off++]; if (!l) break; off += l; }
-            off += 4;
-        }
-        for (int i = 0; i < an && off + 10 <= n; i++) {    // 逐条 Answer
-            while (off < n) {
-                uint8_t l = pkt[off];
-                if (l & 0xC0) { off += 2; break; }         // 压缩指针
-                if (!l) { off += 1; break; }
-                off += 1 + l;
-            }
-            if (off + 10 > n) break;
-            uint16_t type = (uint16_t)((pkt[off] << 8) | pkt[off + 1]);
-            uint16_t rdlen = (uint16_t)((pkt[off + 8] << 8) | pkt[off + 9]);
-            off += 10;
-            if (type == 1 && rdlen == 4 && off + 4 <= n) { // A 记录
-                g_dnsReq.addr = ((uint32_t)pkt[off] << 24) | ((uint32_t)pkt[off+1] << 16) |
-                                ((uint32_t)pkt[off+2] << 8) | pkt[off+3];
-                g_dnsReq.found = 1;
-                break;
-            }
-            off += rdlen;
-        }
-        g_dnsReq.state = 2;
+    BOOL tcpWant = g_dnsTcpWant;  g_dnsTcpWant = NO;
+    BOOL udpWant = g_dnsUdpWant;  g_dnsUdpWant = NO;
+    BOOL abortTcp = g_dnsAbortTcp; g_dnsAbortTcp = NO;
+    BOOL pending = g_dnsPending && g_dnsReq.state == 0;
+    pthread_mutex_unlock(&g_dnsMutex);
+
+    if (abortTcp && g_dnsTcpPcb) {
+        t2s_dns_tcp_close(g_dnsTcpPcb);
+    }
+    if (tcpWant) {
+        T2SLog(@"DNS 走 TCP 通道（线路 UDP 无回包，改用 DNS over TCP）");
+        t2s_dns_start_tcp();
+        pthread_mutex_lock(&g_dnsMutex);
+        if (g_dnsReq.state == 0) g_dnsReq.state = 1;
+        pthread_mutex_unlock(&g_dnsMutex);
+        return;
+    }
+    if (!pending && !udpWant) return;
+
+    // UDP 通道（兜底）
+    if (!g_dnsPcb) {
+        g_dnsPcb = udp_new_ip_type(IPADDR_TYPE_V4);
+        if (!g_dnsPcb) return;
+        udp_recv(g_dnsPcb, t2s_dns_recv_cb, NULL);
+    }
+    size_t n = g_dnsQueryLen;
+    if (!n) return;
+    struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, (u16_t)n, PBUF_RAM);
+    if (!p) return;
+    pbuf_take(p, g_dnsQuery, (u16_t)n);
+    ip_addr_t s;
+    ip_addr_copy_from_ip4(s, g_dnsServer);
+    err_t r = udp_sendto(g_dnsPcb, p, &s, 53);
+    pbuf_free(p);
+    pthread_mutex_lock(&g_dnsMutex);
+    if (r == ERR_OK) {
+        if (g_dnsReq.state == 0) g_dnsReq.state = 1;
+    } else if (!udpWant) {
+        g_dnsReq.state = 2;               // 发不出去直接判失败
         pthread_cond_broadcast(&g_dnsCond);
     }
     pthread_mutex_unlock(&g_dnsMutex);
 }
 
-static void t2s_dns_poll(void) {
-    pthread_mutex_lock(&g_dnsMutex);
-    BOOL pending = g_dnsPending && g_dnsReq.state == 0;
-    pthread_mutex_unlock(&g_dnsMutex);
-    if (!pending) return;
+BOOL T2SResolve(NSString *host, uint32_t *outAddrV4) {
+    if (!g_ready || !host.length || !outAddrV4) return NO;
+    char name[256] = {0};
+    [host getCString:name maxLength:sizeof name - 1 encoding:NSUTF8StringEncoding];
 
-    uint8_t q[300];
+    // 构建 DNS 查询报文（App 线程构建，引擎线程发送）
+    uint8_t q[512];
     size_t n = 0;
-    pthread_mutex_lock(&g_dnsMutex);
-    g_dnsTxid = (uint16_t)(random() & 0xFFFF);
-    uint16_t txid = g_dnsTxid;
-    pthread_mutex_unlock(&g_dnsMutex);
+    uint16_t txid = (uint16_t)(random() & 0xFFFF);
     q[n++] = (uint8_t)(txid >> 8); q[n++] = (uint8_t)(txid & 0xFF);
     q[n++] = 0x01; q[n++] = 0x00;          // RD=1
     q[n++] = 0; q[n++] = 1;                // QDCOUNT=1
     q[n++] = 0; q[n++] = 0; q[n++] = 0; q[n++] = 0; q[n++] = 0; q[n++] = 0;
-    for (const char *c = g_dnsReq.name; *c && n < sizeof q - 6; c++) {
+    for (const char *c = name; *c && n < sizeof q - 6; c++) {
         if (*c == '.') { q[n++] = 0; continue; }
         const char *dot = strchr(c, '.');
         size_t l = dot ? (size_t)(dot - c) : strlen(c);
@@ -585,30 +754,6 @@ static void t2s_dns_poll(void) {
     q[n++] = 0;
     q[n++] = 0; q[n++] = 1;                // Type A
     q[n++] = 0; q[n++] = 1;                // Class IN
-
-    if (!g_dnsPcb) {
-        g_dnsPcb = udp_new_ip_type(IPADDR_TYPE_V4);
-        if (!g_dnsPcb) return;
-        udp_recv(g_dnsPcb, t2s_dns_recv_cb, NULL);
-    }
-    struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, (u16_t)n, PBUF_RAM);
-    if (!p) return;
-    pbuf_take(p, q, (u16_t)n);
-    ip_addr_t s;
-    ip_addr_copy_from_ip4(s, g_dnsServer);
-    err_t r = udp_sendto(g_dnsPcb, p, &s, 53);
-    pbuf_free(p);
-    pthread_mutex_lock(&g_dnsMutex);
-    if (r == ERR_OK) g_dnsReq.state = 1;
-    else g_dnsReq.state = 2;               // 发不出去直接判失败
-    pthread_cond_broadcast(&g_dnsCond);
-    pthread_mutex_unlock(&g_dnsMutex);
-}
-
-BOOL T2SResolve(NSString *host, uint32_t *outAddrV4) {
-    if (!g_ready || !host.length || !outAddrV4) return NO;
-    char name[256] = {0};
-    [host getCString:name maxLength:sizeof name - 1 encoding:NSUTF8StringEncoding];
 
     pthread_mutex_lock(&g_dnsMutex);
     if (g_dnsReq.state == 1) {
@@ -629,13 +774,30 @@ BOOL T2SResolve(NSString *host, uint32_t *outAddrV4) {
     }
     memset(&g_dnsReq, 0, sizeof g_dnsReq);
     strlcpy(g_dnsReq.name, name, sizeof g_dnsReq.name);
+    g_dnsTxid = txid;
+    memcpy(g_dnsQuery, q, n);
+    g_dnsQueryLen = n;
     g_dnsPending = YES;
+    // 先走 TCP（隧道内 UDP 无回包），4s 没答上再补发 UDP
+    g_dnsTcpWant = YES;
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec += 5;
+    ts.tv_sec += 4;
     int rc = 0;
-    while (g_dnsReq.state != 2 && rc != ETIMEDOUT) {
+    BOOL udpFallback = NO;
+    while (g_dnsReq.state != 2) {
         rc = pthread_cond_timedwait(&g_dnsCond, &g_dnsMutex, &ts);
+        if (rc == ETIMEDOUT) {
+            if (!udpFallback) {
+                udpFallback = YES;
+                g_dnsAbortTcp = YES;        // 关掉没答应的 TCP 连接
+                g_dnsUdpWant = YES;         // 补发 UDP 查询
+                clock_gettime(CLOCK_REALTIME, &ts);
+                ts.tv_sec += 3;
+                continue;
+            }
+            break;                          // TCP/UDP 都超时
+        }
     }
     g_dnsPending = NO;
     BOOL found = g_dnsReq.found;
@@ -678,6 +840,10 @@ static void *t2s_main(void *arg) {
             if (n < 0 && errno != EINTR) break;
 
             sys_check_timeouts();
+            // NO_SYS=1 时 lwIP 不会自动跑 TCP 定时器：延迟 ACK、丢包重传、
+            // tcp_poll 回调全靠它。以前没调，表现为「TCP 平时能用（ACK 被
+            // 数据捎带），但一丢包就永久卡死」——DNS over TCP 会直接卡住
+            tcp_tmr();
             t2s_dns_poll();
             if (!g_run) break;
 

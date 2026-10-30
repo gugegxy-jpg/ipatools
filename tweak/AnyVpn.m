@@ -1529,7 +1529,7 @@ __attribute__((constructor))
 static void IPATAnyVpnLoad(void) {
     // 构建版本戳：dylib 一加载就写进日志。排查「日志 0 行/行为不符」时，
     // 第一行就能确认设备上跑的是哪个构建——防止装到旧包白测一轮
-    IPATAppendLogLine(@"[anyvpn] dylib 已加载：构建 #214（DNS 排队 + UDP/入向探针）");
+    IPATAppendLogLine(@"[anyvpn] dylib 已加载：构建 DNS-TCP-20261030（DNS over TCP + tcp_tmr）");
     // 尽早装 socket 劫持（引擎没就绪时全部直通原函数，不影响 App 正常运行）
     T2SInstallHooks();
     // 与其他 tweak 一致：延后一点等主线程就绪再初始化
