@@ -339,6 +339,9 @@ static void cb_progress(void *privdata, int level, const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
+    // 诊断：TLS 被网关干净断开（SSL_ERROR_ZERO_RETURN）的瞬间打一帧 T2S 快照，
+    // 用两次断开之间的计数差判断数据面是停摆还是在正常收发
+    if (strstr(buf, "Read error on TLS session")) T2SStatsLog("TLS被断时刻");
     IPATAppendLogLine([NSString stringWithFormat:@"[anyvpn] %s", buf]);
 }
 
@@ -1247,6 +1250,9 @@ static void cb_protect_socket(void *privdata, int fd) {
             return NO;
         }
         openconnect_set_protocol(g_vpninfo, "anyconnect");
+        // 诊断：开到 PRG_DEBUG（HTTP/CSTP 层交互细节），排查「连接 3 秒后被网关
+        // 干净断开」。PRG_TRACE 的每包 hexdump 仍被 cb_progress 丢弃
+        openconnect_set_loglevel(g_vpninfo, 2);   // PRG_DEBUG
         // 注意：不用 openconnect 的 --token-mode=totp（对齐 Android 端决策）——
         // 它把动态码追加到密码后面，而实测网关把动态码作为独立表单字段下发；
         // 动态码在 cb_auth_form 里按安卓 AuthSession 的规则当场生成回填

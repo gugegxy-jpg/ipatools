@@ -30,6 +30,9 @@ BOOL T2SEngineStart(int openconnectTunFd,
 void T2SEngineStop(void);
 BOOL T2SEngineReady(void);
 
+// 诊断：打印当前流量计数与会话数快照（tag 用于标记调用时机）
+void T2SStatsLog(const char *tag);
+
 // DNS（走隧道内的 VPN DNS）。阻塞，内部 5s 超时，失败返回 NO。
 BOOL T2SResolve(NSString *host, uint32_t *outAddrV4);
 

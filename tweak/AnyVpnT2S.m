@@ -132,6 +132,10 @@ typedef struct UDPSession {
 static TCPSession *g_tcpSess;
 static UDPSession *g_udpSess;
 
+// 流量计数（诊断用）：out = 客户端→隧道（t2s_output），in = 隧道→客户端（t2s_feed_lwip）
+static unsigned long long g_statOutPkts, g_statOutBytes;
+static unsigned long long g_statInPkts, g_statInBytes;
+
 // 受保护 fd（openconnect 自己的 socket，绝不劫持）
 #define PROTECTED_MAX 128
 static int g_protected[PROTECTED_MAX];
@@ -186,7 +190,11 @@ static err_t t2s_output(struct netif *nif, struct pbuf *p, const ip4_addr_t *ipa
     // 按包边界 read）。不存在部分写——缓冲满（EAGAIN/ENOBUFS）就整包丢弃，
     // 靠 lwIP TCP 重传兜底；UDP 丢了就丢了
     ssize_t n = write(g_ocFd, linear, total);
-    if (n == (ssize_t)total) return ERR_OK;
+    if (n == (ssize_t)total) {
+        g_statOutPkts++;
+        g_statOutBytes += total;
+        return ERR_OK;
+    }
     if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS ||
                   errno == EINTR)) {
         return ERR_OK;
@@ -214,6 +222,8 @@ static void t2s_feed_lwip(void) {
             return;   // EAGAIN：无更多数据；对端关闭同样退出
         }
         if (n == 0) return;
+        g_statInPkts++;
+        g_statInBytes += (unsigned long long)n;
         struct pbuf *p = pbuf_alloc(PBUF_RAW, (u16_t)n, PBUF_RAM);
         if (!p) continue;
         pbuf_take(p, pkt, (u16_t)n);
@@ -800,6 +810,17 @@ static int hooked_getaddrinfo(const char *node, const char *service,
         }
     }
     return real_getaddrinfo(node, service, hints, res);
+}
+
+// 诊断：在 TLS 被网关断开的时刻调用——看断开瞬间数据面在正常收发还是已停摆，
+// 以及两次断开之间有没有流量（delta = 本轮会话的收发量）
+void T2SStatsLog(const char *tag) {
+    int tcp = 0, udp = 0;
+    for (TCPSession *s = g_tcpSess; s; s = s->next) tcp++;
+    for (UDPSession *u = g_udpSess; u; u = u->next) udp++;
+    T2SLog(@"[%s] 出 %llu 包/%lluKB，入 %llu 包/%lluKB，TCP 会话 %d，UDP 会话 %d",
+           tag, g_statOutPkts, g_statOutBytes / 1024,
+           g_statInPkts, g_statInBytes / 1024, tcp, udp);
 }
 
 void T2SInstallHooks(void) {
