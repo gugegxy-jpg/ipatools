@@ -97,6 +97,7 @@ struct ortentry {
 #import <netinet/in.h>
 #import <arpa/inet.h>
 #import <netdb.h>   // getaddrinfo（fake-IP 预检用）
+#import <ifaddrs.h> // getifaddrs（底层网卡探测兜底：UDP connect 反查网卡）
 #import <unistd.h>
 #import <time.h>
 #import <ctype.h>
@@ -255,6 +256,50 @@ static int default_route_ifindex(void) {
     }
     free(buf);
     return idx ? idx : idxAny;
+}
+
+// 探测承载默认流量的网卡：先用内核路由表（WiFi 场景通常能拿到），
+// 拿不到就用「UDP connect 试探 + getifaddrs 反查」兜底——iOS 上 NET_RT_DUMP
+// 经常读不到默认路由（探测失败），但 UDP connect 能让内核按真实路由选路，
+// 再用本地地址反查网卡名，WiFi→en0 / 蜂窝→pdp_ip0 都能拿到
+static int probe_underlying_ifindex(void) {
+    int idx = default_route_ifindex();
+    if (idx > 0) return idx;
+
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) return 0;
+    struct sockaddr_in dst;
+    memset(&dst, 0, sizeof dst);
+    dst.sin_len = sizeof dst;
+    dst.sin_family = AF_INET;
+    dst.sin_port = htons(53);
+    dst.sin_addr.s_addr = htonl(0x08080808);      // 8.8.8.8，只为让内核选路
+    if (connect(s, (struct sockaddr *)&dst, sizeof dst) != 0) { close(s); return 0; }
+    struct sockaddr_in local;
+    socklen_t sl = sizeof local;
+    if (getsockname(s, (struct sockaddr *)&local, &sl) != 0) { close(s); return 0; }
+    close(s);
+    uint32_t localAddr = local.sin_addr.s_addr;
+
+    struct ifaddrs *ifa = NULL;
+    if (getifaddrs(&ifa) != 0) return 0;
+    int found = 0;
+    for (struct ifaddrs *p = ifa; p; p = p->ifa_next) {
+        if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET) continue;
+        if (!p->ifa_name) continue;
+        // 跳过隧道/虚拟网卡：绑到它们会把 VPN 自己的流量送回隧道
+        if (strncmp(p->ifa_name, "utun", 4) == 0 ||
+            strncmp(p->ifa_name, "tun", 3) == 0 ||
+            strncmp(p->ifa_name, "ipsec", 5) == 0 ||
+            strncmp(p->ifa_name, "ppp", 3) == 0) continue;
+        struct sockaddr_in *sin = (struct sockaddr_in *)p->ifa_addr;
+        if (sin->sin_addr.s_addr == localAddr) {
+            found = (int)if_nametoindex(p->ifa_name);
+            break;
+        }
+    }
+    freeifaddrs(ifa);
+    return found;
 }
 
 #pragma mark - openconnect 回调（静态全局，对齐 anyvpn-jni.c 的做法）
@@ -1269,21 +1314,33 @@ static void cb_protect_socket(void *privdata, int fd) {
         // 撞上网关重放保护 → 连续 401，直到窗口翻转才成功（表现为重试两次才连上）
         g_staticPasswordSubmitted = NO;
 
-        // 底层网卡：plist 显式指定优先；否则自动探测默认路由（WiFi=en0 / 蜂窝=pdp_ip0）。
-        // 以前绑死 en0，切到蜂窝后 VPN 自己的 connect() 直接 ENETUNREACH
-        NSString *underlying = [self plist:@"UnderlyingIface" default:@""];
-        if (underlying.length) {
-            g_underlying_idx = ifindex_of(underlying.UTF8String);
-        } else {
-            g_underlying_idx = default_route_ifindex();
+        // 底层网卡绑定策略：
+        //  - 越狱（root）模式：utun 接管了系统路由，VPN 自己的 socket 必须绑到
+        //    物理网卡，否则会被 utun 路由绕回隧道成环
+        //  - 非越狱模式：隧道是「应用级接管」（T2S 引擎 + fishhook），系统路由表
+        //    里没有隧道路由，本来就不会成环；而强绑网卡一旦绑错（蜂窝/WiFi 切换
+        //    的瞬间）就会 ENETUNREACH 连不上——所以不绑，走系统默认路由
+        BOOL root = (geteuid() == 0);
+        g_underlying_idx = 0;
+        if (root) {
+            NSString *underlying = [self plist:@"UnderlyingIface" default:@""];
+            if (underlying.length) {
+                g_underlying_idx = ifindex_of(underlying.UTF8String);
+            } else {
+                g_underlying_idx = probe_underlying_ifindex();
+            }
         }
+        int probedIdx = probe_underlying_ifindex();
         char ifname[IFNAMSIZ] = {0};
-        if (g_underlying_idx > 0 && if_indextoname((unsigned)g_underlying_idx, ifname)) {
+        if (probedIdx > 0 && if_indextoname((unsigned)probedIdx, ifname)) {
             IPATAppendLogLine([NSString stringWithFormat:
-                @"[anyvpn] 底层网卡：%s（idx %d）", ifname, g_underlying_idx]);
+                @"[anyvpn] 底层网卡：%s（idx %d）%@", ifname, probedIdx,
+                root ? @"（已绑定）" : @"（非越狱模式，仅提示，不绑定）"]);
         } else {
-            g_underlying_idx = 0;   // 探测失败就不绑，走系统默认路由
-            IPATAppendLogLine(@"[anyvpn] 底层网卡：探测失败，不绑定（走系统默认路由）");
+            g_underlying_idx = 0;
+            IPATAppendLogLine([NSString stringWithFormat:
+                @"[anyvpn] 底层网卡：探测失败（%@）", root ? @"不绑定，走系统默认路由"
+                                                        : @"非越狱模式，走系统默认路由"]);
         }
         NSString *server = g_cfgServer;
 
@@ -1381,7 +1438,6 @@ static void cb_protect_socket(void *privdata, int fd) {
         //  - 非 root：socketpair 掉包，openconnect 的 tun 对端接 lwIP 用户态
         //    TCP/IP 栈 + fishhook 劫持宿主流量（见 AnyVpnT2S）
         char tunname[IFNAMSIZ] = {0};
-        BOOL root = (geteuid() == 0);
         if (root) {
             g_tun_fd = create_utun(tunname);
             if (g_tun_fd < 0) {
