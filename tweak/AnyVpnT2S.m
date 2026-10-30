@@ -26,6 +26,11 @@
 #import "lwip/timeouts.h"
 #import "lwip/sys.h"
 
+// lwIP 的 TCP 定时器：NO_SYS=1 时没有 tcpip 线程，必须由应用自己周期调用，
+// 否则延迟 ACK、丢包重传、tcp_poll 回调全都不工作（一丢包就永久卡死）。
+// 部分 lwIP 版本只在 #if !NO_SYS 分支里声明它，这里自己 extern 一次。
+extern void tcp_tmr(void);
+
 #import <sys/socket.h>
 #import <netinet/in.h>
 #import <arpa/inet.h>
