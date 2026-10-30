@@ -100,6 +100,8 @@ struct ortentry {
 #import <unistd.h>
 #import <time.h>
 #import <ctype.h>
+#import <sys/sysctl.h>   // 默认路由探测（NET_RT_DUMP）
+#import <net/route.h>    // 同上：rt_msghdr / RTAX_*
 #import <CommonCrypto/CommonHMAC.h>   // TOTP 的 HMAC-SHA1（系统库，无额外链接）
 
 #pragma mark - 配置键
@@ -200,6 +202,46 @@ static int ifindex_of(const char *ifname) {
     if (!ifname || !*ifname) return 0;
     unsigned idx = if_nametoindex(ifname);
     return idx ? (int)idx : 0;
+}
+
+// 读内核路由表，找 IPv4 默认路由（0.0.0.0/0）所在网卡的 ifindex。
+// WiFi 下是 en0，蜂窝下是 pdp_ip0——绑死 en0 的话切到蜂窝后 VPN 自己的
+// connect() 直接 ENETUNREACH（实测问题：WiFi 能连、流量连不上）
+static int default_route_ifindex(void) {
+    int mib[6] = { CTL_NET, PF_ROUTE, 0, AF_INET, NET_RT_DUMP, 0 };
+    size_t len = 0;
+    if (sysctl(mib, 6, NULL, &len, NULL, 0) != 0) return 0;
+    char *buf = (char *)malloc(len);
+    if (!buf) return 0;
+    int idx = 0;
+    if (sysctl(mib, 6, buf, &len, NULL, 0) == 0) {
+        for (char *p = buf; p + sizeof(struct rt_msghdr) <= buf + len; ) {
+            struct rt_msghdr *rtm = (struct rt_msghdr *)p;
+            if (rtm->rtm_msglen < (u_short)sizeof(struct rt_msghdr) ||
+                rtm->rtm_version != RTM_VERSION) break;
+            // 默认路由：带网关、目的 0.0.0.0
+            if (rtm->rtm_type == RTM_GET && (rtm->rtm_flags & RTF_GATEWAY) &&
+                (rtm->rtm_addrs & RTA_DST)) {
+                struct sockaddr *sa = (struct sockaddr *)(rtm + 1);
+                struct sockaddr_in *dst = NULL;
+                for (int i = 0; i < RTAX_MAX; i++) {
+                    if (!(rtm->rtm_addrs & (1 << i))) continue;
+                    if (sa->sa_len == 0) break;
+                    if (i == RTAX_DST) dst = (struct sockaddr_in *)sa;
+                    sa = (struct sockaddr *)((char *)sa + ((sa->sa_len + 3) & ~3));
+                    if ((char *)sa > buf + len) break;
+                }
+                if (dst && dst->sin_family == AF_INET &&
+                    dst->sin_addr.s_addr == INADDR_ANY) {
+                    idx = (int)rtm->rtm_index;
+                    break;
+                }
+            }
+            p += rtm->rtm_msglen;
+        }
+    }
+    free(buf);
+    return idx;
 }
 
 #pragma mark - openconnect 回调（静态全局，对齐 anyvpn-jni.c 的做法）
@@ -1196,8 +1238,22 @@ static void cb_protect_socket(void *privdata, int fd) {
         // 撞上网关重放保护 → 连续 401，直到窗口翻转才成功（表现为重试两次才连上）
         g_staticPasswordSubmitted = NO;
 
-        NSString *underlying = [self plist:@"UnderlyingIface" default:@"en0"];
-        g_underlying_idx = ifindex_of(underlying.UTF8String);
+        // 底层网卡：plist 显式指定优先；否则自动探测默认路由（WiFi=en0 / 蜂窝=pdp_ip0）。
+        // 以前绑死 en0，切到蜂窝后 VPN 自己的 connect() 直接 ENETUNREACH
+        NSString *underlying = [self plist:@"UnderlyingIface" default:@""];
+        if (underlying.length) {
+            g_underlying_idx = ifindex_of(underlying.UTF8String);
+        } else {
+            g_underlying_idx = default_route_ifindex();
+        }
+        char ifname[IFNAMSIZ] = {0};
+        if (g_underlying_idx > 0 && if_indextoname((unsigned)g_underlying_idx, ifname)) {
+            IPATAppendLogLine([NSString stringWithFormat:
+                @"[anyvpn] 底层网卡：%s（idx %d）", ifname, g_underlying_idx]);
+        } else {
+            g_underlying_idx = 0;   // 探测失败就不绑，走系统默认路由
+            IPATAppendLogLine(@"[anyvpn] 底层网卡：探测失败，不绑定（走系统默认路由）");
+        }
         NSString *server = g_cfgServer;
 
         NSString *host = server;
