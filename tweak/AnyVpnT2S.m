@@ -581,9 +581,21 @@ BOOL T2SResolve(NSString *host, uint32_t *outAddrV4) {
     [host getCString:name maxLength:sizeof name - 1 encoding:NSUTF8StringEncoding];
 
     pthread_mutex_lock(&g_dnsMutex);
-    if (g_dnsReq.state != 2 && g_dnsReq.state != 0) {
+    if (g_dnsReq.state == 1) {
+        // 前一个查询在飞：等它落地再排队发自己的。原来直接 return NO，
+        // 调用方（hooked_getaddrinfo）会立刻回落系统 DNS——系统解析拿不到
+        // 线路 DNS 的地域结果，游戏并发发起的一串域名几乎全部绕开选线，
+        // 这是「连哪条线都进同一个环境」的元凶
+        struct timespec tsPrev;
+        clock_gettime(CLOCK_REALTIME, &tsPrev);
+        tsPrev.tv_sec += 5;
+        while (g_dnsReq.state == 1) {
+            if (pthread_cond_timedwait(&g_dnsCond, &g_dnsMutex, &tsPrev) == ETIMEDOUT) break;
+        }
+    }
+    if (g_dnsReq.state == 1) {
         pthread_mutex_unlock(&g_dnsMutex);
-        return NO;                          // 上一个查询还在飞，别叠加
+        return NO;                          // 前一个查询 5s 还没落地，放弃本条
     }
     memset(&g_dnsReq, 0, sizeof g_dnsReq);
     strlcpy(g_dnsReq.name, name, sizeof g_dnsReq.name);
@@ -600,7 +612,12 @@ BOOL T2SResolve(NSString *host, uint32_t *outAddrV4) {
     uint32_t addr = g_dnsReq.addr;
     g_dnsReq.state = 0;
     pthread_mutex_unlock(&g_dnsMutex);
-    if (found) *outAddrV4 = htonl(addr);
+    if (found) {
+        // addr 是主机序，诊断日志直接点分
+        T2SLog(@"DNS 应答：%s = %u.%u.%u.%u（线路 DNS）", name,
+               (addr >> 24) & 0xFF, (addr >> 16) & 0xFF, (addr >> 8) & 0xFF, addr & 0xFF);
+        *outAddrV4 = htonl(addr);
+    }
     return found ? YES : NO;
 }
 
@@ -846,6 +863,11 @@ static int hooked_getaddrinfo(const char *node, const char *service,
     if (g_hooksInstalled && g_ready && node && *node && res) {
         struct in_addr numeric;
         if (inet_pton(AF_INET, node, &numeric) != 1) {     // 数字 IP 直接放行
+            static int dnsQueryLogs = 0;
+            if (dnsQueryLogs < 30) {
+                dnsQueryLogs++;
+                T2SLog(@"DNS 查询 #%d：%s", dnsQueryLogs, node);
+            }
             uint32_t a = 0;
             if (T2SResolve([NSString stringWithUTF8String:node], &a)) {
                 int port = service ? atoi(service) : 0;
@@ -867,7 +889,9 @@ static int hooked_getaddrinfo(const char *node, const char *service,
                 free(ai);
                 free(sa);
             }
-            // 隧道解析失败：回落系统解析（可能拿不到隧道内的地域结果，但聊胜于无）
+            // 隧道解析失败：回落系统解析——注意系统 DNS 拿到的是线上/本地结果，
+            // 会绕开线路 DNS 的地域视角；这条日志就是用来抓「哪些域名没走线路」
+            T2SLog(@"DNS 查询：%s → 线路 DNS 失败，回落系统解析", node);
         }
     }
     return real_getaddrinfo(node, service, hints, res);
