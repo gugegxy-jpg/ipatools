@@ -768,11 +768,10 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
     [self refreshButtonAppearance];
 }
 
-/// 顺序固定一下，免得每次加载顺序不同导致界面跳来跳去。
-/// 后注册的未知功能（未来新 dylib）追加在最后，仍然稳定。
+/// 顺序固定一下，免得每次加载顺序不同导致界面跳来跳去：
+/// VPN 隧道 -> QNet -> 性能浮窗 -> 文件导入，其余（如 plugins）追加最后。
 - (NSArray<NSString *> *)sortedFeatureIds {
-    NSArray *order = @[IPATFeatureQNet, IPATFeaturePlugins, IPATFeatureFiles,
-                       @"anyvpn", @"solox"];
+    NSArray *order = @[@"anyvpn", IPATFeatureQNet, @"solox", IPATFeatureFiles];
     NSMutableArray<NSString *> *ids = [NSMutableArray array];
     for (NSString *featureId in order) {
         if (self.features[featureId]) [ids addObject:featureId];
