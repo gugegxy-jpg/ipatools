@@ -29,6 +29,8 @@ OUT_DIR="${IPATOOL_OUT_DIR:-$HERE/build}"
 MIN_IOS="${IPATOOL_MIN_IOS:-14.0}"
 ARCHS="${IPATOOL_ARCHS:-arm64}"
 TARGETS="${IPATOOL_TARGETS:-IPATool QNet SoloX}"
+# 面板标题显示的版本号：功能有可感知变化时手动 +1（区别于每次构建都变的 run number）
+IPAT_VERSION="${IPAT_VERSION:-1.0.0}"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "错误：编译 iOS dylib 需要 macOS + Xcode 命令行工具（当前系统：$(uname -s)）" >&2
@@ -163,7 +165,8 @@ build_target() {
   #    CGBitmapContextCreate / CGAffineTransform* / CGRectGet* 必须显式链接 CoreGraphics；
   # 2) 必须用 if ! 显式判失败：build_target 是作为 `... || status=1` 的左操作数调用的，
   #    在那种上下文里 bash 会禁用函数内的 set -e，链接失败会被静默吞掉（还会误报"已生成"）。
-  # IPAT_BUILD_NUM：面板上显示构建号，用户一眼确认设备里加载的是不是最新 dylib
+  # IPAT_VERSION：面板标题显示的版本号；IPAT_BUILD_NUM 仍编译进去（日志/诊断用），
+  # 但面板不再显示
   if ! xcrun -sdk iphoneos clang \
     -dynamiclib -fobjc-arc -O2 \
     "${ARCH_FLAGS[@]}" \
@@ -171,6 +174,7 @@ build_target() {
     -isysroot "$SDK" \
     -framework Foundation -framework UIKit -framework CoreGraphics \
     -framework QuartzCore \
+    -DIPAT_VERSION="\"$IPAT_VERSION\"" \
     -DIPAT_BUILD_NUM="\"$GITHUB_RUN_NUMBER\"" \
     ${extra[@]+"${extra[@]}"} \
     -install_name "@executable_path/Frameworks/$name.dylib" \

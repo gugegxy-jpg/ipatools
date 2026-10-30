@@ -714,12 +714,13 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
                                                               width - IPATCpInset * 2, IPATCpTitleHeight)];
     title.font = [UIFont systemFontOfSize:15.0 weight:UIFontWeightSemibold];
     title.textColor = [UIColor whiteColor];
-    // 构建号写死在 dylib 里：一眼确认设备加载的是哪一版（Release 里的
-    // IPATool.dylib 构建号 = Actions run 编号）
-#if defined(IPAT_BUILD_NUM)
+    // 版本号在 build.sh 里定义（IPAT_VERSION，手动维护）；构建号不再上标题
+#if defined(IPAT_VERSION)
+    title.text = [NSString stringWithFormat:@"ipatool 面板  v%s", IPAT_VERSION];
+#elif defined(IPAT_BUILD_NUM)
     title.text = [NSString stringWithFormat:@"ipatool 面板  build#%s", IPAT_BUILD_NUM];
 #else
-    title.text = @"ipatool 面板  (旧构建)";
+    title.text = @"ipatool 面板";
 #endif
     [self.contentView addSubview:title];
 
