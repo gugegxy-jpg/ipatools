@@ -77,6 +77,7 @@ static NSString *const kSoloXChartJS =
 @implementation SoloXMonitor {
     UIWindow *_window;
     UIView *_bar;
+    NSLayoutConstraint *_barTop;   // 性能条顶部距离（竖屏要让出刘海/灵动岛）
     UILabel *_cpu, *_mem, *_net, *_fps, *_bat, *_temp;
     CADisplayLink *_link;
     NSInteger _frameCount;
@@ -218,9 +219,11 @@ static NSString *const kSoloXChartJS =
     [rootView addSubview:_bar];
     // 钉在窗口自身 bounds 上（align 把窗口铺满屏幕，scene 负责把它转到正确方向）；
     // 不用 safeAreaLayoutGuide，避免随界面方向变化时安全区计算错位。
-    // 两侧留 16pt 空白，避免被屏幕物理圆角把性能条两侧圆角裁掉；顶部留 8pt。
+    // 顶部距离由 align() 动态算：竖屏让出刘海/灵动岛，横屏贴顶 8pt。
+    // 两侧留 16pt 空白，避免被屏幕物理圆角把性能条两侧圆角裁掉。
+    _barTop = [_bar.topAnchor constraintEqualToAnchor:rootView.topAnchor constant:8];
     [NSLayoutConstraint activateConstraints:@[
-        [_bar.topAnchor constraintEqualToAnchor:rootView.topAnchor constant:8],
+        _barTop,
         [_bar.leadingAnchor constraintEqualToAnchor:rootView.leadingAnchor constant:16],
         [_bar.trailingAnchor constraintEqualToAnchor:rootView.trailingAnchor constant:-16],
         [_bar.heightAnchor constraintEqualToConstant:22],
@@ -271,6 +274,30 @@ static NSString *const kSoloXChartJS =
     // 拿不到游戏窗口（冷启动瞬间）就退回按屏幕尺寸铺满。
     UIWindow *app = IPATAppKeyWindowExcluding(_window);
     IPATAlignWindowToInterface(_window, app);
+
+    // 顶部距离：竖屏时刘海/灵动岛（约 50-60pt）会正好压在 top+8 的性能条上，
+    // 数据文字全被遮住（看起来就是一条没有字的半透明条）；横屏时刘海在侧边，
+    // 贴顶即可。窗口是抄游戏旋转的，transform 非单位阵 = 显示上是横屏。
+    BOOL rotated = !CGAffineTransformIsIdentity(_window.transform);
+    BOOL portrait = !rotated && _window.bounds.size.height > _window.bounds.size.width;
+    CGFloat top = 8.0;
+    if (portrait) {
+        CGFloat safeTop = 0;
+        if (@available(iOS 11.0, *)) {
+            // 优先读游戏窗口的安全区（未旋转、数值可靠），拿不到再读自己的
+            safeTop = app ? app.safeAreaInsets.top : _window.safeAreaInsets.top;
+            if (safeTop <= 0) safeTop = _window.safeAreaInsets.top;
+        }
+        top = MAX(top, safeTop + 4.0);
+    }
+    _barTop.constant = top;
+}
+
+/// 转屏动画约 0.4s，动画期间读到的 safeAreaInsets 还是旧的；
+/// 等动画收尾再算一次顶部距离（align 自身幂等，多跑一次无害）
+- (void)alignLate {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ [self align]; });
 }
 
 - (void)applyVisibility {
@@ -315,6 +342,7 @@ static NSString *const kSoloXChartJS =
     [c addObserver:self selector:@selector(handleAction:)   name:IPATControlActionNotification object:nil];
     [c addObserver:self selector:@selector(handleDiscover:) name:IPATControlDiscoverNotification object:nil];
     [c addObserver:self selector:@selector(align)          name:UIDeviceOrientationDidChangeNotification object:nil];
+    [c addObserver:self selector:@selector(alignLate)      name:UIDeviceOrientationDidChangeNotification object:nil];
     // App 进入前台 / scene 激活后再显示并对齐一次：解决「启动不显示 + 横屏不转正」
     [c addObserver:self selector:@selector(applyVisibility) name:UIApplicationDidBecomeActiveNotification object:nil];
     if (@available(iOS 13.0, *)) {
