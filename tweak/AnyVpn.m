@@ -547,6 +547,10 @@ static void cb_protect_socket(void *privdata, int fd) {
         // （IPATKeyAnyVpnEnabled 只反映当前连接状态，不是用户设置；
         //   初始默认值走 Info.plist 的 Enabled，由 applyConfig 读）
         [[NSUserDefaults standardUserDefaults] removeObjectForKey:IPATKeyAnyVpnEnabled];
+        // 启动时就记住「已知的选中连接」。绝不能等到比较时才懒加载去读存储键：
+        // 面板发切换通知前已经把新值写进了那个键，第一次比较必然读到新值，
+        // 检测不出变化（这就是「连接中切线路没反应」的残留根因）
+        self.selectedIdMemo = [[NSUserDefaults standardUserDefaults] stringForKey:IPATKeyAnyVpnActive] ?: @"";
         [self applyConfig];
         [[NSNotificationCenter defaultCenter] addObserver:self
                                                  selector:@selector(handleChange:)
@@ -976,6 +980,8 @@ static void cb_protect_socket(void *privdata, int fd) {
     if (values[IPATKeyAnyVpnActive]) {
         NSString *aid = values[IPATKeyAnyVpnActive];
         if (![aid isEqualToString:[self activeProfileId]]) {
+            IPATAppendLogLine([NSString stringWithFormat:@"[anyvpn] 切换连接：%@ → %@",
+                               [self activeProfileId] ?: @"(无)", aid]);
             [[NSUserDefaults standardUserDefaults] setObject:aid forKey:IPATKeyAnyVpnActive];
             self.selectedIdMemo = aid;
             activeChanged = YES;
