@@ -55,8 +55,8 @@ static void set_nonblock(int fd) {
 
 typedef struct {
     uint16_t sport;      // 宿主侧 socket 的本地端口（bind 127.0.0.1:0 后拿到）
-    uint32_t ip;         // 真实目的地（网络序）
-    uint16_t port;
+    uint32_t ip;         // 真实目的地（主机序）
+    uint16_t port;       // 真实目的地端口（主机序）
 } T2STarget;
 
 #define T2S_TARGET_MAX 256
@@ -352,7 +352,7 @@ static void t2s_tcp_accept(int newfd) {
     tcp_err(pcb, t2s_tcp_err);
 
     ip_addr_t addr;
-    ip_addr_set_ip4_u32(&addr, dip);
+    ip_addr_set_ip4_u32(&addr, htonl(dip));   // lwIP addr 字段存网络序，主机序入表后在此转回
     if (tcp_connect(pcb, &addr, dport, t2s_tcp_connected) != ERR_OK) {
         tcp_arg(pcb, NULL);
         tcp_abort(pcb);
@@ -360,7 +360,7 @@ static void t2s_tcp_accept(int newfd) {
         return;
     }
     s->pcb = pcb;
-    // 诊断：记录游戏接线目标（源 IP/端口可疑一眼可见）
+    // 诊断：记录游戏接线目标（dip/dport 已是主机序，可直接点分打印）
     static int acceptLogs = 0;
     if (acceptLogs < 5) {
         acceptLogs++;
@@ -433,8 +433,8 @@ static void t2s_udp_accept(struct sockaddr_in *from) {
     if (!pcb) { free(u); return; }
     udp_recv(pcb, t2s_udp_recv_cb, u);
     ip_addr_t addr;
-    ip_addr_set_ip4_u32(&addr, dip);
-    if (udp_connect(pcb, &addr, dport) != ERR_OK) {
+    ip_addr_set_ip4_u32(&addr, htonl(dip));   // 同 TCP：lwIP 要网络序 IP
+    if (udp_connect(pcb, &addr, dport) != ERR_OK) {   // udp_connect 要主机序端口
         udp_remove(pcb);
         free(u);
         return;
@@ -757,8 +757,10 @@ static BOOL t2s_wire_fd(int fd, BOOL isTCP, const struct sockaddr_in *dest) {
     // 但这里不能依赖那个兜底逻辑
     int rc = real_connect(fd, (struct sockaddr *)&relay, sizeof relay);
     if (rc != 0 && errno != EINPROGRESS) return NO;
-    if (isTCP) target_add(g_tcpTargets, sport, dest->sin_addr.s_addr, dest->sin_port);
-    else target_add(g_udpTargets, sport, dest->sin_addr.s_addr, dest->sin_port);
+    // sockaddr 里 s_addr/sin_port 是网络序，这里统一转成主机序落表；
+    // lwIP 使用点再按各自约定转回去（ip 用 htonl，port 直接用主机序）
+    if (isTCP) target_add(g_tcpTargets, sport, ntohl(dest->sin_addr.s_addr), ntohs(dest->sin_port));
+    else target_add(g_udpTargets, sport, ntohl(dest->sin_addr.s_addr), ntohs(dest->sin_port));
     return YES;
 }
 
