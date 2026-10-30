@@ -31,7 +31,8 @@
 #define PBUF_POOL_SIZE          128
 #define PBUF_POOL_BUFSIZE       1600
 
-#define TCP_MSS                 1344
+// 必须小于 MTU(1340)-40：MSS 超了 lwIP 的满尺寸 TCP 段出不了网
+#define TCP_MSS                 1300
 #define TCP_WND                 (16 * 1024)
 #define TCP_SND_BUF             (16 * 1024)
 #define TCP_SND_QUEUELEN        64
@@ -43,7 +44,12 @@
 #define MEMP_NUM_REASSDATA      16
 
 #define IP_REASSEMBLY           1
-#define IP_FRAG                 0
+// 必须开：lwIP 2.1 的 MTU 检查包在 #if IP_FRAG 里，关掉分片后超过 netif MTU 的
+// 包（游戏 UDP 常见 1341~1384 字节）会原样送到 t2s_output；openconnect 的 tun
+// 读缓冲按 MTU 分配，DGRAM read 会把大包截断成畸形 IP 包，网关校验失败直接
+// 杀会话（表现：一连上、游戏一跑流量就 2~3 秒被断一次）。开了分片 lwIP 自动
+// 按 netif->mtu 切片，超大包到不了 openconnect
+#define IP_FRAG                 1
 #define IP_REASS_MAX_PBUFS      64
 #define LWIP_CHECKSUM_ON_COPY   1
 

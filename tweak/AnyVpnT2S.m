@@ -157,10 +157,26 @@ static BOOL engineWantsInet(const struct sockaddr_in *d) {
 #pragma mark - lwIP netif
 
 static err_t t2s_output(struct netif *nif, struct pbuf *p, const ip4_addr_t *ipaddr) {
-    (void)nif; (void)ipaddr;
+    (void)ipaddr;
     if (g_ocFd < 0) return ERR_IF;
-    static uint8_t linear[TCP_MSS + 40];
     size_t total = 0;
+    for (struct pbuf *q = p; q; q = q->next) {
+        total += q->len;
+    }
+    // MTU 守门：超过 netif MTU 的包绝不能进 openconnect——tun 读缓冲按 MTU 分配，
+    // DGRAM read 会把大包截断成畸形 IP 包喂给网关，ocserv 校验失败直接杀会话
+    //（表现：一连上、游戏一跑流量就 2~3 秒被服务端断一次）。IP_FRAG 开启后
+    // lwIP 理论不会再出大包，这里兜底；真出现就丢，靠上层重传/重发
+    if (nif && nif->mtu && total > nif->mtu) {
+        static int dropLogs = 0;
+        if (dropLogs < 5) {
+            dropLogs++;
+            T2SLog(@"丢弃超 MTU 出站包：%zu 字节（MTU %d）", total, nif->mtu);
+        }
+        return ERR_BUF;
+    }
+    static uint8_t linear[TCP_MSS + 40];
+    total = 0;
     for (struct pbuf *q = p; q; q = q->next) {
         if (total + q->len > sizeof linear) return ERR_BUF;
         memcpy(linear + total, q->payload, q->len);
