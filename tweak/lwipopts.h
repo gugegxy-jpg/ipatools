@@ -24,7 +24,9 @@
 #define LWIP_ICMP               1
 #define LWIP_STATS              0
 #define LWIP_TIMERS             1
-#define LWIP_SUPPORT_CUSTOM_PBUF 0
+// IP_FRAG 的 ip4_frag.h 用到 struct pbuf_custom，必须一并开启，否则编译报
+// "field has incomplete type 'struct pbuf_custom'"
+#define LWIP_SUPPORT_CUSTOM_PBUF 1
 
 #define MEM_LIBC_MALLOC         1   // 用系统 malloc，省得自己管堆
 #define MEMP_MEM_MALLOC         1
