@@ -228,30 +228,33 @@ static int default_route_ifindex(void) {
     if (sysctl(mib, 6, NULL, &len, NULL, 0) != 0) return 0;
     char *buf = (char *)malloc(len);
     if (!buf) return 0;
-    int idx = 0;
+    int idx = 0, idxAny = 0;
     if (sysctl(mib, 6, buf, &len, NULL, 0) == 0) {
         for (char *p = buf; p + sizeof(struct ipat_rt_msghdr) <= buf + len; ) {
             struct ipat_rt_msghdr *rtm = (struct ipat_rt_msghdr *)p;
             if (rtm->rtm_msglen < (u_short)sizeof(struct ipat_rt_msghdr) ||
                 rtm->rtm_version != IPAT_RTM_VERSION) break;
-            // 默认路由：带网关、目的 0.0.0.0（sockaddr 链按 sa_len 4 字节对齐遍历）
-            if (rtm->rtm_type == IPAT_RTM_GET && (rtm->rtm_flags & IPAT_RTF_GATEWAY) &&
-                (rtm->rtm_addrs & IPAT_RTA_DST)) {
+            // 默认路由：目的 0.0.0.0（sockaddr 链按 sa_len 4 字节对齐遍历）。
+            // 注意不能要求 RTF_GATEWAY：WiFi 的默认路由是 "default 192.168.x.1"
+            // （带 G 标志），蜂窝是 "default link#N"（网关=接口自己，不带 G），
+            // 按带 G 过滤会导致蜂窝下永远探测失败
+            if (rtm->rtm_type == IPAT_RTM_GET && (rtm->rtm_addrs & IPAT_RTA_DST)) {
                 struct sockaddr *sa = (struct sockaddr *)(rtm + 1);
                 struct sockaddr_in *dst = NULL;
                 if (sa->sa_len > 0 && sa->sa_family == AF_INET) {
                     dst = (struct sockaddr_in *)sa;
                 }
-                if (dst && dst->sin_addr.s_addr == INADDR_ANY) {
-                    idx = (int)rtm->rtm_index;
-                    break;
+                if (dst && dst->sin_addr.s_addr == INADDR_ANY && rtm->rtm_index > 0) {
+                    // WiFi（带网关）优先；蜂窝 link 路由记一份兜底
+                    if (!idxAny) idxAny = (int)rtm->rtm_index;
+                    if (rtm->rtm_flags & IPAT_RTF_GATEWAY) { idx = (int)rtm->rtm_index; break; }
                 }
             }
             p += rtm->rtm_msglen;
         }
     }
     free(buf);
-    return idx;
+    return idx ? idx : idxAny;
 }
 
 #pragma mark - openconnect 回调（静态全局，对齐 anyvpn-jni.c 的做法）
