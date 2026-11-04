@@ -92,6 +92,28 @@ targets:
       - sdk: NetworkExtension.framework
       - sdk: Security.framework
 
+    # Xcode 26 对 app-extension 仍会用自动生成的 Info.plist 覆盖手写文件，
+    # 丢掉 NSExtension 字典 → 装真机报 IXErrorDomain Code=17。
+    # 在每个构建（含 Xcode 直接 Run）末尾补写，签名阶段之前执行，不影响签名。
+    postBuildScripts:
+      - name: Ensure NSExtension in appex Info.plist
+        basedOnDependencyAnalysis: false
+        script: |
+          set -e
+          PB=/usr/libexec/PlistBuddy
+          PLIST="${TARGET_BUILD_DIR}/${INFOPLIST_PATH}"
+          if [ ! -f "$PLIST" ]; then
+            echo "warning: 找不到 appex Info.plist: $PLIST"
+            exit 0
+          fi
+          if ! "$PB" -c "Print :NSExtension:NSExtensionPointIdentifier" "$PLIST" 2>/dev/null | grep -q "packet-tunnel"; then
+            "$PB" -c "Delete :NSExtension" "$PLIST" 2>/dev/null || true
+            "$PB" -c "Add :NSExtension dict" "$PLIST"
+            "$PB" -c "Add :NSExtension:NSExtensionPointIdentifier string com.apple.networkextension.packet-tunnel" "$PLIST"
+            "$PB" -c "Add :NSExtension:NSExtensionPrincipalClass string PacketTunnel.PacketTunnelProvider" "$PLIST"
+            echo "已补齐 appex NSExtension 字典: $PLIST"
+          fi
+
 schemes:
   AnyVpnApp:
     build:
