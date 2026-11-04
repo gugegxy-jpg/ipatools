@@ -216,19 +216,6 @@ def _build_parser() -> argparse.ArgumentParser:
     solox.add_argument("--solox", action="store_true", help="注入性能悬浮窗 SoloX.dylib")
     solox.add_argument("--solox-dylib", metavar="PATH", help="性能悬浮窗 dylib 路径，默认自动查找（macOS 上会自动编译）")
 
-    anyvpn = pj.add_argument_group(
-        "VPN 隧道（--anyvpn）",
-        "注入 AnyVpn.dylib（OpenConnect/AnyConnect 协议客户端，依赖 iOS 版"
-        " openconnect 静态库，见 tweak/anyvpn/build-openconnect-ios.sh）。"
-        "连接凭据写进 Info.plist，连接/断开在游戏内悬浮窗里控制",
-    )
-    anyvpn.add_argument("--anyvpn", action="store_true", help="注入 VPN 隧道 AnyVpn.dylib")
-    anyvpn.add_argument("--anyvpn-dylib", metavar="PATH", help="VPN 隧道 dylib 路径，默认自动查找")
-    anyvpn.add_argument("--anyvpn-server", metavar="URL", help="VPN 服务器地址（AnyConnect 网关 URL）")
-    anyvpn.add_argument("--anyvpn-user", metavar="NAME", help="VPN 登录账号（表单自动回填）")
-    anyvpn.add_argument("--anyvpn-pass", metavar="PASS", help="VPN 登录密码（写进 Info.plist，注意随包分发）")
-    anyvpn.add_argument("--anyvpn-group", metavar="GROUP", help="认证组（多组网关时按 label/name 匹配）")
-
     files = pj.add_argument_group(
         "文件导入导出",
         "在悬浮窗里浏览沙盒里的游戏热更文件，导出到系统「文件」App，或从「文件」App 导入回来",
@@ -962,14 +949,13 @@ def cmd_inject(args) -> int:
         plugins_tuning = bool(args.plugins_dylib or args.plugins_autoload)
         plugins_enabled = bool(args.plugins or plugins_tuning) and not args.no_plugins
         solox_enabled = bool(args.solox or args.solox_dylib)
-        anyvpn_enabled = bool(args.anyvpn or args.anyvpn_dylib)
         # 悬浮窗默认跟着内置功能一起注入；--no-panel 关掉它。
-        # SoloX / AnyVpn 的开关都在悬浮窗里，所以开它们时也默认把悬浮窗一起注入
+        # SoloX 的开关也在悬浮窗里，所以开它时同样默认把悬浮窗一起注入
         # （除非 --no-panel）。
         panel_tuning = bool(args.panel or args.panel_dylib or args.panel_title)
         panel_enabled = bool(
             files_enabled or qnet_enabled or plugins_enabled or panel_tuning
-            or solox_enabled or anyvpn_enabled
+            or solox_enabled
         ) and not args.no_panel
         plist_touched = bool(
             files_enabled
@@ -977,7 +963,6 @@ def cmd_inject(args) -> int:
             or plugins_enabled
             or panel_enabled
             or solox_enabled
-            or anyvpn_enabled
             or args.background_mode
             or args.allow_arbitrary_loads
         )
@@ -1063,26 +1048,6 @@ def cmd_inject(args) -> int:
             if not panel_enabled:
                 warnings.append("没有注入悬浮窗，SoloX 开关无处可放：建议去掉 --no-panel 或加 --panel，"
                                 "否则只能显示、不能在游戏内关掉")
-        if anyvpn_enabled:
-            anyvpn_dylib = inject_mod.locate_anyvpn_dylib(
-                explicit=args.anyvpn_dylib,
-                log=lambda m: print(f"  {m}"),
-            )
-            planned.append((anyvpn_dylib, inject_mod.ANYVPN_DYLIB_NAME))
-            print(f"VPN 隧道    : {anyvpn_dylib}")
-            settings.append((inject_mod.ANYVPN_INFO_KEY,
-                             inject_mod.build_anyvpn_options(
-                                 server=args.anyvpn_server,
-                                 user=args.anyvpn_user,
-                                 password=args.anyvpn_pass,
-                                 group=args.anyvpn_group,
-                                 enabled=False,
-                             ), "VPN 隧道"))
-            if not args.anyvpn_server:
-                warnings.append("VPN 没配 --anyvpn-server，注入后悬浮窗里点「立即连接」也不会成功")
-            if not panel_enabled:
-                warnings.append("没有注入悬浮窗，VPN 连接/断开没有入口：建议去掉 --no-panel 或加 --panel")
-
         for path in args.dylib or []:
             planned.append((path, os.path.basename(path)))
 

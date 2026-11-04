@@ -1,0 +1,90 @@
+name: AnyVpnApp
+options:
+  bundleIdPrefix: com.anyvpn
+  deploymentTarget:
+    iOS: "15.0"   # Material / .background(_:in:) 毛玻璃材质最低 iOS 15
+  generateEmptyDirectories: true
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    CLANG_ENABLE_MODULES: YES
+    CLANG_ENABLE_OBJC_ARC: YES
+    GCC_WARN_UNDECLARED_SELECTOR: YES
+
+targets:
+  # 宿主 App：线路管理 / 凭据 / VPN 配置安装 / 日志
+  AnyVpnApp:
+    type: application
+    platform: iOS
+    sources:
+      - path: App
+        excludes:
+          - "Info.plist"
+          - "**/Info.plist"
+          - "*.entitlements"
+          - "**/*.entitlements"
+      - path: Shared
+    info:
+      path: App/Info.plist
+    entitlements:
+      path: App/App.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.anyvpn.app
+    dependencies:
+      - target: PacketTunnel
+        embed: true
+
+  # NetworkExtension：系统级 tun，libopenconnect 直接收发 IP 包
+  PacketTunnel:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Tunnel
+        excludes:
+          - "Info.plist"
+          - "**/Info.plist"
+          - "*.entitlements"
+          - "**/*.entitlements"
+      - path: Shared
+    info:
+      path: Tunnel/Info.plist
+    entitlements:
+      path: Tunnel/Tunnel.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.anyvpn.app.tunnel
+        SWIFT_OBJC_BRIDGING_HEADER: Tunnel/Bridging-Header.h
+        HEADER_SEARCH_PATHS:
+          - "$(inherited)"
+          - "$(PROJECT_DIR)/Vendor/openconnect/include"
+          - "$(PROJECT_DIR)/Vendor/openconnect/include/libxml2"
+        LIBRARY_SEARCH_PATHS:
+          - "$(inherited)"
+          - "$(PROJECT_DIR)/Vendor/openconnect/lib"
+        OTHER_LDFLAGS:
+          - "$(inherited)"
+          - "-lopenconnect"
+          - "-lssl"
+          - "-lcrypto"
+          - "-lxml2"
+          - "-lz"
+          - "-liconv"
+    dependencies:
+      - sdk: NetworkExtension.framework
+      - sdk: Security.framework
+
+schemes:
+  AnyVpnApp:
+    build:
+      targets:
+        AnyVpnApp: all
+        PacketTunnel: all
+    run:
+      config: Debug
+    archive:
+      config: Release

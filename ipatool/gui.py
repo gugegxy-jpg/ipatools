@@ -421,12 +421,6 @@ class IpatoolGui:
         self.v_export_token = tk.StringVar()
         self.v_dylib_path = tk.StringVar()
         self.v_ipa_path = tk.StringVar()
-        # VPN 隧道（AnyVpn）
-        self.v_anyvpn = tk.BooleanVar(value=False)
-        self.v_anyvpn_server = tk.StringVar()
-        self.v_anyvpn_user = tk.StringVar()
-        self.v_anyvpn_pass = tk.StringVar()
-        self.v_anyvpn_group = tk.StringVar()
         # 页面内部状态（下拉选项 / 最近运行等）
         self._repo_full: dict[str, str] = {}
         self.repo_cb = None
@@ -615,7 +609,6 @@ class IpatoolGui:
         self._build_pack_dylib(top, 0, column=1, sticky="nsew")
         self._build_pack_sign(page, 1)
         self._build_pack_install(page, 2)
-        self._build_pack_vpn(page, 3)
 
     # ---- 信息 --------------------------------------------------------- #
     def _build_info_tab(self) -> None:
@@ -903,21 +896,6 @@ class IpatoolGui:
             box, style="Muted.TLabel", justify="left", wraplength=680,
             )
         self._refresh_install_summary()
-
-    def _build_pack_vpn(self, page, row: int) -> None:
-        """VPN 隧道（AnyVpn）：勾选后注入 AnyVpn.dylib 并把凭据写进 Info.plist。"""
-        box = self._group(page, "VPN 隧道（AnyConnect / OpenConnect）", row)
-        self._check(box, "注入 VPN 隧道（--anyvpn）", self.v_anyvpn).grid(
-            row=0, column=0, columnspan=2, sticky="w", pady=(0, 2))
-        ttk.Label(
-            box, style="Muted.TLabel", justify="left", wraplength=680,
-            text="连接 / 断开在游戏内悬浮窗里操作。流量接管需要 root（越狱）；"
-                 "dylib 本体需在 macOS 上先跑 tweak/anyvpn/build-openconnect-ios.sh 编出。",
-        ).grid(row=0, column=2, columnspan=2, sticky="e", pady=(0, 2))
-        self._entry(box, 1, "服务器", self.v_anyvpn_server, "AnyConnect 网关 URL")
-        self._entry(box, 2, "账号", self.v_anyvpn_user)
-        self._entry(box, 3, "密码", self.v_anyvpn_pass)
-        self._entry(box, 4, "认证组", self.v_anyvpn_group, "留空 = 选第一个")
 
     def _build_bottom(self) -> None:
         area = ttk.Frame(self.root)
@@ -1644,17 +1622,11 @@ class IpatoolGui:
         argv = ["inject", src]
         for path in self.custom_dylibs:
             argv += ["--dylib", path]
-        if self.v_anyvpn.get():
-            argv.append("--anyvpn")
-            _add(argv, "--anyvpn-server", self.v_anyvpn_server.get().strip() or None)
-            _add(argv, "--anyvpn-user", self.v_anyvpn_user.get().strip() or None)
-            _add(argv, "--anyvpn-pass", self.v_anyvpn_pass.get() or None)
-            _add(argv, "--anyvpn-group", self.v_anyvpn_group.get().strip() or None)
         argv += self._common_args()
 
-        if not self.custom_dylibs and not self.v_anyvpn.get():
+        if not self.custom_dylibs:
             messagebox.showwarning(
-                "没有要注入的东西", "请先点「添加…」选一个 dylib，或勾选「注入 VPN 隧道」。")
+                "没有要注入的东西", "请先点「添加…」选一个 dylib。")
             return None
         return argv
 

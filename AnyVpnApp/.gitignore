@@ -1,0 +1,9 @@
+.build-openconnect/
+build/
+out/
+AnyVpnApp.xcodeproj/
+Vendor/openconnect/lib/
+Vendor/openconnect/include/
+*.ipa
+*.xcarchive
+*.dSYM.zip
