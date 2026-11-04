@@ -1,10 +1,9 @@
 # 在 GitHub 官方的 macOS 云主机上编译注入用 dylib：
-#   IPATool.dylib = 悬浮面板 + 文件导入导出，SoloX.dylib = 性能悬浮窗。
+#   IPATool.dylib = 悬浮面板 + 文件导入导出，SoloX.dylib = 性能悬浮窗，
+#   AnyVpn.dylib = VPN 隧道插件（OpenConnect，注入宿主 App 用）。
 #
 # 用法：把仓库推到 GitHub 后，Actions → Build iOS Tweaks → Run workflow，
 # 跑完在 Artifacts 里下载 ipatool-tweaks（内含 *.dylib）。
-# VPN 隧道已独立成 AnyVpnApp/（NetworkExtension App），本工作流不再编译
-# AnyVpn.dylib，也不需要 openconnect/openssl/libxml2/lwIP 静态库；
 # Demo IPA 的编译与注入验证已移除。
 name: Build iOS Tweaks
 
@@ -37,8 +36,8 @@ concurrency:
 jobs:
   build:
     runs-on: macos-14
-    # 不再交叉编译 openconnect/openssl，30 分钟足够
-    timeout-minutes: 30
+    # openconnect/openssl 交叉编译 10~20 分钟，排队也算进来，90 分钟封顶
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -48,15 +47,30 @@ jobs:
           xcrun --sdk iphoneos --show-sdk-version
           xcrun --sdk iphoneos --show-sdk-path
 
+      # AnyVpn.dylib 依赖 iOS 版 openconnect/openssl/lwIP 静态库，
+      # 交叉编译要 10~20 分钟，按脚本内容缓存产物
+      - name: Cache AnyVPN prebuilt libs
+        uses: actions/cache@v4
+        with:
+          path: tweak/anyvpn/prebuilt
+          key: anyvpn-prebuilt-${{ inputs.archs || 'arm64' }}-${{ hashFiles('tweak/anyvpn/build-openconnect-ios.sh') }}
+
+      - name: Build AnyVPN dependencies (openconnect/openssl/libxml2/lwIP)
+        run: |
+          chmod +x tweak/anyvpn/build-openconnect-ios.sh
+          ./tweak/anyvpn/build-openconnect-ios.sh 2>&1 | tee anyvpn-deps.log
+          exit ${PIPESTATUS[0]}
+
       - name: Build dylibs
         env:
           IPATOOL_MIN_IOS: ${{ inputs.min_ios || '14.0' }}
           IPATOOL_ARCHS: ${{ inputs.archs || 'arm64' }}
           # 悬浮面板 + 文件导入导出合编成 IPATool.dylib；
-          # 性能悬浮窗单独出 SoloX.dylib。
+          # 性能悬浮窗单独出 SoloX.dylib；
+          # VPN 隧道单独出 AnyVpn.dylib（注入宿主 App 用）。
           # QNet（弱网）/ PluginLoader（运行时插件）默认不编，
           # 需要时手动改这里或在本地给 build.sh 传 IPATOOL_TARGETS。
-          IPATOOL_TARGETS: IPATool SoloX
+          IPATOOL_TARGETS: IPATool SoloX AnyVpn
         run: |
           mkdir -p tweak/build
           chmod +x tweak/build.sh
@@ -107,6 +121,7 @@ jobs:
           assets=()
           for f in tweak/build/*.dylib; do if [ -f "$f" ]; then assets+=("$f"); fi; done
           if [ -f build-artifacts.zip ]; then assets+=(build-artifacts.zip); fi
+          if [ -f anyvpn-deps.log ]; then assets+=(anyvpn-deps.log); fi
           if [ ${#assets[@]} -eq 0 ]; then
             echo "没有可发布的产物，跳过 Release"
             exit 0
