@@ -1157,7 +1157,11 @@ def cmd_inject(args) -> int:
 def cmd_export(args) -> int:
     from . import cloud_build
     token = args.token or os.environ.get("GITHUB_TOKEN", "")
-    cloud_build.export_repo(args.repo, args.branch, args.out, token=token, log=print)
+    try:
+        cloud_build.export_repo(args.repo, args.branch, args.out, token=token, log=print)
+    except Exception as e:
+        print(f"失败: {e}", file=sys.stderr)
+        return 1
     print(f"已导出 {args.repo}@{args.branch} 到 {args.out}")
     return 0
 

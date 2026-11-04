@@ -128,8 +128,21 @@ def _parse(text, default=None):
         return default or {}
 
 
+class DownloadError(RuntimeError):
+    """HTTP 层明确失败（区别于连不上/超时的网络错误）。"""
+
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+
 def _download_binary(url, headers, path, timeout=180):
-    """下载二进制文件（直连，解析全部 IP 逐个试）。"""
+    """下载二进制文件（直连，解析全部 IP 逐个试）。
+
+    HTTP 错误页绝不能算下载成功：codeload 在分支不存在时返回一小段
+    "404: Not Found" 文本，curl 没开 -f 会把它当成 zip 写盘，直到解压才报
+    "File is not a zip file"，真正原因（分支写错）就被埋掉了。
+    """
     host = urlparse(url).netloc
     ips = []
     try:
@@ -143,23 +156,39 @@ def _download_binary(url, headers, path, timeout=180):
             req.add_header(k, v)
         opener = urllib.request.build_opener()
         with opener.open(req, timeout=timeout) as r:
+            if r.status != 200:
+                raise DownloadError(f"HTTP {r.status}", r.status)
             data = r.read()
         with open(path, "wb") as fh:
             fh.write(data)
         return
+    except urllib.error.HTTPError as e:
+        if 400 <= e.code < 500:
+            raise DownloadError(f"HTTP {e.code}", e.code) from e
+        last_err = e
+    except DownloadError:
+        raise
     except Exception as e:
         last_err = e
     for ip in ips:
         curl = shutil.which("curl") or "curl"
-        cmd = [curl, "-sS", url, "-o", path,
+        cmd = [curl, "-sS", "-f", url, "-o", path,
                "--connect-timeout", "20", "--max-time", str(timeout),
+               "-w", "%{http_code}",
                "--connect-to", f"{host}:443:{ip}:443"]
         for k, v in headers.items():
             cmd += ["-H", f"{k}: {v}"]
         p = subprocess.run(cmd, capture_output=True, timeout=timeout + 15)
-        if p.returncode == 0:
+        try:
+            status = int(p.stdout.decode("utf-8", "replace").strip()[-3:])
+        except ValueError:
+            status = 0
+        if p.returncode == 0 and status == 200:
             return
-        last_err = RuntimeError(p.stderr.decode("utf-8", "replace").strip()[:200])
+        if 400 <= status < 500:
+            raise DownloadError(f"HTTP {status}", status)
+        last_err = RuntimeError(
+            p.stderr.decode("utf-8", "replace").strip()[:200] or f"curl 退出码 {p.returncode}")
     raise RuntimeError(f"下载失败: {last_err}")
 
 
@@ -182,20 +211,32 @@ def export_repo(url, branch, out_dir, token="", log=print, timeout=300):
     branch 可为分支 / 标签 / 提交；私有仓库传 token（走 Authorization 头）。
     """
     owner, repo = _parse_repo(url, branch)
-    archive_url = f"https://codeload.github.com/{owner}/{repo}/zip/{branch}"
+    archive_url = f"https://codeload.github.com/{owner}/{repo}/zip/{quote(branch, safe='/')}"
     headers = {}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     os.makedirs(out_dir, exist_ok=True)
-    tmp = os.path.join(out_dir, f".{repo}-{branch}.zip.tmp")
+    safe_branch = re.sub(r'[\\/:*?"<>|]', "_", branch)
+    tmp = os.path.join(out_dir, f".{repo}-{safe_branch}.zip.tmp")
     log(f"[导出] {owner}/{repo}@{branch} 开始下载 …")
-    _download_binary(archive_url, headers, tmp, timeout=timeout)
-    log("[导出] 下载完成，正在解压 …")
-    _extract_zip(tmp, out_dir)
     try:
-        os.remove(tmp)
-    except OSError:
-        pass
+        try:
+            _download_binary(archive_url, headers, tmp, timeout=timeout)
+        except DownloadError as e:
+            if e.status == 404:
+                raise RuntimeError(
+                    f"HTTP 404：仓库 {owner}/{repo} 不存在，或分支/标签/提交「{branch}」"
+                    "不存在（不少仓库默认分支是 master 而非 main，请确认后重试）") from e
+            raise RuntimeError(f"下载被拒绝：{e}") from e
+        log("[导出] 下载完成，正在解压 …")
+        if not zipfile.is_zipfile(tmp):
+            raise RuntimeError("下载内容不是有效的 ZIP 包（可能被代理替换成了错误页）")
+        _extract_zip(tmp, out_dir)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
     log(f"[导出] 已导出到 {out_dir}")
 
 
@@ -212,11 +253,14 @@ def _extract_zip(zip_path, out_dir):
 # --------------------------------------------------------------------------- #
 def api_call(method, url, token, data=None):
     headers = {
-        "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
         "User-Agent": "github-importer",
         "Content-Type": "application/json",
     }
+    # 空 token 时别发 "Bearer "：GitHub 会把这个无效头当成坏凭据返回 401，
+    # 公开仓库明明不需要登录也会读失败。
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     body = json.dumps(data).encode("utf-8") if data is not None else None
     try:
         status, text = _http_request(method, url, headers, body, timeout=30)

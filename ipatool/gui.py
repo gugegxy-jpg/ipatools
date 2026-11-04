@@ -57,6 +57,7 @@ def _gui_config_path() -> str:
 
 
 CAPTURE_TASKS = ("info", "devices")
+SILENT_TASKS = frozenset({"export"})   # 全程只写日志 / 状态栏，不弹任何对话框
 DEVICE_POLL_MS = 30_000        # 设备列表静默刷新间隔（插入手机后不用手点「刷新设备」）
 
 # 配色 / 字体：深色 + 青色强调的「科技感」风格。
@@ -109,16 +110,17 @@ def _txt(value) -> str:
 
 
 def _format_argv(argv: list[str]) -> str:
-    """拼出可读的命令行，证书密码打码。"""
+    """拼出可读的命令行，证书密码 / GitHub Token 等敏感参数打码。"""
     parts: list[str] = []
     hide_next = False
+    secret_flags = ("--p12-password", "--token")
     for item in argv:
         if hide_next:
             parts.append(PASSWORD_MASK)
             hide_next = False
             continue
         parts.append(f'"{item}"' if " " in item else item)
-        if item == "--p12-password":
+        if item in secret_flags:
             hide_next = True
     return "python -m ipatool " + " ".join(parts)
 
@@ -419,6 +421,12 @@ class IpatoolGui:
         self.v_export_branch = tk.StringVar(value="main")
         self.v_export_out = tk.StringVar()
         self.v_export_token = tk.StringVar()
+        # 导出页分支自动读取：防抖定时器 / 上次读过的仓库 / 请求序号 / 自动填入的分支
+        self._export_repo_timer = None
+        self._export_last_repo = ""
+        self._export_req_seq = 0
+        self._export_auto_branch = ""
+        self.export_branch_cb = None
         self.v_dylib_path = tk.StringVar()
         self.v_ipa_path = tk.StringVar()
         # 页面内部状态（下拉选项 / 最近运行等）
@@ -1391,6 +1399,9 @@ class IpatoolGui:
                 elif kind == "done":
                     task, code = payload  # type: ignore[misc]
                     self._finish(str(task), int(code))
+                else:
+                    # 别让未知 task 的日志被静默丢掉（导出等任务以前就吃过大亏）
+                    self._append(str(payload))
         except queue.Empty:
             pass
         except Exception:
@@ -1400,9 +1411,14 @@ class IpatoolGui:
     _SIGN_GROUP = frozenset({"sign", "modify", "inject", "inject-list"})
 
     def _start(self, argv: list[str], task: str, quiet: bool = False) -> None:
-        """quiet=True 用于自动刷新：不弹「请稍候」、也不把命令行回显到日志里。"""
+        """quiet=True 用于自动刷新：不提示、也不把命令行回显到日志里。
+
+        SILENT_TASKS（如 export）一律不弹对话框，重复点击只写一行日志。
+        """
         if task in self._running_tasks:
-            if not quiet:
+            if task in SILENT_TASKS:
+                self._clog(f"[{task}] 上一次任务还在进行中，请稍候 …\n")
+            elif not quiet:
                 messagebox.showinfo("请稍候", f"「{task}」任务正在进行，请等它结束。")
             return
         self._running_tasks.add(task)
@@ -1439,7 +1455,9 @@ class IpatoolGui:
             code = exc.code if isinstance(exc.code, int) else (1 if exc.code else 0)
         except BaseException:
             code = 1
-            text += "\n" + traceback.format_exc()
+            # 异常详情走 ("log", ...) 才会被 _poll 显示；塞进 (task, text) 时
+            # 除 info/devices 外的任务（如 export）会被直接丢弃，只剩「退出码 1」。
+            self.q.put(("log", "\n" + traceback.format_exc()))
         if err.getvalue().strip():
             self.q.put(("log", err.getvalue()))
         if text:
@@ -1453,11 +1471,11 @@ class IpatoolGui:
             self._refresh_devices_silent()   # 跑完顺手静默刷新（可能刚插上手机）
         if code == 0:
             self._set_status("完成")
+            if task in SILENT_TASKS:
+                self._clog(f"[{task}] 已完成。\n")
+                return
             if task == "install":
                 messagebox.showinfo("完成", "安装完成。")
-                return
-            if task == "export":
-                messagebox.showinfo("完成", "源码已导出到本地（详见日志）。")
                 return
             if task in ("inject", "modify", "sign"):
                 # 产物刚生成：把路径自动填进「安装到设备」的「安装包」栏，
@@ -1468,11 +1486,12 @@ class IpatoolGui:
             return
         if code == 3:          # 用户在「已有同名 App」那步选了取消
             self._set_status("已取消")
-            messagebox.showinfo("已取消", "已取消安装")
+            if task not in SILENT_TASKS:
+                messagebox.showinfo("已取消", "已取消安装")
             return
         self._set_status(f"失败（退出码 {code}）", "err")
         self._append(f"任务失败，退出码 {code}\n", "err")
-        if task not in CAPTURE_TASKS:
+        if task not in CAPTURE_TASKS and task not in SILENT_TASKS:
             messagebox.showerror("执行失败", f"任务未能完成，退出码 {code}。\n详情见下方日志。")
 
     def _render(self, kind: str, text: str) -> None:
@@ -2666,9 +2685,24 @@ class IpatoolGui:
         outer, page = self._make_scroll(self.page_area)
         page.columnconfigure(0, weight=1)
         box = self._group(page, "导出 GitHub 仓库源码到本地", 0)
-        self._entry(box, 0, "仓库地址", self.v_export_repo,
-                    "https://github.com/owner/repo 或 owner/repo")
-        self._entry(box, 1, "分支 / 标签 / 提交", self.v_export_branch, "留空默认 main")
+        ttk.Label(box, text="仓库地址").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        repo_entry = ttk.Entry(box, textvariable=self.v_export_repo, width=36)
+        repo_entry.grid(row=0, column=1, sticky="ew", pady=4)
+        box.columnconfigure(1, weight=1)
+        tail0 = ttk.Frame(box, style="Card.TFrame")
+        tail0.grid(row=0, column=2, sticky="w", padx=(8, 0), pady=4)
+        ttk.Button(tail0, text="读取分支", width=10,
+                   command=lambda: self._export_fetch_branches(auto=False)).pack(side="left")
+        ttk.Label(tail0, text="https://github.com/owner/repo 或 owner/repo",
+                  style="Muted.TLabel").pack(side="left", padx=(8, 0))
+
+        ttk.Label(box, text="分支 / 标签 / 提交").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+        self.export_branch_cb = ttk.Combobox(
+            box, textvariable=self.v_export_branch, width=34)
+        self.export_branch_cb.grid(row=1, column=1, sticky="ew", pady=4)
+        ttk.Label(box, text="填好仓库地址后自动读取，默认分支自动选中；也可手填标签 / 提交",
+                  style="Muted.TLabel").grid(row=1, column=2, sticky="w", padx=(8, 0), pady=4)
+        self.v_export_repo.trace_add("write", self._export_on_repo_change)
 
         ttk.Label(box, text="导出到").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Entry(box, textvariable=self.v_export_out).grid(row=2, column=1, sticky="ew", pady=4)
@@ -2689,14 +2723,87 @@ class IpatoolGui:
         ).grid(row=4, column=1, columnspan=3, sticky="w", pady=(10, 0))
         return outer
 
+    def _export_on_repo_change(self, *_args) -> None:
+        """仓库地址一变就防抖自动读取分支：停顿 0.8s 才发请求，避免逐字输入刷请求。"""
+        timer = getattr(self, "_export_repo_timer", None)
+        if timer:
+            try:
+                self.root.after_cancel(timer)
+            except Exception:
+                pass
+        self._export_repo_timer = self.root.after(
+            800, lambda: self._export_fetch_branches(auto=True))
+
+    def _export_fetch_branches(self, auto: bool = False) -> None:
+        """按导出页填的仓库地址，从 GitHub API 拉取分支列表与默认分支。
+
+        公开仓库不需要 Token；私有仓库用导出页或「GitHub 导入」页填的 Token。
+        拉取失败只降级为手填，不打断导出。
+        """
+        raw = self.v_export_repo.get().strip()
+        if not raw:
+            return
+        try:
+            owner, repo = cloud_mod._parse_repo(raw)
+        except ValueError as e:
+            if not auto:
+                self._clog(f"[导出] 仓库地址无效：{e}\n")
+            return
+        full = f"{owner}/{repo}"
+        if auto and full == self._export_last_repo and self.export_branch_cb is not None \
+                and self.export_branch_cb["values"]:
+            return
+        token = self.v_export_token.get().strip() or self.v_gh_token.get().strip()
+        self._export_req_seq += 1
+        seq = self._export_req_seq
+        if not auto:
+            self._clog(f"[导出] 正在读取 {full} 的分支 …")
+
+        def work():
+            try:
+                _, info = cloud_mod.api_call(
+                    "GET", f"https://api.github.com/repos/{owner}/{repo}", token)
+                default = info.get("default_branch", "") if isinstance(info, dict) else ""
+                _, raw_branches = cloud_mod.api_call(
+                    "GET", f"https://api.github.com/repos/{owner}/{repo}/branches?per_page=100",
+                    token)
+                branches = [b.get("name", "") for b in
+                            (raw_branches if isinstance(raw_branches, list) else [])]
+                branches = [b for b in branches if b]
+            except Exception as e:
+                if seq == self._export_req_seq:
+                    self._clog(
+                        f"[导出] 读取 {full} 分支失败：{e}（可直接手填分支 / 标签 / 提交）\n")
+                return
+            if default and default not in branches:
+                branches.insert(0, default)
+
+            def apply():
+                if seq != self._export_req_seq:
+                    return          # 地址又改了，丢弃过期结果
+                if self.export_branch_cb is not None:
+                    self.export_branch_cb["values"] = branches
+                self._export_last_repo = full
+                cur = self.v_export_branch.get().strip()
+                if default and (not cur or cur == "main" or cur == self._export_auto_branch):
+                    self.v_export_branch.set(default)
+                    self._export_auto_branch = default
+                self._clog(f"[导出] {full} 默认分支 {default or '未知'}，共 {len(branches)} 个分支")
+
+            self.root.after(0, apply)
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _export_repo_run(self) -> None:
         repo = self.v_export_repo.get().strip()
         if not repo:
-            messagebox.showwarning("缺少仓库地址", "请先填写 GitHub 仓库地址。")
+            self._set_status("缺少仓库地址", "err")
+            self._clog("[导出] 请先填写 GitHub 仓库地址。\n")
             return
         out = self.v_export_out.get().strip()
         if not out:
-            messagebox.showwarning("缺少导出目录", "请先选择导出到的本地目录。")
+            self._set_status("缺少导出目录", "err")
+            self._clog("[导出] 请先选择导出到的本地目录。\n")
             return
         branch = self.v_export_branch.get().strip() or "main"
         token = self.v_export_token.get().strip() or self.v_gh_token.get().strip()
