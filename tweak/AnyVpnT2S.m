@@ -202,8 +202,8 @@ static err_t t2s_output(struct netif *nif, struct pbuf *p, const ip4_addr_t *ipa
     }
     uint32_t afPrefix = htonl(2 /*AF_INET*/);
     memcpy(linear, &afPrefix, 4);
-    // 诊断：前 10 个出站包打印协议/源/目的——定位「网关收到包就杀会话」的元凶
-    // （linear+4 起才是 IPv4 头：byte9=协议，12-15=源，16-19=目的）
+    // 诊断：前 10 个出站包打印协议/源/目的/端口/TCP 标志——定位「网关收到包就杀会话」
+    // 以及「DNS 连上了却不应答」的元凶（SYN-ACK 还是 RST，一眼可见）
     const uint8_t *iph = linear + 4;
     static int pktLogs = 0;
     if (pktLogs < 10 && total >= 20) {
@@ -213,8 +213,22 @@ static err_t t2s_output(struct netif *nif, struct pbuf *p, const ip4_addr_t *ipa
                  iph[12], iph[13], iph[14], iph[15]);
         snprintf(dst, sizeof dst, "%u.%u.%u.%u",
                  iph[16], iph[17], iph[18], iph[19]);
-        T2SLog(@"出站包#%d：%u 字节 proto=%u %s -> %s",
-               pktLogs, (unsigned)total, iph[9], src, dst);
+        size_t ihl = (size_t)(iph[0] & 0x0F) * 4;
+        uint8_t proto = iph[9];
+        uint16_t sport = 0, dport = 0;
+        char flags[16] = "";
+        if (ihl + 4 <= total && (proto == 6 || proto == 17)) {
+            sport = (uint16_t)((iph[ihl] << 8) | iph[ihl + 1]);
+            dport = (uint16_t)((iph[ihl + 2] << 8) | iph[ihl + 3]);
+        }
+        if (proto == 6 && ihl + 14 <= total) {
+            uint8_t fl = iph[ihl + 13];
+            snprintf(flags, sizeof flags, "%s%s%s%s",
+                     (fl & 0x02) ? "S" : "", (fl & 0x10) ? "A" : "",
+                     (fl & 0x01) ? "F" : "", (fl & 0x04) ? "R" : "");
+        }
+        T2SLog(@"出站包#%d：%u 字节 proto=%u %s:%u -> %s:%u%s",
+               pktLogs, (unsigned)total, proto, src, sport, dst, dport, flags);
     }
     // g_ocFd 是 AF_UNIX SOCK_DGRAM：一次 write 必须是完整一个包（openconnect
     // 按包边界 read）。不存在部分写——缓冲满（EAGAIN/ENOBUFS）就整包丢弃，
@@ -260,9 +274,8 @@ static void t2s_feed_lwip(void) {
         if (ntohl(afVal) != 2 /*AF_INET*/) continue;
         memmove(pkt, pkt + 4, (size_t)n - 4);
         n -= 4;
-        // 诊断：前 10 个入向包打印协议/源/目的——判断隧道内 UDP（DNS）到底
-        // 有没有回包：回包出现 = 我们 UDP 转发路径有 bug；完全不出现 = 网关
-        // 压根没回（线路 DNS 对隧道内来源不响应）
+        // 诊断：前 10 个入向包打印协议/源/目的/端口/TCP 标志——区分「服务器不应答」
+        // 与「连接被 RST 拒绝」；proto=1(icmp) 也一眼看到（网关可能回不可达）
         static int inLogs = 0;
         if (inLogs < 10) {
             inLogs++;
@@ -271,8 +284,22 @@ static void t2s_feed_lwip(void) {
                      pkt[12], pkt[13], pkt[14], pkt[15]);
             snprintf(dst, sizeof dst, "%u.%u.%u.%u",
                      pkt[16], pkt[17], pkt[18], pkt[19]);
-            T2SLog(@"入向包#%d：%u 字节 proto=%u %s -> %s",
-                   inLogs, (unsigned)n, pkt[9], src, dst);
+            size_t ihl = (size_t)(pkt[0] & 0x0F) * 4;
+            uint8_t proto = pkt[9];
+            uint16_t sport = 0, dport = 0;
+            char flags[16] = "";
+            if (ihl + 4 <= n && (proto == 6 || proto == 17)) {
+                sport = (uint16_t)((pkt[ihl] << 8) | pkt[ihl + 1]);
+                dport = (uint16_t)((pkt[ihl + 2] << 8) | pkt[ihl + 3]);
+            }
+            if (proto == 6 && ihl + 14 <= n) {
+                uint8_t fl = pkt[ihl + 13];
+                snprintf(flags, sizeof flags, "%s%s%s%s",
+                         (fl & 0x02) ? "S" : "", (fl & 0x10) ? "A" : "",
+                         (fl & 0x01) ? "F" : "", (fl & 0x04) ? "R" : "");
+            }
+            T2SLog(@"入向包#%d：%u 字节 proto=%u %s:%u -> %s:%u%s",
+                   inLogs, (unsigned)n, proto, src, sport, dst, dport, flags);
         }
         g_statInPkts++;
         g_statInBytes += (unsigned long long)n;
@@ -618,6 +645,8 @@ static err_t t2s_dns_tcp_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, er
             uint16_t rlen = (uint16_t)((g_dnsTcpBuf[0] << 8) | g_dnsTcpBuf[1]);
             if (g_dnsTcpLen >= 2u + rlen) ok = t2s_dns_parse(g_dnsTcpBuf + 2, rlen, &a);
         }
+        T2SLog(@"DNS TCP：对端关闭（已收 %u 字节，%@）",
+               (unsigned)g_dnsTcpLen, ok ? @"应答已收全" : @"没有完整应答");
         t2s_dns_tcp_close(pcb);
         t2s_dns_finish(ok, a);
         return ERR_OK;
@@ -628,6 +657,7 @@ static err_t t2s_dns_tcp_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, er
         g_dnsTcpLen += len;
     }
     pbuf_free(p);
+    T2SLog(@"DNS TCP：收到 %u 字节（累计 %u）", len, (unsigned)g_dnsTcpLen);
     if (g_dnsTcpLen >= 2) {                           // 2 字节长度前缀 + 应答
         uint16_t rlen = (uint16_t)((g_dnsTcpBuf[0] << 8) | g_dnsTcpBuf[1]);
         if (g_dnsTcpLen >= 2u + rlen) {
@@ -663,7 +693,18 @@ static err_t t2s_dns_tcp_connected(void *arg, struct tcp_pcb *pcb, err_t err) {
         return ERR_OK;
     }
     tcp_output(pcb);
+    T2SLog(@"DNS TCP：已连上 192.168.100.5:53，发送查询 %u 字节（2 字节长度前缀 + 报文）",
+           (unsigned)qlen);
     return ERR_OK;
+}
+
+// DNS TCP 被拒/重置（RST）时 lwIP 走 err 回调——不注册就只会静默等到超时，
+// 看不出「连接被拒」和「服务器不应答」的区别
+static void t2s_dns_tcp_err(void *arg, err_t err) {
+    (void)arg; (void)err;
+    g_dnsTcpPcb = NULL;
+    T2SLog(@"DNS TCP：连接被重置（RST/拒绝）");
+    t2s_dns_finish(NO, 0);
 }
 
 // 引擎线程：启动 DNS over TCP
@@ -676,6 +717,7 @@ static void t2s_dns_start_tcp(void) {
     if (!pcb) { t2s_dns_finish(NO, 0); return; }
     tcp_arg(pcb, NULL);
     tcp_recv(pcb, t2s_dns_tcp_recv);
+    tcp_err(pcb, t2s_dns_tcp_err);
     ip_addr_t addr;
     ip_addr_copy_from_ip4(addr, g_dnsServer);
     if (tcp_connect(pcb, &addr, 53, t2s_dns_tcp_connected) != ERR_OK) {
@@ -722,6 +764,10 @@ static void t2s_dns_poll(void) {
     ip_addr_copy_from_ip4(s, g_dnsServer);
     err_t r = udp_sendto(g_dnsPcb, p, &s, 53);
     pbuf_free(p);
+    if (udpWant) {
+        T2SLog(@"DNS UDP 兜底：已发查询 %u 字节 → 192.168.100.5:53（%@）",
+               (unsigned)n, r == ERR_OK ? @"已发出" : @"发送失败");
+    }
     pthread_mutex_lock(&g_dnsMutex);
     if (r == ERR_OK) {
         if (g_dnsReq.state == 0) g_dnsReq.state = 1;
@@ -783,11 +829,12 @@ BOOL T2SResolve(NSString *host, uint32_t *outAddrV4) {
     memcpy(g_dnsQuery, q, n);
     g_dnsQueryLen = n;
     g_dnsPending = YES;
-    // 先走 TCP（隧道内 UDP 无回包），4s 没答上再补发 UDP
+    // 先走 TCP（隧道内 UDP 无回包），3s 没答上再补发 UDP，总超时控制在 5s 内
+    // （域名是串行排队的，超时太长会把游戏首屏拖死）
     g_dnsTcpWant = YES;
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec += 4;
+    ts.tv_sec += 3;
     int rc = 0;
     BOOL udpFallback = NO;
     while (g_dnsReq.state != 2) {
@@ -798,7 +845,7 @@ BOOL T2SResolve(NSString *host, uint32_t *outAddrV4) {
                 g_dnsAbortTcp = YES;        // 关掉没答应的 TCP 连接
                 g_dnsUdpWant = YES;         // 补发 UDP 查询
                 clock_gettime(CLOCK_REALTIME, &ts);
-                ts.tv_sec += 3;
+                ts.tv_sec += 2;
                 continue;
             }
             break;                          // TCP/UDP 都超时
