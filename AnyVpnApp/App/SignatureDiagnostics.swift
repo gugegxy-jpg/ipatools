@@ -63,6 +63,23 @@ struct SignatureDiagnostics {
                         value: keychain.isEmpty ? "缺失 ❌" : keychain.joined(separator: ", "),
                         ok: !keychain.isEmpty))
 
+        // 描述文件是不是给这个 App 用的：application-identifier = TEAMID.<bundle id>
+        let appId = ents["application-identifier"] as? String ?? ""
+        let myBundle = Bundle.main.bundleIdentifier ?? ""
+        if !appId.isEmpty && !myBundle.isEmpty && !appId.hasSuffix(myBundle) {
+            out.append(Item(title: "App ID 匹配",
+                            value: "描述文件对应的是 \(appId)，不是当前 App（\(myBundle)）❌",
+                            ok: false))
+        }
+        // 通配符 profile（TEAMID.*）永远不可能带 Network Extensions / App Groups，
+        // 这类能力必须显式 App ID
+        if keychain.contains(where: { $0.hasSuffix("*") }) {
+            out.append(Item(title: "描述文件类型",
+                            value: "通配符（Wildcard）profile：不可能包含 Network Extensions / "
+                                + "App Groups 能力，必须换成显式 App ID 的 profile ❌",
+                            ok: false))
+        }
+
         // appex 的描述文件：App 与 appex 是两份签名，任一份缺能力都会失败
         if let appexURL = appexURL, appexExists {
             if let appexPlist = provisionPlist(in: appexURL) {

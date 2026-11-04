@@ -40,21 +40,37 @@ struct VpnProfile: Codable, Identifiable, Equatable {
 enum ProfileStore {
     private static let kProfiles = "com.anyvpn.profiles"
     private static let kActive = "com.anyvpn.activeProfileId"
+    /// Keychain 镜像：描述文件若没勾 App Groups（App Group 容器不可访问），
+    /// App 与 appex 靠共享 Keychain 交换线路配置——这样只剩 NetworkExtension
+    /// 一个必须能力，keychain-access-groups 通配（TEAMID.*）就能用。
+    private static let kcProfiles = "profiles.json"
+    private static let kcActive = "activeProfileId"
 
     static func all() -> [VpnProfile] {
-        guard let data = SharedConfig.defaults.data(forKey: kProfiles),
-              let list = try? JSONDecoder().decode([VpnProfile].self, from: data) else { return [] }
-        return list
+        // Keychain 优先：appex 只读得到 Keychain，两边以它为准才不会不一致
+        if let s = KeychainStore.get(kcProfiles), !s.isEmpty,
+           let data = s.data(using: .utf8),
+           let list = try? JSONDecoder().decode([VpnProfile].self, from: data) { return list }
+        if let data = SharedConfig.defaults.data(forKey: kProfiles),
+           let list = try? JSONDecoder().decode([VpnProfile].self, from: data) { return list }
+        return []
     }
 
     static func save(_ list: [VpnProfile]) {
         guard let data = try? JSONEncoder().encode(list) else { return }
         SharedConfig.defaults.set(data, forKey: kProfiles)
+        if let s = String(data: data, encoding: .utf8) { KeychainStore.set(s, for: kcProfiles) }
     }
 
-    static func activeId() -> String? { SharedConfig.defaults.string(forKey: kActive) }
+    static func activeId() -> String? {
+        if let s = KeychainStore.get(kcActive), !s.isEmpty { return s }
+        return SharedConfig.defaults.string(forKey: kActive)
+    }
 
-    static func setActiveId(_ id: String) { SharedConfig.defaults.set(id, forKey: kActive) }
+    static func setActiveId(_ id: String) {
+        SharedConfig.defaults.set(id, forKey: kActive)
+        KeychainStore.set(id, for: kcActive)
+    }
 
     static func profile(withId id: String) -> VpnProfile? { all().first { $0.id == id } }
 
