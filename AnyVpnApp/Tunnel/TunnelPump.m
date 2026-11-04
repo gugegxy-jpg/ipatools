@@ -23,8 +23,13 @@
     if ((self = [super init])) {
         _flow = flow;
         _fd = fd;
-        // 保证非 nil：向 nil block 调用会崩溃，日志块在后台线程里被多处使用
-        _log = log ? [log copy] : ^(NSString *line) { (void)line; };
+        // 保证非 nil：向 nil block 调用会崩溃，日志块在后台线程里被多处使用。
+        // 不能用三元：[log copy] 是 id，与 block 字面量类型不同会编译报错
+        if (log) {
+            _log = [log copy];
+        } else {
+            _log = ^(NSString *line) { (void)line; };
+        }
         _lock = [[NSLock alloc] init];
         _inQueue = dispatch_queue_create("com.anyvpn.pump.in", DISPATCH_QUEUE_SERIAL);
         _outQueue = dispatch_queue_create("com.anyvpn.pump.out", DISPATCH_QUEUE_SERIAL);
