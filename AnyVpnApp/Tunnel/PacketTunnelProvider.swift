@@ -116,20 +116,21 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let v4 = NEIPv4Settings(addresses: [addr], subnetMasks: [mask])
         let routes = (info["splitIncludes"] as? [String] ?? []).compactMap { ipv4Route($0) }
         v4.includedRoutes = routes.isEmpty ? [NEIPv4Route.default()] : routes
-        settings.IPv4Settings = v4
 
+        var v6Settings: NEIPv6Settings?
         if let addr6 = info["addr6"] as? String, !addr6.isEmpty {
             let prefix = Int(info["netmask6"] as? String ?? "") ?? 64
             let v6 = NEIPv6Settings(addresses: [addr6],
                                     networkPrefixLengths: [NSNumber(value: prefix)])
             v6.includedRoutes = [NEIPv6Route.default()]
-            settings.IPv6Settings = v6
+            v6Settings = v6
         }
 
         var servers = info["dns"] as? [String] ?? []
         let overrideDNS = profile.tunnelDNSList
         if !overrideDNS.isEmpty { servers = overrideDNS }
 
+        var dnsSettings: NEDNSSettings?
         if !servers.isEmpty {
             let dns = NEDNSSettings(servers: servers)
             if let domain = info["domain"] as? String, !domain.isEmpty {
@@ -140,11 +141,29 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // 用这个避免全机断网，同时游戏域名仍能拿到线路专属地址）。
             let match = profile.dnsMatchDomainList
             dns.matchDomains = match.isEmpty ? [""] : match
-            settings.DNSSettings = dns
+            dnsSettings = dns
         }
 
+        apply(settings, ipv4: v4, ipv6: v6Settings, dns: dnsSettings)
         settings.mtu = NSNumber(value: info["mtu"] as? Int ?? 1400)
         return settings
+    }
+
+    /// iOS 26 SDK（Xcode 26 / Swift 6.2）把 NetworkExtension 的这几个属性
+    /// 按 Swift 命名规范改成了小写开头；旧 SDK 仍是大写。用编译期分支兼容两者。
+    private func apply(_ s: NEPacketTunnelNetworkSettings,
+                       ipv4: NEIPv4Settings?,
+                       ipv6: NEIPv6Settings?,
+                       dns: NEDNSSettings?) {
+        #if compiler(>=6.2)
+        if let v = ipv4 { s.ipv4Settings = v }
+        if let v = ipv6 { s.ipv6Settings = v }
+        if let v = dns { s.dnsSettings = v }
+        #else
+        if let v = ipv4 { s.IPv4Settings = v }
+        if let v = ipv6 { s.IPv6Settings = v }
+        if let v = dns { s.DNSSettings = v }
+        #endif
     }
 
     private func ipv4Route(_ text: String) -> NEIPv4Route? {
@@ -167,7 +186,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     private func dnsDescription(_ s: NEPacketTunnelNetworkSettings) -> String {
-        guard let d = s.DNSSettings else { return "（未设置，走系统 DNS）" }
+        #if compiler(>=6.2)
+        let dns: NEDNSSettings? = s.dnsSettings
+        #else
+        let dns: NEDNSSettings? = s.DNSSettings
+        #endif
+        guard let d = dns else { return "（未设置，走系统 DNS）" }
         let match = d.matchDomains ?? []
         return d.servers.joined(separator: ",") + "（匹配：\(match.joined(separator: ","))）"
     }
