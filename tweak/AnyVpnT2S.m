@@ -547,6 +547,7 @@ static pthread_mutex_t g_dnsMutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_dnsCond = PTHREAD_COND_INITIALIZER;
 static struct udp_pcb *g_dnsPcb;
 static ip4_addr_t g_dnsServer;
+static char g_dnsServerText[64] = "8.8.8.8";   // 日志用：当前线路 DNS 的点分地址
 static uint16_t g_dnsTxid;
 static BOOL g_dnsPending;
 // 查询报文由 App 线程构建、引擎线程发送（TCP/UDP 两个通道共用同一份）
@@ -560,6 +561,16 @@ static uint8_t g_dnsTcpQuery[512];
 static size_t g_dnsTcpQueryLen;
 static uint8_t g_dnsTcpBuf[1600];
 static size_t g_dnsTcpLen;
+
+// ---- 线路 DNS 熔断 ----
+// 隧道内 DNS（网关下发的 192.168.100.5）经常不提供服务：TCP/53 直接 RST，
+// UDP/53 无应答。此时每个域名都要白等 5s——游戏那 30+ 个 DoH 域名会把首屏拖死。
+// 连续失败到阈值就熔断：立刻回落系统解析（快），冷却结束再试探一次。
+#define T2S_DNS_FAIL_THRESHOLD 3
+#define T2S_DNS_RETRY_MS       (5 * 60 * 1000)
+static int   g_dnsFailCount;
+static BOOL  g_dnsDisabled;
+static u32_t g_dnsRetryAt;
 
 // 从 DNS 应答里取第一个 A 记录（主机序）
 static BOOL t2s_dns_parse(const uint8_t *pkt, size_t n, uint32_t *outAddr) {
@@ -590,6 +601,27 @@ static BOOL t2s_dns_parse(const uint8_t *pkt, size_t n, uint32_t *outAddr) {
         off += rdlen;
     }
     return NO;
+}
+
+// 记录一次 DNS 查询结果；连续失败到阈值就熔断线路 DNS
+static void t2s_dns_note_result(BOOL ok) {
+    BOOL trip = NO;
+    pthread_mutex_lock(&g_dnsMutex);
+    if (ok) {
+        g_dnsFailCount = 0;
+    } else {
+        g_dnsFailCount++;
+        if (!g_dnsDisabled && g_dnsFailCount >= T2S_DNS_FAIL_THRESHOLD) {
+            g_dnsDisabled = YES;
+            g_dnsRetryAt = sys_now() + T2S_DNS_RETRY_MS;
+            trip = YES;
+        }
+    }
+    pthread_mutex_unlock(&g_dnsMutex);
+    if (trip)
+        T2SLog(@"线路 DNS 连续 %d 次失败：判定隧道内 DNS 不可用，后续域名直接回落系统解析"
+               @"（选线将不生效——需网关侧放行 DNS，或用 TunnelDNS 指定可达 DNS）",
+               T2S_DNS_FAIL_THRESHOLD);
 }
 
 // 结束一次 DNS 请求：ok=YES 时 outAddr 有效
@@ -693,8 +725,8 @@ static err_t t2s_dns_tcp_connected(void *arg, struct tcp_pcb *pcb, err_t err) {
         return ERR_OK;
     }
     tcp_output(pcb);
-    T2SLog(@"DNS TCP：已连上 192.168.100.5:53，发送查询 %u 字节（2 字节长度前缀 + 报文）",
-           (unsigned)qlen);
+    T2SLog(@"DNS TCP：已连上 %s:53，发送查询 %u 字节（2 字节长度前缀 + 报文）",
+           g_dnsServerText, (unsigned)qlen);
     return ERR_OK;
 }
 
@@ -765,8 +797,8 @@ static void t2s_dns_poll(void) {
     err_t r = udp_sendto(g_dnsPcb, p, &s, 53);
     pbuf_free(p);
     if (udpWant) {
-        T2SLog(@"DNS UDP 兜底：已发查询 %u 字节 → 192.168.100.5:53（%@）",
-               (unsigned)n, r == ERR_OK ? @"已发出" : @"发送失败");
+        T2SLog(@"DNS UDP 兜底：已发查询 %u 字节 → %s:53（%@）",
+               (unsigned)n, g_dnsServerText, r == ERR_OK ? @"已发出" : @"发送失败");
     }
     pthread_mutex_lock(&g_dnsMutex);
     if (r == ERR_OK) {
@@ -780,6 +812,22 @@ static void t2s_dns_poll(void) {
 
 BOOL T2SResolve(NSString *host, uint32_t *outAddrV4) {
     if (!g_ready || !host.length || !outAddrV4) return NO;
+
+    // 熔断：线路 DNS 已判定不可用时直接回落系统解析，不再白等 5s
+    BOOL disabled = NO, allowTrial = NO;
+    pthread_mutex_lock(&g_dnsMutex);
+    disabled = g_dnsDisabled;
+    if (disabled && (int32_t)(sys_now() - g_dnsRetryAt) >= 0) allowTrial = YES;  // 冷却结束
+    pthread_mutex_unlock(&g_dnsMutex);
+    if (disabled && !allowTrial) return NO;
+    if (allowTrial) {
+        pthread_mutex_lock(&g_dnsMutex);
+        g_dnsDisabled = NO;
+        g_dnsFailCount = 0;
+        pthread_mutex_unlock(&g_dnsMutex);
+        T2SLog(@"线路 DNS 熔断冷却结束，重新试探一次");
+    }
+
     char name[256] = {0};
     [host getCString:name maxLength:sizeof name - 1 encoding:NSUTF8StringEncoding];
 
@@ -862,6 +910,7 @@ BOOL T2SResolve(NSString *host, uint32_t *outAddrV4) {
                (addr >> 24) & 0xFF, (addr >> 16) & 0xFF, (addr >> 8) & 0xFF, addr & 0xFF);
         *outAddrV4 = htonl(addr);
     }
+    t2s_dns_note_result(found);
     return found ? YES : NO;
 }
 
@@ -988,7 +1037,15 @@ BOOL T2SEngineStart(int engineFd, NSString *localIP, NSString *netmask, NSString
     netif_set_default(&g_nif);
     netif_set_up(&g_nif);
 
-    ip4addr_aton(dnsIPs.firstObject.UTF8String ?: "8.8.8.8", &g_dnsServer);
+    NSString *dnsText = dnsIPs.firstObject.length ? dnsIPs.firstObject : @"8.8.8.8";
+    ip4addr_aton(dnsText.UTF8String, &g_dnsServer);
+    strlcpy(g_dnsServerText, dnsText.UTF8String, sizeof g_dnsServerText);
+    // 每次建链都重置熔断状态：换了线路/重连后 DNS 可能已经恢复
+    g_dnsFailCount = 0;
+    g_dnsDisabled = NO;
+    g_dnsRetryAt  = 0;
+    T2SLog(@"线路 DNS 服务器：%@（隧道内；候选：%@）", dnsText,
+           dnsIPs.count ? [dnsIPs componentsJoinedByString:@","] : @"无");
 
     g_run = YES;
     if (pthread_create(&g_thread, NULL, t2s_main, NULL) != 0) {

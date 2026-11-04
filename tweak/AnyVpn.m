@@ -19,6 +19,8 @@
 //  配置（Info.plist IPAToolAnyVpn 字典，由 ipatool --anyvpn-* 写入）：
 //    Server / User / Password / AuthGroup / DisableDTLS / AutoConnect /
 //    UnderlyingIface（默认 en0） / VersionString / ReportedOS
+//    TunnelDNS（覆盖网关下发的线路 DNS，"ip1,ip2" 或数组；网关下发的
+//    192.168.100.5 在隧道内经常不服务时用它换可达的内部 DNS）
 //  自动连接与禁用 DTLS 也可以在游戏内悬浮窗里改（NSUserDefaults 优先）。
 //
 //  依赖 tweak/anyvpn/prebuilt/ 下的 iOS arm64 静态库
@@ -316,6 +318,7 @@ static NSString *g_cfgGroup = nil;
 static NSString *g_cfgServer = nil;
 static NSString *g_totpSecret = nil;  // 当前连接的 TOTP 密钥（Base32），空 = 不用动态码
 static NSString *g_certKey = nil;     // TOFU 指纹存 NSUserDefaults 用的键
+static NSArray<NSString *> *g_tunnelDNS = nil;  // 覆盖后的隧道 DNS 列表（空 = 用网关下发的）
 
 // TOTP 认证状态机（对齐 Android 端 AuthSession，见 AuthFormResolver.kt）：
 // 三段式账号 -> 动态码 -> 密码，每段一张表单；动态码必须当场生成；
@@ -740,6 +743,38 @@ static void cb_protect_socket(void *privdata, int fd) {
     for (NSDictionary *p in profs)
         if ([p isKindOfClass:[NSDictionary class]] && [p[@"id"] isEqualToString:aid]) return p;
     return profs.firstObject;
+}
+
+/// 隧道内 DNS 覆盖：优先当前 profile 的 tunnelDNS，其次 Info.plist 的 TunnelDNS
+///
+/// 背景：网关下发的线路 DNS（192.168.100.5）在隧道内经常不提供服务——TCP/53 直接
+/// RST、UDP/53 无应答。此时所有域名都回落系统解析，两条线解析结果一样，选线不生效。
+/// 网关侧给出可达的内部 DNS 后，用这个开关替换掉，不必改代码。
+/// 写法：profile 的 tunnelDNS = "10.0.0.53,10.0.0.54"，或 Info.plist 的
+/// IPAToolAnyVpn.TunnelDNS = "10.0.0.53" / ["10.0.0.53","10.0.0.54"]
+- (NSArray<NSString *> *)tunnelDNSList {
+    NSMutableArray<NSString *> *out = [NSMutableArray array];
+    NSMutableArray *raw = [NSMutableArray array];
+    id pv = [self activeProfile][@"tunnelDNS"];
+    if ([pv isKindOfClass:NSString.class] && [pv length]) [raw addObject:pv];
+    else if ([pv isKindOfClass:NSArray.class]) [raw addObjectsFromArray:pv];
+    if (raw.count == 0) {
+        NSDictionary *cfg = [[NSBundle mainBundle] objectForInfoDictionaryKey:IPAToolAnyVpnPlistKey];
+        id cv = cfg[@"TunnelDNS"];
+        if ([cv isKindOfClass:NSString.class] && [cv length]) [raw addObject:cv];
+        else if ([cv isKindOfClass:NSArray.class]) [raw addObjectsFromArray:cv];
+    }
+    NSCharacterSet *ws = NSCharacterSet.whitespaceAndNewlineCharacterSet;
+    for (id item in raw) {
+        NSString *s = [item isKindOfClass:NSString.class] ? item
+             : ([item respondsToSelector:@selector(stringValue)] ? [item stringValue] : nil);
+        if (!s.length) continue;
+        for (NSString *part in [s componentsSeparatedByString:@","]) {
+            NSString *t = [part stringByTrimmingCharactersInSet:ws];
+            if (t.length) [out addObject:t];
+        }
+    }
+    return out;
 }
 
 #pragma mark TOTP 密钥表（账号级，对齐 Android 端 TotpVault：按账号取密钥）
@@ -1433,6 +1468,21 @@ static void cb_protect_socket(void *privdata, int fd) {
             return NO;
         }
 
+        // 隧道 DNS 覆盖（profile.tunnelDNS / Info.plist 的 TunnelDNS）：
+        // 网关下发的 192.168.100.5 在隧道内经常不服务（TCP/53 RST、UDP/53 无应答），
+        // 全部回落系统解析 → 两条线解析结果一样 → 选线不生效。
+        // 网关侧给出可达的内部 DNS 后用这个开关替换，不必改代码。
+        NSArray<NSString *> *ovDNS = [self tunnelDNSList];
+        g_tunnelDNS = ovDNS;
+        NSMutableArray<NSString *> *gwDNS = [NSMutableArray array];
+        for (int i = 0; i < 3 && ip->dns[i]; i++) [gwDNS addObject:@(ip->dns[i])];
+        if (ovDNS.count) {
+            IPATAppendLogLine([NSString stringWithFormat:
+                @"[anyvpn] 隧道 DNS 覆盖：%@ ← 覆盖网关下发的 %@",
+                [ovDNS componentsJoinedByString:@","],
+                gwDNS.count ? [gwDNS componentsJoinedByString:@","] : @"（无）"]);
+        }
+
         // TUN 两种模式：
         //  - root（越狱）：建 utun 配地址加路由，系统级接管（老路径）
         //  - 非 root：socketpair 掉包，openconnect 的 tun 对端接 lwIP 用户态
@@ -1473,6 +1523,7 @@ static void cb_protect_socket(void *privdata, int fd) {
             NSString *err = nil;
             NSMutableArray<NSString *> *dns = [NSMutableArray array];
             for (int i = 0; i < 3 && ip->dns[i]; i++) [dns addObject:@(ip->dns[i])];
+            if (ovDNS.count) dns = [ovDNS mutableCopy];   // 覆盖网关下发的线路 DNS
             if (!T2SEngineStart(sp[1],
                                 @(ip->addr),
                                 ip->netmask ? @(ip->netmask) : @"255.255.255.0",
@@ -1504,6 +1555,8 @@ static void cb_protect_socket(void *privdata, int fd) {
                 }
                 for (int i = 0; i < 3 && ip->dns[i]; i++)
                     route_add(rs, ip->dns[i], gw);   // DNS 也得走隧道，不然解析泄露
+                for (NSString *d in g_tunnelDNS)
+                    route_add(rs, d.UTF8String, gw); // 覆盖后的线路 DNS 同样走隧道
             }
             close(rs);
         }
@@ -1540,6 +1593,9 @@ static void cb_protect_socket(void *privdata, int fd) {
     }
     for (int i = 0; i < 3 && ip->dns[i]; i++)
         route_del(rs, ip->dns[i], gw);
+    for (NSString *d in g_tunnelDNS)
+        route_del(rs, d.UTF8String, gw);
+    g_tunnelDNS = nil;
     close(rs);
 }
 
@@ -1552,6 +1608,7 @@ static void cb_protect_socket(void *privdata, int fd) {
 - (void)cleanup {
     self.running = NO;
     T2SEngineStop();   // 非越狱模式引擎（root 模式下是空操作）
+    g_tunnelDNS = nil;
     if (g_tun_fd >= 0) { close(g_tun_fd); g_tun_fd = -1; }
     if (g_vpninfo) {
         openconnect_vpninfo_free(g_vpninfo);
@@ -1585,7 +1642,7 @@ __attribute__((constructor))
 static void IPATAnyVpnLoad(void) {
     // 构建版本戳：dylib 一加载就写进日志。排查「日志 0 行/行为不符」时，
     // 第一行就能确认设备上跑的是哪个构建——防止装到旧包白测一轮
-    IPATAppendLogLine(@"[anyvpn] dylib 已加载：构建 DNS-TCP-20261030（DNS over TCP + tcp_tmr）");
+    IPATAppendLogLine(@"[anyvpn] dylib 已加载：构建 DNS-BREAKER-20261104（线路 DNS 熔断 + TunnelDNS 覆盖）");
     // 尽早装 socket 劫持（引擎没就绪时全部直通原函数，不影响 App 正常运行）
     T2SInstallHooks();
     // 与其他 tweak 一致：延后一点等主线程就绪再初始化
