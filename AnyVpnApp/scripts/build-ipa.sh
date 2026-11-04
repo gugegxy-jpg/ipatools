@@ -20,9 +20,12 @@ xcodegen generate
 
 # 诊断：确认 target 级真的在用我们手写的 Info.plist（曾出现只在 project 级
 # 设 GENERATE_INFOPLIST_FILE=NO 被 target 级覆盖的情况）
-xcodebuild -project AnyVpnApp.xcodeproj -target PacketTunnel \
-  -configuration Release -showBuildSettings 2>/dev/null \
-  | grep -E "GENERATE_INFOPLIST_FILE|INFOPLIST_FILE|INFOPLIST_EXPAND_BUILD_SETTINGS" || true
+for T in PacketTunnel AnyVpnApp; do
+  echo ">>> build settings: $T"
+  xcodebuild -project AnyVpnApp.xcodeproj -target "$T" \
+    -configuration Release -showBuildSettings 2>/dev/null \
+    | grep -E "GENERATE_INFOPLIST_FILE|INFOPLIST_FILE|INFOPLIST_EXPAND_BUILD_SETTINGS" || true
+done
 
 xcodebuild -project AnyVpnApp.xcodeproj \
   -scheme AnyVpnApp -configuration Release \
@@ -62,6 +65,23 @@ if ! "$PB" -c "Print :NSExtension:NSExtensionPointIdentifier" \
   exit 1
 fi
 echo "✅ appex NSExtension 校验通过"
+
+# App 的 Info.plist 必须带 UILaunchScreen：缺了 iOS 会用 3.5 寸兼容模式跑，
+# 屏幕上下留黑块（用户反馈"只有中间区域显示内容"）。这里强校验。
+APP_PLIST="$APP/Info.plist"
+if [ ! -f "$APP_PLIST" ]; then
+  echo "❌ 缺少 $APP_PLIST" >&2
+  exit 1
+fi
+if ! "$PB" -c "Print :UILaunchScreen" "$APP_PLIST" >/dev/null 2>&1; then
+  echo "❌ App Info.plist 缺 UILaunchScreen（会上下黑块）" >&2
+  exit 1
+fi
+if ! "$PB" -c "Print :UISupportedInterfaceOrientations" "$APP_PLIST" >/dev/null 2>&1; then
+  echo "❌ App Info.plist 缺 UISupportedInterfaceOrientations" >&2
+  exit 1
+fi
+echo "✅ App Info.plist 校验通过（UILaunchScreen / 方向支持）"
 
 OUT="$ROOT/out"
 rm -rf "$OUT"

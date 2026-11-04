@@ -33,8 +33,9 @@ targets:
           - "*.entitlements"
           - "**/*.entitlements"
       - path: Shared
-    info:
-      path: App/Info.plist
+    # 注意：不要用 XcodeGen 的 info: 块。info: 会让 XcodeGen 生成并覆盖我们手写的
+    # Info.plist（UILaunchScreen / CFBundleDisplayName 会被冲掉），
+    # 这里只通过 build setting 指定 INFOPLIST_FILE。
     entitlements:
       path: App/App.entitlements
     settings:
@@ -48,6 +49,35 @@ targets:
     dependencies:
       - target: PacketTunnel
         embed: true
+    postBuildScripts:
+      # App 的 Info.plist 若丢了 UILaunchScreen，iOS 会用 3.5 寸兼容模式跑，
+      # 屏幕上下留黑块。这里兜底补齐（签名之前执行，不影响签名）。
+      - name: Ensure launch screen in app Info.plist
+        basedOnDependencyAnalysis: false
+        script: |
+          set -e
+          PB=/usr/libexec/PlistBuddy
+          PLIST="${TARGET_BUILD_DIR}/${INFOPLIST_PATH}"
+          if [ ! -f "$PLIST" ]; then
+            echo "warning: 找不到 App Info.plist: $PLIST"
+            exit 0
+          fi
+          if ! "$PB" -c "Print :UILaunchScreen" "$PLIST" >/dev/null 2>&1; then
+            "$PB" -c "Add :UILaunchScreen dict" "$PLIST"
+            echo "已补齐 UILaunchScreen: $PLIST"
+          fi
+          if ! "$PB" -c "Print :UISupportedInterfaceOrientations" "$PLIST" >/dev/null 2>&1; then
+            "$PB" -c "Add :UISupportedInterfaceOrientations array" "$PLIST"
+            "$PB" -c "Add :UISupportedInterfaceOrientations:0 string UIInterfaceOrientationPortrait" "$PLIST"
+            "$PB" -c "Add :UISupportedInterfaceOrientations:1 string UIInterfaceOrientationLandscapeLeft" "$PLIST"
+            "$PB" -c "Add :UISupportedInterfaceOrientations:2 string UIInterfaceOrientationLandscapeRight" "$PLIST"
+          fi
+          if ! "$PB" -c "Print :CFBundleDisplayName" "$PLIST" >/dev/null 2>&1; then
+            "$PB" -c "Add :CFBundleDisplayName string AnyVpn" "$PLIST"
+          fi
+          if ! "$PB" -c "Print :LSRequiresIPhoneOS" "$PLIST" >/dev/null 2>&1; then
+            "$PB" -c "Add :LSRequiresIPhoneOS bool true" "$PLIST"
+          fi
 
   # NetworkExtension：系统级 tun，libopenconnect 直接收发 IP 包
   PacketTunnel:
@@ -61,8 +91,7 @@ targets:
           - "*.entitlements"
           - "**/*.entitlements"
       - path: Shared
-    info:
-      path: Tunnel/Info.plist
+    # 同上：不用 info:，避免 XcodeGen 覆盖手写的 appex Info.plist（NSExtension 会丢）
     entitlements:
       path: Tunnel/Tunnel.entitlements
     settings:

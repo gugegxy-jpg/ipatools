@@ -10,45 +10,26 @@ struct ContentView: View {
     @State private var editTarget: VpnProfile?
     @State private var editIsNew = false
     @State private var showLog = false
-    @State private var showRemoveConfirm = false
     @State private var showDiag = false
     @State private var diagItems: [SignatureDiagnostics.Item] = []
 
     private let ticker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
     private var selected: VpnProfile? { profiles.first { $0.id == selectedId } }
+    private var hasBlockingIssue: Bool {
+        diagItems.contains { !$0.ok && $0.title != "Keychain 可写" }
+    }
 
     var body: some View {
         NavigationView {
             ScrollView {
-                VStack(spacing: 20) {
+                VStack(spacing: 16) {
                     statusCard
-
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text("线路").font(.headline).padding(.leading, 4)
-                        if profiles.isEmpty {
-                            Text("还没有线路，先添加一条")
-                                .font(.footnote).foregroundColor(.secondary)
-                                .padding(.leading, 4)
-                        }
-                        ForEach(profiles) { p in profileRow(p) }
-                        Button("＋ 添加线路") {
-                            editTarget = VpnProfile()
-                            editIsNew = true
-                        }
-                        .appGlassButton(prominent: false)
-                    }
-
+                    profilesSection
                     notesCard
-
-                    HStack(spacing: 12) {
-                        Button("查看 / 复制连接日志") { showLog = true }
-                            .appGlassButton(prominent: false)
-                        Button("签名诊断") { showDiag = true }
-                            .appGlassButton(prominent: false)
-                    }
+                    footerButtons
                 }
                 .padding(.horizontal, 16)
-                .padding(.vertical, 20)
+                .padding(.vertical, 16)
             }
             .navigationTitle("AnyVpn")
             .appGlassScene()
@@ -59,20 +40,14 @@ struct ContentView: View {
             }
             .sheet(isPresented: $showLog) { LogView() }
             .sheet(isPresented: $showDiag) { SignatureDiagnosticsView() }
-            .alert(isPresented: $showRemoveConfirm) {
-                Alert(title: Text("删除系统 VPN 配置？"),
-                      message: Text("只会删掉系统里的 VPN 描述，线路和密钥保留。"),
-                      primaryButton: .destructive(Text("删除")) { vpn.removeConfiguration() },
-                      secondaryButton: .cancel())
-            }
         }
         .navigationViewStyle(.stack)
     }
 
-    // MARK: - 卡片
+    // MARK: - 状态卡
 
     private var statusCard: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 10) {
                 Circle()
                     .fill(vpn.status == .connected ? Color.green : Color.secondary)
@@ -85,8 +60,9 @@ struct ContentView: View {
             }
             if let e = vpn.lastError {
                 Text(e).font(.footnote).foregroundColor(.red)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            if diagItems.contains(where: { !$0.ok && $0.title != "Keychain 可写" }) {
+            if hasBlockingIssue {
                 Button { showDiag = true } label: {
                     HStack(spacing: 6) {
                         Image(systemName: "exclamationmark.triangle.fill")
@@ -96,24 +72,43 @@ struct ContentView: View {
                     .foregroundColor(.orange)
                 }
             }
-            HStack(spacing: 12) {
-                Button(vpn.status == .connected ? "断开" : "连接") {
-                    if vpn.status == .connected {
-                        vpn.disconnect()
-                    } else if let p = selected {
-                        vpn.connect(profile: p)
-                    }
+            Button(vpn.status == .connected ? "断开" : "连接") {
+                if vpn.status == .connected {
+                    vpn.disconnect()
+                } else if let p = selected {
+                    vpn.connect(profile: p)
                 }
-                .disabled(selected == nil || vpn.isBusy)
-                .appGlassButton(prominent: true)
-
-                Button("删除配置") { showRemoveConfirm = true }
-                    .appGlassButton(prominent: false)
             }
+            .frame(maxWidth: .infinity)
+            .disabled(selected == nil || vpn.isBusy)
+            .appGlassButton(prominent: true)
         }
         .padding(18)
         .frame(maxWidth: .infinity, alignment: .leading)
         .appGlassCard(tint: vpn.status == .connected ? .green : .blue, prominent: true)
+    }
+
+    // MARK: - 线路
+
+    private var profilesSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("线路").font(.headline).padding(.leading, 4)
+            if profiles.isEmpty {
+                Text("还没有线路，先添加一条")
+                    .font(.footnote).foregroundColor(.secondary)
+                    .padding(.leading, 4)
+            }
+            ForEach(profiles) { p in profileRow(p) }
+            Text("点按选中线路，再点一次可编辑")
+                .font(.caption).foregroundColor(.secondary)
+                .padding(.leading, 4)
+            Button("＋ 添加线路") {
+                editTarget = VpnProfile()
+                editIsNew = true
+            }
+            .frame(maxWidth: .infinity)
+            .appGlassButton(prominent: false)
+        }
     }
 
     private func profileRow(_ p: VpnProfile) -> some View {
@@ -126,17 +121,23 @@ struct ContentView: View {
                 Text(p.server).font(.caption).foregroundColor(.secondary)
             }
             Spacer()
-            Button("编辑") { editTarget = p; editIsNew = false }
-                .appGlassButton(prominent: false)
-                .font(.subheadline)
+            if p.id == selectedId {
+                Text("已选中").font(.caption).foregroundColor(.blue)
+            }
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
         .appGlassCard(tint: .blue, prominent: p.id == selectedId)
         .onTapGesture {
-            selectedId = p.id
-            ProfileStore.setActiveId(p.id)
+            if selectedId == p.id {
+                // 再次点已选中的行 = 编辑
+                editTarget = p
+                editIsNew = false
+            } else {
+                selectedId = p.id
+                ProfileStore.setActiveId(p.id)
+            }
         }
     }
 
@@ -157,6 +158,17 @@ struct ContentView: View {
         .appGlassCard(tint: .purple)
     }
 
+    private var footerButtons: some View {
+        HStack(spacing: 12) {
+            Button("连接日志") { showLog = true }
+                .frame(maxWidth: .infinity)
+                .appGlassButton(prominent: false)
+            Button("签名诊断") { showDiag = true }
+                .frame(maxWidth: .infinity)
+                .appGlassButton(prominent: false)
+        }
+    }
+
     // MARK: - 数据
 
     private func reload() {
@@ -167,6 +179,64 @@ struct ContentView: View {
 
     private func refreshDiag() {
         diagItems = SignatureDiagnostics.items
+    }
+}
+
+struct LogView: View {
+    @Environment(\.presentationMode) private var presentation
+    @EnvironmentObject private var vpn: VPNManager
+    @State private var text = ""
+    @State private var showRemoveConfirm = false
+    @State private var copied = false
+    private let ticker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        NavigationView {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text(text.isEmpty ? "（暂无日志）" : text)
+                        .font(.system(size: 11, design: .monospaced))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                    Button(copied ? "已复制 ✅" : "复制日志") {
+                        UIPasteboard.general.string = text
+                        copied = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
+                    }
+                    .frame(maxWidth: .infinity)
+                    .appGlassButton(prominent: true)
+                }
+                .padding(16)
+            }
+            .navigationTitle("连接日志")
+            .appGlassScene()
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    HStack(spacing: 10) {
+                        Button("复制") { UIPasteboard.general.string = text }
+                            .appGlassButton(prominent: false)
+                        Button("清空") { LogStore.clear(); text = "" }
+                            .appGlassButton(prominent: false)
+                    }
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Menu {
+                        Button("删除系统 VPN 配置", role: .destructive) { showRemoveConfirm = true }
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                    }
+                }
+            }
+            .onAppear { text = LogStore.read() }
+            .onReceive(ticker) { _ in text = LogStore.read() }
+            .alert(isPresented: $showRemoveConfirm) {
+                Alert(title: Text("删除系统 VPN 配置？"),
+                      message: Text("只会删掉系统里的 VPN 描述，线路和密钥保留。"),
+                      primaryButton: .destructive(Text("删除")) { vpn.removeConfiguration() },
+                      secondaryButton: .cancel())
+            }
+        }
+        .navigationViewStyle(.stack)
     }
 }
 
@@ -251,47 +321,6 @@ struct SignatureDiagnosticsView: View {
                     }
                 }
             }
-        }
-        .navigationViewStyle(.stack)
-    }
-}
-
-struct LogView: View {
-    @Environment(\.presentationMode) private var presentation
-    @State private var text = ""
-    private let ticker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
-
-    var body: some View {
-        NavigationView {
-            ScrollView {
-                VStack(alignment: .leading) {
-                    Text(text.isEmpty ? "（暂无日志）" : text)
-                        .font(.system(size: 11, design: .monospaced))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .padding(16)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .appGlassCard(tint: .gray)
-                .padding()
-            }
-            .navigationTitle("连接日志")
-            .appGlassScene()
-            .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    HStack(spacing: 10) {
-                        Button("复制") { UIPasteboard.general.string = text }
-                            .appGlassButton(prominent: false)
-                        Button("清空") { LogStore.clear(); text = "" }
-                            .appGlassButton(prominent: false)
-                    }
-                }
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("关闭") { presentation.wrappedValue.dismiss() }
-                        .appGlassButton(prominent: true)
-                }
-            }
-            .onAppear { text = LogStore.read() }
-            .onReceive(ticker) { _ in text = LogStore.read() }
         }
         .navigationViewStyle(.stack)
     }
