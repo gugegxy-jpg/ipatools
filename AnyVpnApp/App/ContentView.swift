@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import NetworkExtension
 
 struct ContentView: View {
     @EnvironmentObject private var vpn: VPNManager
@@ -10,6 +11,8 @@ struct ContentView: View {
     @State private var editIsNew = false
     @State private var showLog = false
     @State private var showRemoveConfirm = false
+    @State private var showDiag = false
+    @State private var diagItems: [SignatureDiagnostics.Item] = []
 
     private let ticker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
     private var selected: VpnProfile? { profiles.first { $0.id == selectedId } }
@@ -37,20 +40,25 @@ struct ContentView: View {
 
                     notesCard
 
-                    Button("查看 / 复制连接日志") { showLog = true }
-                        .appGlassButton(prominent: false)
+                    HStack(spacing: 12) {
+                        Button("查看 / 复制连接日志") { showLog = true }
+                            .appGlassButton(prominent: false)
+                        Button("签名诊断") { showDiag = true }
+                            .appGlassButton(prominent: false)
+                    }
                 }
                 .padding(.horizontal, 16)
                 .padding(.vertical, 20)
             }
             .navigationTitle("AnyVpn")
             .appGlassScene()
-            .onAppear { reload(); vpn.refresh() }
+            .onAppear { reload(); vpn.refresh(); refreshDiag() }
             .onReceive(ticker) { _ in vpn.refreshStatus() }
             .sheet(item: $editTarget) { p in
                 ProfileEditView(profile: p, isNew: editIsNew, onSave: reload)
             }
             .sheet(isPresented: $showLog) { LogView() }
+            .sheet(isPresented: $showDiag) { SignatureDiagnosticsView() }
             .alert(isPresented: $showRemoveConfirm) {
                 Alert(title: Text("删除系统 VPN 配置？"),
                       message: Text("只会删掉系统里的 VPN 描述，线路和密钥保留。"),
@@ -77,6 +85,16 @@ struct ContentView: View {
             }
             if let e = vpn.lastError {
                 Text(e).font(.footnote).foregroundColor(.red)
+            }
+            if diagItems.contains(where: { !$0.ok && $0.title != "Keychain 可写" }) {
+                Button { showDiag = true } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                        Text("签名能力可能缺失，VPN 连不上：点这里看诊断")
+                    }
+                    .font(.footnote)
+                    .foregroundColor(.orange)
+                }
             }
             HStack(spacing: 12) {
                 Button(vpn.status == .connected ? "断开" : "连接") {
@@ -129,6 +147,10 @@ struct ContentView: View {
                  + "若网关 DNS 不服务，在编辑页把游戏域名填进「仅这些域名走隧道 DNS」，"
                  + "其余域名仍走系统 DNS，避免全机断网。")
                 .font(.footnote).foregroundColor(.secondary)
+            Text("首次点「连接」时，iOS 会弹出「AnyVpnApp 想要添加 VPN 配置」，必须点「允许」；"
+                 + "配置会写进「设置 → 通用 → VPN 与设备管理」。"
+                 + "若之前误点过「不允许」，请到那里重新允许。")
+                .font(.footnote).foregroundColor(.secondary)
         }
         .padding(18)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -141,6 +163,96 @@ struct ContentView: View {
         profiles = ProfileStore.all()
         selectedId = ProfileStore.activeId() ?? profiles.first?.id
         if let id = selectedId { ProfileStore.setActiveId(id) }
+    }
+
+    private func refreshDiag() {
+        diagItems = SignatureDiagnostics.items
+    }
+}
+
+/// 签名诊断详情：把「实际生效了哪些能力」摊开给用户看
+struct SignatureDiagnosticsView: View {
+    @Environment(\.presentationMode) private var presentation
+    @State private var items: [SignatureDiagnostics.Item] = []
+    @State private var neText = "正在向系统查询 VPN 配置权限…"
+    @State private var neOK = false
+
+    var body: some View {
+        NavigationView {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("VPN 能否安装取决于签名：描述文件缺能力时系统直接 permission denied。")
+                        .font(.footnote).foregroundColor(.secondary)
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 6) {
+                            Text(neOK ? "✅" : "❌")
+                            Text("系统权限实测").font(.subheadline).fontWeight(.semibold)
+                        }
+                        Text(neText)
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .appGlassCard(tint: neOK ? .green : .red, prominent: false)
+
+                    ForEach(items) { item in
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack(spacing: 6) {
+                                Text(item.ok ? "✅" : "❌")
+                                Text(item.title).font(.subheadline).fontWeight(.semibold)
+                            }
+                            Text(item.value)
+                                .font(.system(size: 12, design: .monospaced))
+                                .foregroundColor(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .appGlassCard(tint: item.ok ? .green : .red, prominent: false)
+                    }
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("重签要点").font(.subheadline).fontWeight(.semibold)
+                        Text("① 开发者后台给该 AppID 勾选 Network Extensions（顺便 App Groups / Keychain Sharing），重新生成描述文件。\n"
+                             + "② App 与 appex 分别签，签名里都要含 com.apple.developer.networking.networkextension = packet-tunnel-provider。\n"
+                             + "③ 别让重签工具重建 appex 的 Info.plist（会再把 NSExtension 弄丢 → 装不上）。")
+                            .font(.footnote).foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .appGlassCard(tint: .purple, prominent: false)
+                }
+                .padding(16)
+            }
+            .navigationTitle("签名诊断")
+            .appGlassScene()
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("复制") { UIPasteboard.general.string = SignatureDiagnostics.summary }
+                        .appGlassButton(prominent: false)
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("关闭") { presentation.wrappedValue.dismiss() }
+                        .appGlassButton(prominent: true)
+                }
+            }
+            .onAppear {
+                items = SignatureDiagnostics.items
+                NETunnelProviderManager.loadAllFromPreferences { managers, error in
+                    DispatchQueue.main.async {
+                        if let e = error {
+                            let ns = e as NSError
+                            neText = "\(ns.localizedDescription)（\(ns.domain) #\(ns.code)）"
+                            neOK = false
+                        } else {
+                            neText = "系统允许读写 VPN 配置（已有 \(managers?.count ?? 0) 条）"
+                            neOK = true
+                        }
+                    }
+                }
+            }
+        }
+        .navigationViewStyle(.stack)
     }
 }
 

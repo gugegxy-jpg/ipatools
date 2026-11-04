@@ -42,7 +42,7 @@ final class VPNManager: ObservableObject {
         NETunnelProviderManager.loadAllFromPreferences { [weak self] managers, error in
             DispatchQueue.main.async {
                 guard let self = self else { return }
-                if let e = error { self.lastError = e.localizedDescription; return }
+                if let e = error { self.lastError = Self.describe(e); return }
                 self.manager = managers?.first
                 self.status = self.manager?.connection.status ?? .invalid
             }
@@ -62,42 +62,52 @@ final class VPNManager: ObservableObject {
         LogStore.append("[app] 正在连接 \(profile.displayName) …")
         loadOrCreate { [weak self] result in
             guard let self = self else { return }
+            // 读不到系统配置不代表不能连：读失败时改建一份新配置，
+            // 真正触发系统「添加 VPN 配置」授权弹窗的是 saveToPreferences。
+            let manager: NETunnelProviderManager
             switch result {
             case .failure(let e):
-                self.fail("读取 VPN 配置失败：\(e.localizedDescription)")
+                LogStore.append("[app] 读取系统配置失败，改为新建：\(e.localizedDescription)")
+                manager = NETunnelProviderManager()
             case .success(let m):
-                let proto = NETunnelProviderProtocol()
-                proto.providerBundleIdentifier = SharedConfig.tunnelBundleIdentifier
-                proto.serverAddress = profile.server
-                proto.username = profile.username
-                proto.providerConfiguration = ["profileId": profile.id]
-                proto.disconnectOnSleep = false
-                m.protocolConfiguration = proto
-                m.localizedDescription = "AnyVpn"
-                m.isEnabled = true
-                m.isOnDemandEnabled = false
-                m.saveToPreferences { [weak self] err in
-                    guard let self = self else { return }
-                    if let e = err {
-                        self.fail("保存 VPN 配置失败：\(e.localizedDescription)")
-                        return
-                    }
-                    // saveToPreferences 之后必须重新 load，直接 start 会拿到陈旧对象
-                    NETunnelProviderManager.loadAllFromPreferences { [weak self] managers, _ in
-                        DispatchQueue.main.async {
-                            guard let self = self else { return }
-                            guard let fresh = managers?.first else {
-                                self.fail("VPN 配置未生效（系统未返回配置）")
-                                return
-                            }
-                            self.manager = fresh
-                            do {
-                                try fresh.connection.startVPNTunnel()
-                                self.connectedProfileId = profile.id
-                                self.status = .connecting
-                            } catch {
-                                self.fail("启动隧道失败：\(error.localizedDescription)")
-                            }
+                manager = m
+            }
+            let proto = NETunnelProviderProtocol()
+            proto.providerBundleIdentifier = SharedConfig.tunnelBundleIdentifier
+            proto.serverAddress = profile.server
+            proto.username = profile.username
+            proto.providerConfiguration = ["profileId": profile.id]
+            proto.disconnectOnSleep = false
+            manager.protocolConfiguration = proto
+            manager.localizedDescription = "AnyVpn"
+            manager.isEnabled = true
+            manager.isOnDemandEnabled = false
+            manager.saveToPreferences { [weak self] err in
+                guard let self = self else { return }
+                if let e = err {
+                    // 首次保存时 iOS 会弹「AnyVpnApp 想要添加 VPN 配置」，需要用户点允许
+                    self.fail("保存 VPN 配置失败：\(Self.describe(e))")
+                    return
+                }
+                // saveToPreferences 之后必须重新 load，直接 start 会拿到陈旧对象
+                NETunnelProviderManager.loadAllFromPreferences { [weak self] managers, error in
+                    DispatchQueue.main.async {
+                        guard let self = self else { return }
+                        if let e = error {
+                            self.fail("VPN 配置已保存但读取失败：\(Self.describe(e))")
+                            return
+                        }
+                        guard let fresh = managers?.first else {
+                            self.fail("VPN 配置未生效（系统未返回配置）")
+                            return
+                        }
+                        self.manager = fresh
+                        do {
+                            try fresh.connection.startVPNTunnel()
+                            self.connectedProfileId = profile.id
+                            self.status = .connecting
+                        } catch {
+                            self.fail("启动隧道失败：\(error.localizedDescription)")
                         }
                     }
                 }
@@ -137,5 +147,21 @@ final class VPNManager: ObservableObject {
             self.status = .disconnected
             LogStore.append("[app] ❌ \(msg)")
         }
+    }
+
+    /// 把系统错误翻成人话。NEVPNErrorDomain #5 (configurationReadWriteFailed)
+    /// 的 localizedDescription 正好是 "permission denied"，几乎总是签名能力问题。
+    private static func describe(_ error: Error) -> String {
+        let ns = error as NSError
+        var text = "\(ns.localizedDescription)（\(ns.domain) #\(ns.code)）"
+        if ns.domain == NEVPNErrorDomain, ns.code == 5 {
+            text += "\n👉 系统拒绝读写 VPN 配置：通常是描述文件缺 Network Extensions 能力，"
+                + "或重签时没把 entitlements 合进去。App 与 appex 要分别签，签名里必须含 "
+                + "com.apple.developer.networking.networkextension = packet-tunnel-provider。"
+                + "点「签名诊断」能看到具体缺哪一项。"
+        } else if ns.domain == NSPOSIXErrorDomain, ns.code == 1 || ns.code == 13 {
+            text += "\n👉 权限被拒：同样是签名/描述文件的问题，点「签名诊断」核对。"
+        }
+        return text
     }
 }
