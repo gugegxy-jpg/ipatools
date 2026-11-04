@@ -29,6 +29,21 @@ if [ ! -d "$APP" ]; then
   exit 1
 fi
 
+# 构建期挡回归：Xcode 15+ 的 GENERATE_INFOPLIST_FILE 若被打开，会自动生成一份
+# 不带 NSExtension 的 appex Info.plist，包装得出来但装不上真机
+# （IXErrorDomain Code=17 "extensionDictionary must be set"）。
+APPEX="$APP/PlugIns/PacketTunnel.appex"
+if [ ! -f "$APPEX/Info.plist" ]; then
+  echo "❌ 缺少 $APPEX/Info.plist" >&2
+  exit 1
+fi
+if ! /usr/libexec/PlistBuddy -c "Print :NSExtension:NSExtensionPointIdentifier" \
+        "$APPEX/Info.plist" 2>/dev/null | grep -q "packet-tunnel"; then
+  echo "❌ appex Info.plist 缺 NSExtension 字典：检查 GENERATE_INFOPLIST_FILE 是否为 NO" >&2
+  exit 1
+fi
+echo "✅ appex NSExtension 校验通过"
+
 OUT="$ROOT/out"
 rm -rf "$OUT"
 mkdir -p "$OUT/Payload"

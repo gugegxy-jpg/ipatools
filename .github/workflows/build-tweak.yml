@@ -1,9 +1,11 @@
-# 在 GitHub 官方的 macOS 云主机上编译注入用 dylib（IPATool.dylib 合编 + QNet.dylib 单独出包）。
+# 在 GitHub 官方的 macOS 云主机上编译注入用 dylib：
+#   IPATool.dylib = 悬浮面板 + 文件导入导出，SoloX.dylib = 性能悬浮窗。
 #
 # 用法：把仓库推到 GitHub 后，Actions → Build iOS Tweaks → Run workflow，
-# 跑完在页面底部的 Artifacts 里下载 ipatool-tweaks.zip（内含 *.dylib）。
-# 之所以必须跑在 macOS runner 上：iPhoneOS SDK 与 codesign 只能在 Apple 工具链里使用，
-# Linux 容器拿不到合法 SDK。
+# 跑完在 Artifacts 里下载 ipatool-tweaks（内含 *.dylib）。
+# VPN 隧道已独立成 AnyVpnApp/（NetworkExtension App），本工作流不再编译
+# AnyVpn.dylib，也不需要 openconnect/openssl/libxml2/lwIP 静态库；
+# Demo IPA 的编译与注入验证已移除。
 name: Build iOS Tweaks
 
 on:
@@ -20,9 +22,6 @@ on:
   push:
     paths:
       - "tweak/**"
-      - "demo/**"
-      # CLI 改动靠下面那步「Inject tweaks into demo app」在 macOS runner 上验证，
-      # 所以它也属于触发路径（以前改了 ipatool/ 下面什么都没有跑）
       - "ipatool/**"
       - "requirements.txt"
       - ".github/workflows/build-tweak.yml"
@@ -30,8 +29,7 @@ on:
 permissions:
   contents: write
 
-# macOS 免费并发额度小、排队慢：连续导入只保留最新一次构建，
-# 旧的排上队也直接取消，不占额度
+# macOS 免费并发额度小、排队慢：连续导入只保留最新一次构建
 concurrency:
   group: build-tweak-${{ github.ref }}
   cancel-in-progress: true
@@ -39,8 +37,8 @@ concurrency:
 jobs:
   build:
     runs-on: macos-14
-    # 排队等待加上 360 默认太宽，显式 90 分钟封顶防 runner 卡死
-    timeout-minutes: 90
+    # 不再交叉编译 openconnect/openssl，30 分钟足够
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -50,28 +48,15 @@ jobs:
           xcrun --sdk iphoneos --show-sdk-version
           xcrun --sdk iphoneos --show-sdk-path
 
-      # AnyVpn.dylib 依赖 iOS 版 openconnect/openssl/lwIP 静态库，
-      # 交叉编译要 10-20 分钟，按脚本内容缓存产物
-      - name: Cache AnyVPN prebuilt libs
-        uses: actions/cache@v4
-        with:
-          path: tweak/anyvpn/prebuilt
-          key: anyvpn-prebuilt-${{ inputs.archs || 'arm64' }}-${{ hashFiles('tweak/anyvpn/build-openconnect-ios.sh') }}
-
-      - name: Build AnyVPN dependencies (openconnect/openssl/libxml2/lwIP)
-        run: |
-          chmod +x tweak/anyvpn/build-openconnect-ios.sh
-          ./tweak/anyvpn/build-openconnect-ios.sh 2>&1 | tee anyvpn-deps.log
-          exit ${PIPESTATUS[0]}
-
       - name: Build dylibs
         env:
           IPATOOL_MIN_IOS: ${{ inputs.min_ios || '14.0' }}
           IPATOOL_ARCHS: ${{ inputs.archs || 'arm64' }}
-          # 悬浮窗 / 文件导入导出 / 插件加载合编成一个 IPATool.dylib；
-          # 弱网测试单独出 QNet.dylib；性能悬浮窗单独出 SoloX.dylib；
-          # VPN 隧道单独出 AnyVpn.dylib
-          IPATOOL_TARGETS: IPATool QNet SoloX AnyVpn
+          # 悬浮面板 + 文件导入导出合编成 IPATool.dylib；
+          # 性能悬浮窗单独出 SoloX.dylib。
+          # QNet（弱网）/ PluginLoader（运行时插件）默认不编，
+          # 需要时手动改这里或在本地给 build.sh 传 IPATOOL_TARGETS。
+          IPATOOL_TARGETS: IPATool SoloX
         run: |
           mkdir -p tweak/build
           chmod +x tweak/build.sh
@@ -80,7 +65,7 @@ jobs:
           echo "=== build.sh exit=$code ===" | tee -a tweak/build/_build.log
           echo "=== ls -la tweak/build ===" | tee -a tweak/build/_build.log
           ls -la tweak/build 2>&1 | tee -a tweak/build/_build.log
-          # 之前少了这一步：dylib 编译失败也会假报 success，误导排查
+          # 少了这一步：dylib 编译失败也会假报 success，误导排查
           exit "$code"
 
       - name: Verify artifacts
@@ -98,36 +83,7 @@ jobs:
             codesign -dvvv "$f" 2>&1 | head -3 || true
           done
 
-      - name: Build demo app (for on-device testing)
-        id: build_demo
-        continue-on-error: true
-        run: |
-          chmod +x demo/build-demo.sh
-          ./demo/build-demo.sh 2>&1 | tee demo-build.log
-          exit ${PIPESTATUS[0]}
-
-      - name: Inject tweaks into demo app
-        id: inject_demo
-        if: steps.build_demo.outcome == 'success'
-        continue-on-error: true
-        run: |
-          python3 -m ipatool inject demo/build/IPATDemo.ipa \
-            --files --qnet --plugins --solox --in-place --sign none 2>&1 | tee demo-inject.log
-          echo "=== 注入后核对 ===" | tee -a demo-inject.log
-          python3 -m ipatool inject demo/build/IPATDemo.ipa --list 2>&1 | tee -a demo-inject.log
-          python3 -m ipatool info demo/build/IPATDemo.ipa 2>&1 | tee -a demo-inject.log
-          ls -la demo/build 2>&1 | tee -a demo-inject.log
-
-      - uses: actions/upload-artifact@v4
-        if: steps.build_demo.outcome == 'success'
-        with:
-          name: ipatool-demo-ipa
-          path: demo/build/IPATDemo.ipa
-          if-no-files-found: error
-          retention-days: 90
-
       - name: Pack build directory
-        if: always()
         run: |
           zip -r build-artifacts.zip tweak/build -x "*.DS_Store"
           unzip -l build-artifacts.zip
@@ -142,7 +98,6 @@ jobs:
           retention-days: 90
 
       # Release asset 可以匿名下载，Artifact 必须登录，所以额外发一份到 Release
-      # if: always() —— 即使 Demo 编译失败也要把 dylib 和编译日志发出来，方便定位
       - name: Publish dylibs as release assets
         if: always()
         env:
@@ -152,10 +107,10 @@ jobs:
           assets=()
           for f in tweak/build/*.dylib; do if [ -f "$f" ]; then assets+=("$f"); fi; done
           if [ -f build-artifacts.zip ]; then assets+=(build-artifacts.zip); fi
-          if [ -f demo/build/IPATDemo.ipa ]; then assets+=(demo/build/IPATDemo.ipa); fi
-          if [ -f demo-build.log ]; then assets+=(demo-build.log); fi
-          if [ -f demo-inject.log ]; then assets+=(demo-inject.log); fi
-          if [ -f anyvpn-deps.log ]; then assets+=(anyvpn-deps.log); fi
+          if [ ${#assets[@]} -eq 0 ]; then
+            echo "没有可发布的产物，跳过 Release"
+            exit 0
+          fi
           gh release create "$TAG" "${assets[@]}" \
             --title "$TAG" \
             --notes "Actions 自动编译：run ${{ github.run_number }} / commit ${{ github.sha }}" \

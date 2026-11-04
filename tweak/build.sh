@@ -1,26 +1,24 @@
 #!/usr/bin/env bash
 #
-# 编译注入用的 dylib（悬浮控制面板 / 文件导入导出 / 弱网测试）。需要 macOS + Xcode 命令行工具：
-#   xcode-select --install
+# 编译注入用的 dylib。需要 macOS + Xcode 命令行工具：xcode-select --install
 #
-#   ./tweak/build.sh                               默认出 IPATool.dylib + QNet.dylib + SoloX.dylib
-#   IPATOOL_TARGETS="ControlPanel FileBridge QNet" ./tweak/build.sh   只编译指定目标（单独出包）
+#   ./tweak/build.sh                默认出 IPATool.dylib + SoloX.dylib
+#   IPATOOL_TARGETS="QNet" ./tweak/build.sh   按需单独编译其它目标
 #
-# 默认两个产物：
-#   - IPATool.dylib  = ControlPanel + FileBridge（悬浮面板 / 文件导入导出）
-#   - QNet.dylib      = 弱网测试，单独一个 dylib（见下）
-# 说明：运行时「插件加载」(PluginLoader) 已从默认合编里移除 —— iOS 从沙盒 Documents 加载
-# dylib 必须有 disable-library-validation（系统强约束，很多开发描述文件不放行），
-# 故默认不再编入；需要该能力时单独出 PluginLoader.dylib 并经越狱/TrollStore 等环境安装。
-# QNet 单独出包：它和面板之间只用「通知 + NSUserDefaults」通信（IPATControlShared.h），
-# 不链接彼此符号，所以单独编成 QNet.dylib、靠 --qnet 注入 Frameworks 或运行时当插件加载都行，
-# 加载后自己 post IPATControlRegister，面板就会多出弱网那一节。这样改 QNet 不用重编主 dylib。
+# 默认产物（只留还在用的三块功能）：
+#   - IPATool.dylib = ControlPanel + FileBridge（悬浮面板 / 文件导入导出）
+#   - SoloX.dylib   = 性能悬浮窗（CPU/内存/网络/FPS/电量/温度）
+#
+# VPN 隧道已独立成 AnyVpnApp/（NetworkExtension App），这里不再编译 AnyVpn.dylib，
+# 也不再需要 openconnect/openssl/libxml2/lwIP 静态库。
+# QNet（弱网）/ PluginLoader（运行时插件）默认不编，需要时显式给 IPATOOL_TARGETS；
+# 它们与面板只用「通知 + NSUserDefaults」通信，单独出包不影响合编主库。
 #
 # 可通过环境变量调整：
 #   IPATOOL_MIN_IOS   最低系统版本，默认 14.0
 #   IPATOOL_ARCHS     架构列表，默认 "arm64"（可写 "arm64 arm64e"）
 #   IPATOOL_OUT_DIR   产物目录，默认 tweak/build
-#   IPATOOL_TARGETS   目标列表，默认 "IPATool QNet"；也可写单个功能名
+#   IPATOOL_TARGETS   目标列表，默认 "IPATool SoloX"；也可写单个功能名
 #
 set -euo pipefail
 
@@ -28,7 +26,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT_DIR="${IPATOOL_OUT_DIR:-$HERE/build}"
 MIN_IOS="${IPATOOL_MIN_IOS:-14.0}"
 ARCHS="${IPATOOL_ARCHS:-arm64}"
-TARGETS="${IPATOOL_TARGETS:-IPATool QNet SoloX}"
+TARGETS="${IPATOOL_TARGETS:-IPATool SoloX}"
 # 面板标题显示的版本号：功能有可感知变化时手动 +1（区别于每次构建都变的 run number）
 IPAT_VERSION="${IPAT_VERSION:-1.0.0}"
 
@@ -96,15 +94,6 @@ sources_for_target() {
     SoloX)
       printf '%s\n' "$HERE/SoloX.m"
       ;;
-    AnyVpn)
-      # VPN 隧道（OpenConnect）：依赖 iOS 版静态库，没编译就明确跳过
-      if [[ ! -f "$HERE/anyvpn/prebuilt/lib/libopenconnect.a" ]]; then
-        echo "跳过 AnyVpn：缺 tweak/anyvpn/prebuilt/lib/libopenconnect.a，" \
-             "先在 macOS 上跑 tweak/anyvpn/build-openconnect-ios.sh" >&2
-        return 1
-      fi
-      printf '%s\n' "$HERE/AnyVpn.m" "$HERE/AnyVpnT2S.m" "$HERE/fishhook.c"
-      ;;
     *)
       if [[ "$1" == "ControlPanel" ]]; then
         printf '%s\n' "$HERE/$1.m" "$OUT_DIR/IPAToolIcon.m"
@@ -120,17 +109,6 @@ frameworks_for_source() {
   case "$(basename "$1" .m)" in
     # UniformTypeIdentifiers 是 iOS 14 才有的框架，用 weak 链接兼容更低的部署目标
     FileBridge)  printf '%s\n' -weak_framework UniformTypeIdentifiers -lz ;;
-    # VPN：OpenConnect/OpenSSL/libxml2/lwIP 静态库 + zlib；
-    # -I$HERE 是给 lwipopts.h / arch/cc.h 用的（lwIP 要求它们在搜索路径上）
-    AnyVpn)
-      local pre="$HERE/anyvpn/prebuilt"
-      # -D 与 build-openconnect-ios.sh 的 lwIP 编译保持一致（lwIP 的
-      # udp_connect 与 openconnect ssl.c 的同名符号冲突）
-      printf '%s\n' -I"$HERE" -I"$pre/include" \
-        "$pre/lib/libopenconnect.a" "$pre/lib/libssl.a" \
-        "$pre/lib/libcrypto.a" "$pre/lib/libxml2.a" "$pre/lib/liblwip.a" \
-        -lz -liconv -Dudp_connect=ipat_lwip_udp_connect
-      ;;
   esac
 }
 

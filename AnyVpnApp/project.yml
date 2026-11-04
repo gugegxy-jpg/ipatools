@@ -14,6 +14,11 @@ settings:
     CLANG_ENABLE_MODULES: YES
     CLANG_ENABLE_OBJC_ARC: YES
     GCC_WARN_UNDECLARED_SELECTOR: YES
+    # Xcode 15+ 默认 YES：自动生成的 Info.plist 会把我们手写的 NSExtension
+    # 字典整个丢掉，装真机时报 IXErrorDomain Code=17
+    # "extensionDictionary must be set in placeholder attributes"。
+    GENERATE_INFOPLIST_FILE: NO
+    INFOPLIST_EXPAND_BUILD_SETTINGS: YES
 
 targets:
   # 宿主 App：线路管理 / 凭据 / VPN 配置安装 / 日志
@@ -35,6 +40,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.anyvpn.app
+        INFOPLIST_FILE: App/Info.plist
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
     dependencies:
       - target: PacketTunnel
@@ -59,6 +65,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.anyvpn.app.tunnel
+        INFOPLIST_FILE: Tunnel/Info.plist
         SWIFT_OBJC_BRIDGING_HEADER: Tunnel/Bridging-Header.h
         HEADER_SEARCH_PATHS:
           - "$(inherited)"
