@@ -1386,7 +1386,7 @@ static BOOL hostResolvesToFakeIp(const char *host, char *outIp, size_t outIpLen)
     struct addrinfo *res = NULL;
     if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) return NO;
     BOOL fake = NO;
-    for (struct addrinfo *ai = res; ai; ai = ai->ai_addr) {
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
         if (ai->ai_family != AF_INET || !ai->ai_addr) continue;
         uint32_t iph = ntohl(((struct sockaddr_in *)ai->ai_addr)->sin_addr.s_addr);
         if ((iph & 0xFFFE0000u) == 0xC6120000u) {       // 198.18.0.0/15
@@ -1719,7 +1719,7 @@ static NSString *probeHttpGet(const char *host, const char *path,
         for (size_t i = 0; i < sizeof(kExitHosts) / sizeof(kExitHosts[0]); i++) {
             if (i > 0 && ([NSDate timeIntervalSinceReferenceDate] - t0) > kProbeBudget) {
                 mainFail = [NSString stringWithFormat:
-                    @"探测已耗时 %.1f 秒（DNS/连接无响应），跳过剩余候选 %@",
+                    @"探测已耗时 %.1f 秒（DNS/连接无响应），跳过剩余候选 %s",
                     [NSDate timeIntervalSinceReferenceDate] - t0,
                     kExitHosts[i]];
                 break;
@@ -1736,7 +1736,7 @@ static NSString *probeHttpGet(const char *host, const char *path,
                 if (ip.length) break;          // 拿到出口 IP 就收工
                 // 302 之类：算「有响应」，但正文里没有 IP → 换下一个候选
                 if ([st1 hasPrefix:@"HTTP/1.1 3"] || [st1 hasPrefix:@"HTTP/1.0 3"]) {
-                    mainFail = [NSString stringWithFormat:@"探测目标 %@ 返回 %@（重定向，正文里没有 IP）",
+                    mainFail = [NSString stringWithFormat:@"探测目标 %s 返回 %@（重定向，正文里没有 IP）",
                                  kExitHosts[i], st1];
                 }
             } else {
@@ -1744,17 +1744,17 @@ static NSString *probeHttpGet(const char *host, const char *path,
                 if (err1 == IPAT_PROBE_ERR_FAKEIP) {
                     fakeAll = YES;
                     mainFail = [NSString stringWithFormat:
-                        @"探测目标 %@ 被代理 fake-ip 劫持 → 跳过域名目标，改用 IP 目标探测",
+                        @"探测目标 %s 被代理 fake-ip 劫持 → 跳过域名目标，改用 IP 目标探测",
                         kExitHosts[i]];
                     break;
                 }
                 if (err1 == EHOSTUNREACH) {
                     mainFail = [NSString stringWithFormat:
-                        @"探测目标 %@ 域名解析失败：%@（线路 DNS 不通，system 解析也无结果）",
+                        @"探测目标 %s 域名解析失败：%@（线路 DNS 不通，system 解析也无结果）",
                         kExitHosts[i], probeErrText(err1)];
                     break;                      // 换域名也解析不了，别再白等
                 }
-                mainFail = [NSString stringWithFormat:@"探测目标 %@ 失败：%@（errno %d）",
+                mainFail = [NSString stringWithFormat:@"探测目标 %s 失败：%@（errno %d）",
                              kExitHosts[i], probeErrText(err1), err1];
             }
         }
