@@ -309,7 +309,7 @@ static NSString *IPATTlsProbe(int fd, NSString *host, unsigned long long *bytes)
     uint16_t sniLen = (uint16_t)(hostData.length + 3);
     uint8_t sniLenBytes[2] = {(uint8_t)(sniLen >> 8), (uint8_t)(sniLen & 0xFF)};
     [sniExt appendBytes:sniLenBytes length:2];  // server_name_list 长度
-    [sniExt appendBytes:sni bytes:3];            // type(1) + 名字长度(2)
+    [sniExt appendBytes:sni length:3];            // type(1) + 名字长度(2)
     [sniExt appendBytes:hostData.bytes length:hostData.length];
     uint8_t extHdr[4] = {0x00, 0x00, 0, 0};
     extHdr[2] = (uint8_t)(sniExt.length >> 8);
