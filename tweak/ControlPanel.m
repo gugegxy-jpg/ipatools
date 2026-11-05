@@ -774,9 +774,9 @@ static UIWindowScene *IPATCpActiveWindowScene(BOOL requireActive) {
 }
 
 /// 顺序固定一下，免得每次加载顺序不同导致界面跳来跳去：
-/// VPN 隧道 -> QNet -> 性能浮窗 -> 文件导入，其余（如 plugins）追加最后。
+/// QNet -> 性能浮窗 -> 文件导入，其余（如 plugins）追加最后。
 - (NSArray<NSString *> *)sortedFeatureIds {
-    NSArray *order = @[@"anyvpn", IPATFeatureQNet, @"solox", IPATFeatureFiles];
+    NSArray *order = @[IPATFeatureQNet, @"solox", IPATFeatureFiles];
     NSMutableArray<NSString *> *ids = [NSMutableArray array];
     for (NSString *featureId in order) {
         if (self.features[featureId]) [ids addObject:featureId];

@@ -1,6 +1,5 @@
 # 在 GitHub 官方的 macOS 云主机上编译注入用 dylib：
-#   IPATool.dylib = 悬浮面板 + 文件导入导出，SoloX.dylib = 性能悬浮窗，
-#   AnyVpn.dylib = VPN 隧道插件（OpenConnect，注入宿主 App 用）。
+#   IPATool.dylib = 悬浮面板 + 文件导入导出，SoloX.dylib = 性能悬浮窗
 #
 # 用法：把仓库推到 GitHub 后，Actions → Build iOS Tweaks → Run workflow，
 # 跑完在 Artifacts 里下载 ipatool-tweaks（内含 *.dylib）。
@@ -50,30 +49,15 @@ jobs:
           xcrun --sdk iphoneos --show-sdk-version
           xcrun --sdk iphoneos --show-sdk-path
 
-      # AnyVpn.dylib 依赖 iOS 版 openconnect/openssl/lwIP 静态库，
-      # 交叉编译要 10~20 分钟，按脚本内容缓存产物
-      - name: Cache AnyVPN prebuilt libs
-        uses: actions/cache@v4
-        with:
-          path: tweak/anyvpn/prebuilt
-          key: anyvpn-prebuilt-${{ inputs.archs || 'arm64' }}-${{ hashFiles('tweak/anyvpn/build-openconnect-ios.sh') }}
-
-      - name: Build AnyVPN dependencies (openconnect/openssl/libxml2/lwIP)
-        run: |
-          chmod +x tweak/anyvpn/build-openconnect-ios.sh
-          ./tweak/anyvpn/build-openconnect-ios.sh 2>&1 | tee anyvpn-deps.log
-          exit ${PIPESTATUS[0]}
-
       - name: Build dylibs
         env:
           IPATOOL_MIN_IOS: ${{ inputs.min_ios || '14.0' }}
           IPATOOL_ARCHS: ${{ inputs.archs || 'arm64' }}
           # 悬浮面板 + 文件导入导出合编成 IPATool.dylib；
-          # 性能悬浮窗单独出 SoloX.dylib；
-          # VPN 隧道单独出 AnyVpn.dylib（注入宿主 App 用）。
+          # 性能悬浮窗单独出 SoloX.dylib。
           # QNet（弱网）/ PluginLoader（运行时插件）默认不编，
           # 需要时手动改这里或在本地给 build.sh 传 IPATOOL_TARGETS。
-          IPATOOL_TARGETS: IPATool SoloX AnyVpn
+          IPATOOL_TARGETS: IPATool SoloX
         run: |
           mkdir -p tweak/build
           chmod +x tweak/build.sh
@@ -100,7 +84,7 @@ jobs:
             codesign -dvvv "$f" 2>&1 | head -3 || true
           done
 
-      # 真机验证 Demo：编译最小 App，再注入面板 + VPN 插件，供实机测 VPN 连接
+      # 真机验证 Demo：编译最小 App，再注入面板，供实机测注入是否生效
       - name: Build demo IPA
         run: |
           chmod +x demo/build-demo.sh
@@ -109,11 +93,10 @@ jobs:
           echo "=== build-demo.sh exit=$code ===" | tee -a demo-build.log
           exit "$code"
 
-      - name: Inject IPATool + AnyVpn into demo
+      - name: Inject IPATool into demo
         run: |
           python3 -m ipatool inject demo/build/IPATDemo.ipa \
             --dylib tweak/build/IPATool.dylib \
-            --dylib tweak/build/AnyVpn.dylib \
             --in-place --sign none 2>&1 | tee demo-inject.log
           code=${PIPESTATUS[0]}
           echo "=== inject exit=$code ===" | tee -a demo-inject.log
@@ -162,7 +145,6 @@ jobs:
           if [ -f demo/build/IPATDemo.ipa ]; then assets+=(demo/build/IPATDemo.ipa); fi
           if [ -f demo-build.log ]; then assets+=(demo-build.log); fi
           if [ -f demo-inject.log ]; then assets+=(demo-inject.log); fi
-          if [ -f anyvpn-deps.log ]; then assets+=(anyvpn-deps.log); fi
           if [ ${#assets[@]} -eq 0 ]; then
             echo "没有可发布的产物，跳过 Release"
             exit 0

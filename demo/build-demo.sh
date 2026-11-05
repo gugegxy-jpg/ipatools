@@ -33,7 +33,7 @@ echo "编译 ${EXE} (arm64 / min iOS 14.0)"
   -framework Foundation \
   -framework UIKit \
   -o "$BUNDLE/$EXE" \
-  Demo.m Browser.m
+  Demo.m
 
 cp Info.plist "$BUNDLE/Info.plist"
 

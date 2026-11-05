@@ -24,15 +24,6 @@
 	<true/>
 	<key>MinimumOSVersion</key>
 	<string>14.0</string>
-	<!-- The browser's "compare" button uses NSURLSession to hit the same URL
-	     over the system network stack (not hijacked). ATS would block plain
-	     http:// before it reaches the network, so the comparison would be
-	     meaningless. -->
-	<key>NSAppTransportSecurity</key>
-	<dict>
-		<key>NSAllowsArbitraryLoads</key>
-		<true/>
-	</dict>
 	<key>UIDeviceFamily</key>
 	<array>
 		<integer>1</integer>
@@ -66,40 +57,6 @@
 				</dict>
 			</array>
 		</dict>
-	</dict>
-	<!-- AnyVpn.dylib bootstrap config.
-	     Priority: connections saved by the floating panel (NSUserDefaults)
-	     > these values (AnyVpn.m "configured:").
-	     Leaving them empty is fine: open the app, expand the floating panel,
-	     "VPN tunnel" -> "+ add connection", then fill in the gateway.
-	       Server          gateway address (required)
-	       User            account
-	       Password        password
-	       AuthGroup       auth group (empty = pick the first one)
-	       DisableDTLS     true = CSTP/TCP only; DTLS/UDP 443 rarely negotiates
-	       UnderlyingIface en0 = bind openconnect socket to the real NIC
-	       AutoConnect     true = connect on launch (default false)
-	       TotpSecret      Base32 TOTP secret (optional)
-	       TunnelDNS       override tunnel DNS, "ip1,ip2"
-	     Keep this file ASCII-only: zsign reads Info.plist with its own
-	     non-UTF-8 aware XML parser, and non-ASCII comments can break it
-	     ("Can't find app's Info.plist!"). -->
-	<key>IPAToolAnyVpn</key>
-	<dict>
-		<key>Server</key>
-		<string></string>
-		<key>User</key>
-		<string></string>
-		<key>Password</key>
-		<string></string>
-		<key>AuthGroup</key>
-		<string></string>
-		<key>DisableDTLS</key>
-		<true/>
-		<key>UnderlyingIface</key>
-		<string>en0</string>
-		<key>AutoConnect</key>
-		<false/>
 	</dict>
 </dict>
 </plist>

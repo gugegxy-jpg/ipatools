@@ -570,7 +570,7 @@ static int ipat_qn_close(int fd) {
     return (int)syscall(SYS_close, fd);
 }
 
-/// dyld 的符号插入：{新函数, 被替换的函数}。系统自带的机制，不需要 fishhook。
+/// dyld 的符号插入：{新函数, 被替换的函数}。系统自带的机制，不需要第三方 hook 库。
 /// 三个必须知道的边界：
 ///   1) 插入**对声明它的镜像自己不生效**（dyld 的 InterposeTupleSpecific 里带
 ///      onlyImage = this，防止 hook 实现递归）。所以「在自己 dylib 里调一次 send

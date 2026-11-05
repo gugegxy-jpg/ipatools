@@ -19,7 +19,7 @@
 
 #include <math.h>
 #import <Foundation/Foundation.h>
-// 下面的取 keyWindow 辅助用了 UIWindow/UIScene；AnyVpnT2S 等底层
+// 下面的取 keyWindow 辅助用了 UIWindow/UIScene；其它编译单元
 // 编译单元自己没导 UIKit，必须在这里补上，否则 unknown type name
 #import <UIKit/UIKit.h>
 
@@ -202,15 +202,6 @@ static void IPATAppendLogLine(NSString *line) {
 #define IPATKeyFilesEnabled @"IPAToolPanelFilesEnabled"  // 已弃用：文件功能常开，只看 Info.plist 的 Enabled
 #define IPATKeyFilesImportDir @"IPAToolPanelFilesImportDir"  // 仅 plist：导入的默认落地目录（相对沙盒）
 
-#define IPATKeyAnyVpnProfiles  @"IPAToolPanelAnyVpnProfiles"  // 连接列表 NSArray<NSDictionary>（id/name/server/user/password/authgroup）
-#define IPATKeyAnyVpnActive    @"IPAToolPanelAnyVpnActive"    // 当前选中的连接 id，NSString（空 = 第一个）
-#define IPATKeyAnyVpnAddProfile @"IPAToolPanelAnyVpnAddProfile"    // 动作行：添加连接
-#define IPATKeyAnyVpnEditProfile @"IPAToolPanelAnyVpnEditProfile"  // 动作行：编辑当前连接
-#define IPATKeyAnyVpnDelProfile @"IPAToolPanelAnyVpnDelProfile"    // 动作行：删除当前连接
-#define IPATKeyAnyVpnTotp      @"IPAToolPanelAnyVpnTotp"     // TOTP 密钥表（账号级）：NSArray<NSDictionary>（user/secret），连接时按当前连接的账号取
-#define IPATKeyAnyVpnAddTotp   @"IPAToolPanelAnyVpnAddTotp"  // 动作行：添加 TOTP 密钥
-#define IPATKeyAnyVpnDelTotp   @"IPAToolPanelAnyVpnDelTotp"  // 动作行：删除最后一条 TOTP 密钥
-#define IPATKeyAnyVpnCopyLog   @"IPAToolPanelAnyVpnCopyLog"  // 动作行：复制连接日志到剪贴板
 
 #define IPATKeyButtonFrame @"IPAToolPanelButtonFrame"  // 悬浮按钮位置，NSStringFromCGRect
 

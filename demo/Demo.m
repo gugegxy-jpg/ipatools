@@ -10,7 +10,6 @@
 //
 #import <UIKit/UIKit.h>
 #import <mach-o/dyld.h>
-#import "Browser.h"
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -86,110 +85,21 @@ static NSString *AppStateName(void) {
     return @"前台";
 }
 
-// ---------------------------------------------------------------- VPN 状态
-// AnyVpn.dylib 把连接配置写在自己的 NSUserDefaults 里（面板编辑后写入），
-// 这里只读不写，方便核对「到底配了什么、开关是什么状态」。
-
-static BOOL HasTweakNamed(NSString *name) {
-    uint32_t n = _dyld_image_count();
-    for (uint32_t i = 0; i < n; i++) {
-        const char *p = _dyld_get_image_name(i);
-        if (!p) continue;
-        NSString *path = [NSString stringWithUTF8String:p];
-        if ([path.lastPathComponent isEqualToString:name]) return YES;
-    }
-    return NO;
-}
-
-static NSString *VpnStateText(void) {
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    NSMutableString *s = [NSMutableString string];
-
-    BOOL loaded = HasTweakNamed(@"AnyVpn.dylib");
-    [s appendFormat:@"  AnyVpn.dylib : %@\n", loaded ? @"已加载 ✅" : @"未加载 ❌（注入失败？）"];
-
-    id on = [ud objectForKey:@"IPAToolPanelAnyVpnEnabled"];
-    [s appendFormat:@"  连接开关     : %@\n",
-        on ? ([on boolValue] ? @"开" : @"关") : @"关（未连接）"];
-    id noDTLS = [ud objectForKey:@"IPAToolPanelAnyVpnNoDTLS"];
-    [s appendFormat:@"  禁用 DTLS    : %@\n",
-        noDTLS ? ([noDTLS boolValue] ? @"是" : @"否") : @"否（默认）"];
-
-    // 有效性证据（AnyVpn 每秒镜像一次到 NSUserDefaults）
-    id statsObj = [ud objectForKey:@"IPAToolPanelAnyVpnStats"];
-    NSDictionary *st = [statsObj isKindOfClass:[NSDictionary class]] ? statsObj : nil;
-    if (st) {
-        unsigned long long up = [st[@"upBytes"] unsignedLongLongValue];
-        unsigned long long down = [st[@"downBytes"] unsignedLongLongValue];
-        NSString *probe = st[@"probe"] ?: @"";
-        NSString *tunIP = st[@"ip"] ?: @"";
-        NSString *tunDNS = st[@"dns"] ?: @"";
-        int mtu = [st[@"mtu"] intValue];
-        int conns = [st[@"tcpConns"] intValue] + [st[@"udpConns"] intValue];
-        unsigned long long v6 = [st[@"v6Bypass"] unsignedLongLongValue];
-        NSString *status = st[@"status"] ?: @"";
-        [s appendFormat:@"  隧道地址     : %@%@\n", tunIP.length ? tunIP : @"-",
-            mtu > 0 ? [NSString stringWithFormat:@"（MTU %d）", mtu] : @""];
-        [s appendFormat:@"  隧道 DNS     : %@\n", tunDNS.length ? tunDNS : @"-"];
-        [s appendFormat:@"  出口自检     : %@\n", probe.length ? probe : @"（无）"];
-        NSString *exitIP = st[@"exitIP"] ?: @"";
-        BOOL exitPriv = [st[@"exitPrivate"] boolValue];
-        if (exitIP.length) {
-            [s appendFormat:@"  出口地址     : %@%@\n", exitIP,
-                exitPriv ? @"（私网段：网关未 NAT，对端看到的就是这个内网地址）" : @""];
-        }
-        if (status.length) {
-            [s appendFormat:@"  连接状态     : %@\n", status];
-        }
-        [s appendFormat:@"  流量         : ↑%llu B ↓%llu B · %d 个连接\n", up, down, conns];
-        if (v6) {
-            [s appendFormat:@"  ⚠ IPv6 直连  : %llu 条（这些流量没进隧道）\n", v6];
-        }
-    } else {
-        [s appendString:@"  隧道状态     : 尚无统计（未连接或插件未运行）\n"];
-    }
-
-    id profs = [ud objectForKey:@"IPAToolPanelAnyVpnProfiles"];
-    NSArray *list = [profs isKindOfClass:[NSArray class]] ? profs : @[];
-    NSString *active = [ud stringForKey:@"IPAToolPanelAnyVpnActive"] ?: @"";
-    [s appendFormat:@"  连接数       : %lu\n", (unsigned long)list.count];
-
-    if (list.count == 0) {
-        NSDictionary *cfg = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"IPAToolAnyVpn"];
-        NSString *srv = [cfg[@"Server"] isKindOfClass:[NSString class]] ? cfg[@"Server"] : @"";
-        NSString *usr = [cfg[@"User"] isKindOfClass:[NSString class]] ? cfg[@"User"] : @"";
-        [s appendFormat:@"  初始配置     : 服务器 %@ / 账号 %@\n",
-            srv.length ? srv : @"（空）", usr.length ? usr : @"（空）"];
-        [s appendString:@"  → 去右侧悬浮窗的「VPN 隧道」分组点「＋ 添加连接」填网关信息\n"];
-    } else {
-        for (NSUInteger i = 0; i < list.count; i++) {
-            NSDictionary *p = list[i];
-            if (![p isKindOfClass:[NSDictionary class]]) continue;
-            NSString *pid = p[@"id"] ?: @"";
-            BOOL cur = active.length ? [active isEqualToString:pid] : (i == 0);
-            [s appendFormat:@"  %@ %@  %@  账号 %@\n", cur ? @"▶" : @" ",
-                p[@"name"] ?: p[@"server"] ?: @"?",
-                p[@"server"] ?: @"-", p[@"user"] ?: @"-"];
-        }
-    }
-    return s;
-}
-
-/// Documents/ipatool.log 尾部：AnyVpn 与控制面板共用这一个日志文件
-static NSString *VpnLogTail(NSUInteger n) {
+/// Documents/ipatool.log 尾部：面板与各注入功能共用这一个日志文件
+static NSString *LogTail(NSUInteger n) {
     NSString *path = [DocsDir() stringByAppendingPathComponent:@"ipatool.log"];
     NSString *text = [NSString stringWithContentsOfFile:path
                                                 encoding:NSUTF8StringEncoding error:nil];
-    if (!text.length) return @"  （暂无日志：面板与 AnyVpn 的日志都写在这里）";
+    if (!text.length) return @"  （暂无日志）";
     NSArray *lines = [text componentsSeparatedByString:@"\n"];
     if (lines.count > n) {
         lines = [lines subarrayWithRange:NSMakeRange(lines.count - n, n)];
     }
-    NSMutableString *s = [NSMutableString string];
+    NSMutableString *out = [NSMutableString string];
     for (NSString *l in lines) {
-        if (l.length) [s appendFormat:@"  %@\n", l];
+        if (l.length) [out appendFormat:@"  %@\n", l];
     }
-    return s.length ? s : @"  （暂无日志）";
+    return out.length ? out : @"  （暂无日志）";
 }
 
 static void Refresh(void) {
@@ -207,23 +117,20 @@ static void Refresh(void) {
     [t appendFormat:@"  IPAToolControl: %@\n", info[@"IPAToolControl"] ?: @"（无）"];
     [t appendFormat:@"  UIBackgroundModes: %@\n\n", bg];
 
-    [t appendString:@"【3】VPN 状态（AnyVpn.dylib）\n"];
-    [t appendFormat:@"%@\n", VpnStateText()];
-
-    [t appendString:@"【4】运行状态\n"];
+    [t appendString:@"【3】运行状态\n"];
     [t appendFormat:@"  当前状态      : %@\n", AppStateName()];
     [t appendFormat:@"  心跳          : 前台 %d 次 / 后台 %d 次\n", gTick - gBgTick, gBgTick];
     [t appendFormat:@"  进入后台次数  : %d 次，累计后台 %.0f 秒（上次 %.0f 秒）\n\n", gBgCount, gTotalBg, gLastBg];
 
-    [t appendFormat:@"【5】Documents（「文件」App 与面板导入都落这里）\n%@\n", ListDocs()];
+    [t appendFormat:@"【4】Documents（「文件」App 与面板导入都落这里）\n%@\n", ListDocs()];
 
-    [t appendString:@"【6】事件日志\n"];
+    [t appendString:@"【5】事件日志\n"];
     for (NSString *e in gEvents) {
         [t appendFormat:@"  %@\n", e];
     }
 
-    [t appendString:@"\n【7】VPN 连接日志（Documents/ipatool.log 尾部 40 行）\n"];
-    [t appendFormat:@"%@\n", VpnLogTail(40)];
+    [t appendString:@"\n【5】面板日志（Documents/ipatool.log 尾部 40 行）\n"];
+    [t appendFormat:@"%@\n", LogTail(40)];
 
     gText.text = t;
 }
@@ -257,23 +164,16 @@ static void Refresh(void) {
     [clearBtn setTitle:@"清空日志" forState:UIControlStateNormal];
     [clearBtn addTarget:self action:@selector(clearLog) forControlEvents:UIControlEventTouchUpInside];
 
-    UIButton *copyVpnBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    [copyVpnBtn setTitle:@"复制 VPN 日志" forState:UIControlStateNormal];
-    [copyVpnBtn addTarget:self action:@selector(copyVpnLog) forControlEvents:UIControlEventTouchUpInside];
+    UIButton *copyLogBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [copyLogBtn setTitle:@"复制日志" forState:UIControlStateNormal];
+    [copyLogBtn addTarget:self action:@selector(copyLog) forControlEvents:UIControlEventTouchUpInside];
 
-    UIButton *browserBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    [browserBtn setTitle:@"内网浏览器（验证隧道是否真的在跑流量）" forState:UIControlStateNormal];
-    [browserBtn addTarget:self action:@selector(openBrowser) forControlEvents:UIControlEventTouchUpInside];
 
-    UIStackView *bar = [[UIStackView alloc] initWithArrangedSubviews:@[writeBtn, copyVpnBtn, clearBtn]];
+    UIStackView *bar = [[UIStackView alloc] initWithArrangedSubviews:@[writeBtn, copyLogBtn, clearBtn]];
     bar.axis = UILayoutConstraintAxisHorizontal;
     bar.distribution = UIStackViewDistributionFillEqually;
 
-    UIStackView *bar2 = [[UIStackView alloc] initWithArrangedSubviews:@[browserBtn]];
-    bar2.axis = UILayoutConstraintAxisHorizontal;
-    bar2.distribution = UIStackViewDistributionFillEqually;
-
-    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[bar, bar2]];
+    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[bar]];
     stack.axis = UILayoutConstraintAxisVertical;
     stack.spacing = 6.0;
     stack.translatesAutoresizingMaskIntoConstraints = NO;
@@ -285,21 +185,11 @@ static void Refresh(void) {
         [stack.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-8.0],
         [stack.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-8.0],
         [bar.heightAnchor constraintEqualToConstant:40.0],
-        [bar2.heightAnchor constraintEqualToConstant:38.0],
         [gText.topAnchor constraintEqualToAnchor:safe.topAnchor constant:8.0],
         [gText.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:8.0],
         [gText.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-8.0],
         [gText.bottomAnchor constraintEqualToAnchor:stack.topAnchor constant:-8.0],
     ]];
-}
-
-/// 简易内网浏览器：裸 socket 请求，验证隧道是否真的在跑流量
-- (void)openBrowser {
-    IPATBrowserVC *vc = [[IPATBrowserVC alloc] init];
-    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
-    nav.modalPresentationStyle = UIModalPresentationFullScreen;
-    [self presentViewController:nav animated:YES completion:nil];
-    IPATLog(@"打开内网浏览器");
 }
 
 - (void)writeTestFile {
@@ -317,13 +207,13 @@ static void Refresh(void) {
     Refresh();
 }
 
-/// 把 AnyVpn / 面板的连接日志整份复制到剪贴板，直接粘贴发回来即可
-- (void)copyVpnLog {
+/// 把面板日志整份复制到剪贴板，直接粘贴发回来即可
+- (void)copyLog {
     NSString *path = [DocsDir() stringByAppendingPathComponent:@"ipatool.log"];
     NSString *text = [NSString stringWithContentsOfFile:path
                                                 encoding:NSUTF8StringEncoding error:nil] ?: @"";
     UIPasteboard.generalPasteboard.string = text;
-    IPATLog([NSString stringWithFormat:@"已复制 VPN 日志 %lu 字节", (unsigned long)text.length]);
+    IPATLog([NSString stringWithFormat:@"已复制日志 %lu 字节", (unsigned long)text.length]);
     Refresh();
 }
 
