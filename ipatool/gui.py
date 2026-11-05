@@ -246,6 +246,15 @@ class IpatoolGui:
         self.install_button = None               # 安装到设备按钮，运行时单独禁用
         self.custom_dylibs: list[str] = []
         self.action_buttons: list[ttk.Button] = []
+        # 「改 ID / 名称」这两个框当前对应的是哪个包：换包后要跟着刷新，
+        # 否则看着像已经改好，实际打包出来还是上一个包的标识。
+        self._identity_pkg = ""
+        # 上一次读到的包的 ID / 名称：用来判断框里现在的值是「上一个包的残留」
+        # 还是「用户自己改过的」——只有残留才该被新包的信息顶掉。
+        self._identity_seen: tuple[str, str] = ("", "")
+        # 最近一次跑的是哪类产物任务（modify/inject/sign）：决定「输出留空时」
+        # 默认文件名是 -modified / -injected / -signed（和 cli._output_path 一致）。
+        self._last_cmd = ""
 
         self._configure_style()
         self._make_vars()
@@ -515,6 +524,9 @@ class IpatoolGui:
         不遍历整个包，大包也秒开，所以恢复「选完即读」；想手动读也可在
         「IPA 信息」页点「读取信息」。"""
         self.v_input.set(path)
+        # 换包了：清掉「这些 ID/名称是从哪个包读来的」标记，
+        # 下一次读到新包的信息时强制覆盖那两个框（见 _render_info）
+        self._identity_pkg = ""
         self._append(f"[输入] {path}（自动读取信息…）\n")
         if "info" not in self._running_tasks:
             self._load_info()
@@ -1422,6 +1434,10 @@ class IpatoolGui:
                 messagebox.showinfo("请稍候", f"「{task}」任务正在进行，请等它结束。")
             return
         self._running_tasks.add(task)
+        if task in ("inject", "modify", "sign"):
+            # 记下这次是哪类任务：「输出」留空时默认文件名靠它判断
+            # （inject → -injected.ipa，sign → -signed.ipa）
+            self._last_cmd = task
         self._apply_busy_state()
         self._set_status("运行中…", "run")
         if not quiet:
@@ -1478,9 +1494,11 @@ class IpatoolGui:
                 messagebox.showinfo("完成", "安装完成。")
                 return
             if task in ("inject", "modify", "sign"):
-                # 产物刚生成：把路径自动填进「安装到设备」的「安装包」栏，
+                # 产物刚生成：把「本次产物」的路径自动填进「安装到设备」的「安装包」栏，
                 # 顺手刷新摘要，签完名下一秒就能直接点「安装到设备」，不用手动选包。
-                self.v_install_ipa.set(self._install_target())
+                # 注意这里不能用 _install_target()：它优先返回「安装包」栏里的旧值，
+                # 签完名会把上一个包又填回去（用户反馈：地址栏一直停在旧包上）。
+                self.v_install_ipa.set(self._produced_path(task))
                 self._refresh_install_summary()
                 messagebox.showinfo("完成", "处理完成。")
             return
@@ -1586,11 +1604,31 @@ class IpatoolGui:
             f"（内嵌 bundle {len(nested)}，已注入 dylib {len(injected)}）\n"
         )
 
-        # 顺手把当前值填进「改 ID / 名称」页，少打一次字
-        if data.get("bundle_id") and not self.v_bundle_id.get().strip():
-            self.v_bundle_id.set(data["bundle_id"])
-        if data.get("display_name") and not self.v_name.get().strip():
-            self.v_name.set(data["display_name"])
+        # 顺手把当前值填进「改 ID / 名称」页，少打一次字。
+        #
+        # 换包后必须刷新：不然那两栏还留着上一个包的 ID / 名称，看着像已经改好了，
+        # 实际打包出来的还是旧标识（用户踩过的坑）。
+        # 但也不能无脑覆盖——用户自己填过的值（包括上次保存的设置）要留着，
+        # 所以只刷新「还等于上一个包的值」的那一栏（= 没被改过的残留值）。
+        src = _txt(data.get("file"))
+        src = os.path.normcase(os.path.abspath(src)) if src else ""
+        bid = _txt(data.get("bundle_id"))
+        nm = _txt(data.get("display_name"))
+        cur_id = self.v_bundle_id.get().strip()
+        cur_nm = self.v_name.get().strip()
+        if src and src != self._identity_pkg:
+            if bid and (not cur_id or cur_id == self._identity_seen[0]):
+                self.v_bundle_id.set(bid)
+            if nm and (not cur_nm or cur_nm == self._identity_seen[1]):
+                self.v_name.set(nm)
+            self._append("[改 ID/名称] 已按新包刷新\n")
+        else:
+            if bid and not cur_id:
+                self.v_bundle_id.set(bid)
+            if nm and not cur_nm:
+                self.v_name.set(nm)
+        self._identity_pkg = src
+        self._identity_seen = (bid, nm)
 
     # ------------------------------------------------------------------ #
     # 组装 argv
@@ -1762,20 +1800,37 @@ class IpatoolGui:
             return self._device_keys[self._device_texts.index(text)]
         return ""
 
-    def _default_output_path(self) -> str:
-        """「输出」留空时命令行实际会生成的路径（规则和 cli._output_path 保持一致）。"""
+    def _default_output_path(self, cmd: str | None = None) -> str:
+        """「输出」留空时命令行实际会生成的路径（规则和 cli._output_path 保持一致：
+        inject → -injected.ipa，sign → -signed.ipa，其它 → -modified.ipa）。
+
+        之前是按「有没有 dylib / 有没有填 ID」猜后缀，跟 CLI 实际规则对不上，
+        会算出 CLI 根本不会生成的文件名（摘要行显示的文件不存在）。
+        """
         src = self.v_input.get().strip()
         if not src:
             return ""
         src = os.path.abspath(src)
         stem = os.path.splitext(os.path.basename(os.path.normpath(src)))[0]
-        if self.custom_dylibs:
-            suffix = "-injected.ipa"
-        elif self.v_bundle_id.get().strip() or self.v_name.get().strip():
-            suffix = "-modified.ipa"
-        else:
-            suffix = "-signed.ipa"
+        cmd = cmd or self._last_cmd or ""
+        suffix = {"inject": "-injected.ipa", "sign": "-signed.ipa"}.get(cmd, "-modified.ipa")
         return os.path.join(os.path.dirname(src), f"{stem}{suffix}")
+
+    def _produced_path(self, task: str) -> str:
+        """本次任务真实产出的包路径。
+
+        和 _install_target() 的区别：这里**不看「安装包」栏里的旧值**，
+        只按「这次跑的是什么」算——签完名就应该是新签出来的那个包，
+        而不是上一次留在栏里的旧包。
+        """
+        if self.v_inplace.get():
+            # 就地覆盖：CLI 把结果写回原文件，产物就是输入包本身
+            src = self.v_input.get().strip()
+            return os.path.abspath(src) if src else ""
+        out = self.v_output.get().strip()
+        if out:
+            return os.path.abspath(out)
+        return self._default_output_path(task)
 
     def _install_target(self) -> str:
         """装 / 交付哪个包：填了「安装包」就用它；留空 = 输出（就地覆盖时 = 输入）。"""
