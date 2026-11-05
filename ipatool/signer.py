@@ -512,45 +512,104 @@ def zsign_dir(
     bundle_id: str | None = None,
     log=print,
 ) -> None:
-    """用 zsign 直接签「已解包的目录」（root/Payload/xxx.app），就地产出签好的 App。
+    """用 zsign 直接签「已解包的目录」里的各个 bundle，就地产出签好的 App。
 
-    比 zsign_ipa 稳：不用把 IPA 再交给 zsign 解压（它那套内置解压在部分环境下会漏掉
-    app 目录下的 Info.plist / 主程序，报 "Can't find app's Info.plist!"），
-    而且省掉一次「打包 → 解包 → 打包」的往返。签完由调用方 archive() 打包。
+    两个关键点（都是踩过的坑）：
+
+    1. **传 .app 目录本身，不要传含 Payload 的上级目录**。传上级目录时 zsign 会走
+       「找 Payload/*.app」的分支，而它那套搬动/复制的逻辑在这台机器上会把 app
+       目录里的 Info.plist 弄丢，随后报 "Can't find app's Info.plist!"。
+       直接签 .app 目录是 zsign_one 早就在用的稳定用法。
+    2. **不要传 -o**（那是「签 IPA」的输出路径，签目录时传了 zsign 会去找 Payload/ 目录）。
+
+    签完由调用方 archive() 打包成最终 IPA。
     """
     if not p12:
         raise SignError("zsign 后端需要 --p12 证书，通常还要配合 --provision 描述文件")
 
-    payload = os.path.join(root, "Payload")
-    apps = []
-    if os.path.isdir(payload):
-        for name in sorted(os.listdir(payload)):
-            if name.endswith(".app") and os.path.isdir(os.path.join(payload, name)):
-                apps.append(os.path.join(payload, name))
-    if not apps:
+    bundles = _collect_bundles(root)
+    if not bundles:
         raise SignError(f"目录里找不到 Payload/*.app：{root}")
-    for app_dir in apps:
-        info = os.path.join(app_dir, "Info.plist")
-        if not os.path.isfile(info):
-            raise SignError(f"App 目录缺少 Info.plist：{info}")
 
     cmd, tmp = _zsign_prepare(p12, p12_password, provision, entitlements, bundle_id, log=log)
-    # 目录模式：zsign 自己去 root/Payload/ 里找 .app；不要传 -o（那是签 IPA 用的输出路径）
-    cmd += ["-z", "9", root]
-
     try:
-        r = subprocess.run(cmd, capture_output=True, check=False)
+        for bundle in bundles:
+            info = os.path.join(bundle, "Info.plist")
+            if not os.path.isfile(info):
+                raise SignError(f"bundle 缺少 Info.plist：{info}")
+            # 备份 Info.plist：zsign 偶尔会把 app 目录里的文件弄丢，丢了就补回去
+            with open(info, "rb") as fh:
+                backup = fh.read()
+            # 旧签名残留先清掉：zsign 要重签主程序与 Frameworks 里的 dylib，
+            # 留着上一轮的 _CodeSignature 只会让它以为已经签过。
+            stale = os.path.join(bundle, "_CodeSignature")
+            if os.path.isdir(stale):
+                shutil.rmtree(stale, ignore_errors=True)
+            run = subprocess.run(cmd + ["-z", "9", bundle], capture_output=True, check=False)
+            out = (run.stderr.decode("utf-8", "replace").strip()
+                   or run.stdout.decode("utf-8", "replace").strip())
+            if run.returncode != 0:
+                raise SignError("zsign 失败：\n" + out + "\n" + _bundle_snapshot(bundle))
+            if not os.path.isfile(info):
+                with open(info, "wb") as fh:
+                    fh.write(backup)
+                raise SignError(
+                    f"zsign 把 {os.path.basename(bundle)}/Info.plist 弄丢了（已自动补回），"
+                    "请把上面的 zsign 输出发回来。")
+            log(f"  zsign 已签 {os.path.relpath(bundle, root)}")
     finally:
         if tmp and os.path.isfile(tmp):
             try:
                 os.remove(tmp)
             except OSError:
                 pass
-    if r.returncode != 0:
-        out = (r.stderr.decode("utf-8", "replace").strip()
-               or r.stdout.decode("utf-8", "replace").strip())
-        raise SignError("zsign 失败：\n" + out)
     log("  zsign 完成（目录模式，已就地签名）")
+
+
+def _bundle_snapshot(bundle: str) -> str:
+    """bundle 目录的现场快照：zsign 报「找不到 Info.plist」时用来判断文件去哪了。"""
+    lines = ["", "[现场快照] " + bundle]
+    try:
+        for name in sorted(os.listdir(bundle)):
+            full = os.path.join(bundle, name)
+            if os.path.isdir(full):
+                try:
+                    inner = sorted(os.listdir(full))
+                except OSError:
+                    inner = []
+                lines.append(f"  {name}/  ({len(inner)} 项) {inner[:8]}")
+            else:
+                try:
+                    size = os.path.getsize(full)
+                except OSError:
+                    size = -1
+                lines.append(f"  {name}  {size} bytes")
+    except OSError as e:
+        lines.append(f"  读取失败: {e}")
+    return "\n".join(lines)
+
+
+def _collect_bundles(root: str) -> list[str]:
+    """找出要签的 bundle：Payload 下的 .app，以及其中的 PlugIns/*.appex。
+
+    appex 要单独签（它自己也是要签名的 bundle），并且排在主 App 之前。
+    """
+    payload = os.path.join(root, "Payload")
+    found: list[str] = []
+    if not os.path.isdir(payload):
+        return found
+    for name in sorted(os.listdir(payload)):
+        app = os.path.join(payload, name)
+        if not (name.endswith(".app") and os.path.isdir(app)):
+            continue
+        plugins = os.path.join(app, "PlugIns")
+        if os.path.isdir(plugins):
+            for pname in sorted(os.listdir(plugins)):
+                ppath = os.path.join(plugins, pname)
+                if pname.endswith(".appex") and os.path.isdir(ppath):
+                    found.append(ppath)
+        found.append(app)
+    return found
 
 
 def _write_minimal_plist(app_dir: str, exe_name: str) -> None:

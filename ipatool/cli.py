@@ -713,20 +713,44 @@ def _package_and_sign(args, root: str, payload: str, app, workdir: str,
             )
             _, archive_seconds = _timed(ipa_mod.archive, root, out, level)
         elif backend == "zsign":
-            # 让 zsign 直接签「已解包的目录」（root/Payload/xxx.app），不要把 IPA
-            # 再交给它解压：zsign 内置的解压在部分环境下会把 app 目录下的
-            # Info.plist、主程序漏掉，报 "Can't find app's Info.plist!"。
-            # 顺带省掉一次「打包 → 解包 → 打包」。
-            _, sign_seconds = _timed(
-                signer.zsign_dir,
-                root,
-                p12=ident.p12_path,
-                p12_password=ident.p12_password,
-                provision=args.provision,
-                entitlements=args.entitlements,
-                bundle_id=zsign_bundle_id,
-                log=lambda m: print(m) if args.verbose else None,
-            )
+            # 让 zsign 直接签「已解包的 .app 目录」，不要把 IPA 再交给它解压：
+            # zsign 内置的解压/搬动逻辑在部分环境下会把 app 目录下的 Info.plist、
+            # 主程序漏掉，报 "Can't find app's Info.plist!"。顺带省一次打包/解包往返。
+            #
+            # 先给解包目录留个备份：zsign 失败时会把目录搞坏（文件被挪走/删掉），
+            # 回滚后重试，别用「重新解包」——那会把注入的改动全丢掉。
+            backup = os.path.join(workdir, "_root_backup")
+            shutil.rmtree(backup, ignore_errors=True)
+            shutil.copytree(root, backup, dirs_exist_ok=True)
+            try:
+                _, sign_seconds = _timed(
+                    signer.zsign_dir,
+                    root,
+                    p12=ident.p12_path,
+                    p12_password=ident.p12_password,
+                    provision=args.provision,
+                    entitlements=args.entitlements,
+                    bundle_id=zsign_bundle_id,
+                    log=lambda m: print(m) if args.verbose else None,
+                )
+            except signer.SignError as e:
+                if "Can't find app's Info.plist" not in str(e):
+                    raise
+                print("  zsign 说找不到 Info.plist：已回滚解包目录，重试一次 …")
+                shutil.rmtree(root, ignore_errors=True)
+                shutil.copytree(backup, root, dirs_exist_ok=True)
+                _, sign_seconds = _timed(
+                    signer.zsign_dir,
+                    root,
+                    p12=ident.p12_path,
+                    p12_password=ident.p12_password,
+                    provision=args.provision,
+                    entitlements=args.entitlements,
+                    bundle_id=zsign_bundle_id,
+                    log=lambda m: print(m) if args.verbose else None,
+                )
+            finally:
+                shutil.rmtree(backup, ignore_errors=True)
             _, archive_seconds = _timed(ipa_mod.archive, root, out, level)
             # zsign 目录模式可能留下自己的缓存目录，别打进最终 IPA
             for junk in ("zsign_cache", ".zsign_cache"):
