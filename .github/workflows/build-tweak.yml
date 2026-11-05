@@ -22,6 +22,9 @@ on:
     paths:
       - "tweak/**"
       - "ipatool/**"
+      # demo 也在这个 workflow 里编译（Build demo IPA + 注入），改了它同样要重跑，
+      # 否则 demo 的改动永远等不到构建结果
+      - "demo/**"
       - "requirements.txt"
       - ".github/workflows/build-tweak.yml"
 
