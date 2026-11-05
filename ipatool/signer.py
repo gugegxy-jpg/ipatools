@@ -385,20 +385,19 @@ def _ipa_bundle_id(in_ipa: str) -> str | None:
     return None
 
 
-def zsign_ipa(
-    in_ipa: str,
-    out_ipa: str,
-    p12: str | None = None,
-    p12_password: str | None = None,
-    provision: str | None = None,
-    entitlements: str | None = None,
-    bundle_id: str | None = None,
+def _zsign_prepare(
+    p12: str | None,
+    p12_password: str | None,
+    provision: str | None,
+    entitlements: str | None,
+    bundle_id: str | None,
+    ipa_for_bundle_id: str | None = None,
     log=print,
-) -> None:
-    """用 zsign 对 IPA 文件重签名（Windows / Linux / macOS 通用）。"""
-    if not p12:
-        raise SignError("zsign 后端需要 --p12 证书，通常还要配合 --provision 描述文件")
+):
+    """拼 zsign 命令行（不含输入/输出），并把 entitlements 与描述文件合并好。
 
+    返回 (cmd, tmp_entitlements_path)；tmp 文件由调用方负责删。
+    """
     binary = zsign_binary()
     if not binary:
         raise SignError("找不到 zsign。\n" + zsign_report())
@@ -434,7 +433,8 @@ def zsign_ipa(
             # 「描述文件 vs embedded」的校验（越狱+AppSync 之类），工具这边只需保证
             # Info.plist 与 embedded entitlements 自洽即可。通配符描述文件
             # （application-identifier 形如 TEAMID.*）保持通配，不拼成 TEAMID.*.xxx。
-            eff_bid = bundle_id or _ipa_bundle_id(in_ipa)
+            eff_bid = bundle_id or (_ipa_bundle_id(ipa_for_bundle_id)
+                                    if ipa_for_bundle_id else None)
             if eff_bid:
                 app_id = base["application-identifier"]
                 if app_id.endswith(".*"):
@@ -462,6 +462,30 @@ def zsign_ipa(
         cmd += ["-e", ent_file]
     if bundle_id:
         cmd += ["-b", bundle_id]
+    return cmd, tmp
+
+
+def zsign_ipa(
+    in_ipa: str,
+    out_ipa: str,
+    p12: str | None = None,
+    p12_password: str | None = None,
+    provision: str | None = None,
+    entitlements: str | None = None,
+    bundle_id: str | None = None,
+    log=print,
+) -> None:
+    """用 zsign 对 IPA 文件重签名（Windows / Linux / macOS 通用）。
+
+    ⚠️ 这条路径让 zsign 自己解压 IPA。zsign 内置的 minizip 解压在部分环境下会
+    把 app 目录下的文件（Info.plist、主程序）漏掉，随后报
+    「Can't find app's Info.plist!」。优先用 zsign_dir()。
+    """
+    if not p12:
+        raise SignError("zsign 后端需要 --p12 证书，通常还要配合 --provision 描述文件")
+
+    cmd, tmp = _zsign_prepare(p12, p12_password, provision, entitlements, bundle_id,
+                               ipa_for_bundle_id=in_ipa, log=log)
     cmd += ["-z", "9", "-o", out_ipa, in_ipa]
 
     try:
@@ -477,6 +501,56 @@ def zsign_ipa(
             "zsign 失败：\n" + (r.stderr.decode("utf-8", "replace").strip() or r.stdout.decode("utf-8", "replace").strip())
         )
     log(f"  zsign 完成 -> {out_ipa}")
+
+
+def zsign_dir(
+    root: str,
+    p12: str | None = None,
+    p12_password: str | None = None,
+    provision: str | None = None,
+    entitlements: str | None = None,
+    bundle_id: str | None = None,
+    log=print,
+) -> None:
+    """用 zsign 直接签「已解包的目录」（root/Payload/xxx.app），就地产出签好的 App。
+
+    比 zsign_ipa 稳：不用把 IPA 再交给 zsign 解压（它那套内置解压在部分环境下会漏掉
+    app 目录下的 Info.plist / 主程序，报 "Can't find app's Info.plist!"），
+    而且省掉一次「打包 → 解包 → 打包」的往返。签完由调用方 archive() 打包。
+    """
+    if not p12:
+        raise SignError("zsign 后端需要 --p12 证书，通常还要配合 --provision 描述文件")
+
+    payload = os.path.join(root, "Payload")
+    apps = []
+    if os.path.isdir(payload):
+        for name in sorted(os.listdir(payload)):
+            if name.endswith(".app") and os.path.isdir(os.path.join(payload, name)):
+                apps.append(os.path.join(payload, name))
+    if not apps:
+        raise SignError(f"目录里找不到 Payload/*.app：{root}")
+    for app_dir in apps:
+        info = os.path.join(app_dir, "Info.plist")
+        if not os.path.isfile(info):
+            raise SignError(f"App 目录缺少 Info.plist：{info}")
+
+    cmd, tmp = _zsign_prepare(p12, p12_password, provision, entitlements, bundle_id, log=log)
+    # 目录模式：zsign 自己去 root/Payload/ 里找 .app；不要传 -o（那是签 IPA 用的输出路径）
+    cmd += ["-z", "9", root]
+
+    try:
+        r = subprocess.run(cmd, capture_output=True, check=False)
+    finally:
+        if tmp and os.path.isfile(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    if r.returncode != 0:
+        out = (r.stderr.decode("utf-8", "replace").strip()
+               or r.stdout.decode("utf-8", "replace").strip())
+        raise SignError("zsign 失败：\n" + out)
+    log("  zsign 完成（目录模式，已就地签名）")
 
 
 def _write_minimal_plist(app_dir: str, exe_name: str) -> None:

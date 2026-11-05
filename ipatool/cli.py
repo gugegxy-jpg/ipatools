@@ -713,13 +713,13 @@ def _package_and_sign(args, root: str, payload: str, app, workdir: str,
             )
             _, archive_seconds = _timed(ipa_mod.archive, root, out, level)
         elif backend == "zsign":
-            unsigned = os.path.join(workdir, "unsigned.ipa")
-            # 中间包还要被 zsign 重新打一次，所以这里一律不压缩，省一遍 CPU
-            _, archive_seconds = _timed(ipa_mod.archive, root, unsigned, 0)
+            # 让 zsign 直接签「已解包的目录」（root/Payload/xxx.app），不要把 IPA
+            # 再交给它解压：zsign 内置的解压在部分环境下会把 app 目录下的
+            # Info.plist、主程序漏掉，报 "Can't find app's Info.plist!"。
+            # 顺带省掉一次「打包 → 解包 → 打包」。
             _, sign_seconds = _timed(
-                signer.zsign_ipa,
-                unsigned,
-                out,
+                signer.zsign_dir,
+                root,
                 p12=ident.p12_path,
                 p12_password=ident.p12_password,
                 provision=args.provision,
@@ -727,6 +727,12 @@ def _package_and_sign(args, root: str, payload: str, app, workdir: str,
                 bundle_id=zsign_bundle_id,
                 log=lambda m: print(m) if args.verbose else None,
             )
+            _, archive_seconds = _timed(ipa_mod.archive, root, out, level)
+            # zsign 目录模式可能留下自己的缓存目录，别打进最终 IPA
+            for junk in ("zsign_cache", ".zsign_cache"):
+                jd = os.path.join(root, junk)
+                if os.path.isdir(jd):
+                    shutil.rmtree(jd, ignore_errors=True)
         else:
             _, archive_seconds = _timed(ipa_mod.archive, root, out, level)
             # 显式 --sign none 是用户自己的选择，上面也解释过原因了，都别再说「没有签名工具」
@@ -737,6 +743,19 @@ def _package_and_sign(args, root: str, payload: str, app, workdir: str,
         print(f"阶段耗时    : 打包 {archive_seconds:.1f}s")
     else:
         print(f"阶段耗时    : 签名 {sign_seconds:.1f}s / 打包 {archive_seconds:.1f}s")
+
+    # 产物自检：包里必须有 Payload/<app>/Info.plist。缺了就是解包/签名环节把文件
+    # 弄丢了（zsign 早期就会报 "Can't find app's Info.plist!"），这里提前说清楚。
+    if os.path.isfile(out):
+        try:
+            with zipfile.ZipFile(out) as zf:
+                names = zf.namelist()
+            if not any(re.match(r"Payload/[^/]+\.app/Info\.plist$", n) for n in names):
+                print("错误：产物里没有 Payload/<App>.app/Info.plist，签名结果不可用", file=sys.stderr)
+                return 1
+        except zipfile.BadZipFile as e:
+            print(f"错误：产物不是有效的 IPA（{e}）", file=sys.stderr)
+            return 1
 
     if args.in_place:
         shutil.move(out, os.path.abspath(args.input))
