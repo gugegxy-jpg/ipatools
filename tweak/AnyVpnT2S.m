@@ -121,6 +121,8 @@ static pthread_t g_thread;
 typedef struct TCPSession {
     int fd;                          // 已 accept 的宿主侧 socket（非阻塞）
     struct tcp_pcb *pcb;             // err 回调后置 NULL
+    uint32_t dip;                    // 隧道内目标 IP（主机序）：ICMP 差错匹配用
+    uint16_t dport;                  // 隧道内目标端口（主机序）
     uint8_t *buf;                    // 目的地 -> 宿主
     size_t len, cap;
     size_t pendingRecv;              // 已收未确认给对端的字节数
@@ -258,6 +260,55 @@ static err_t t2s_netif_init(struct netif *nif) {
     return ERR_OK;
 }
 
+static void t2s_tcp_destroy(TCPSession *s);
+
+/// ICMP 差错（目标不可达 / 端口不可达 / 超时）→ 立刻掐掉对应的 TCP 会话。
+///
+/// 为什么必须自己做：lwIP 即使编了 LWIP_ICMP=1，也只把 ICMP 用于地址变更通知，
+/// 不会把差错交给 socket。结果就是目标明明不可达，lwIP 还在按 SYN 重传策略重试
+/// （实测 192.168.123.1:80 不可达 → 重传 6 次、白等 8 秒超时）。
+/// 这里解析 ICMP 里封装的原始 TCP 头，匹配上就直接 abort，并用 RST 关宿主侧
+/// socket，让 App 立刻拿到 ECONNRESET 而不是干等。
+static void t2s_handle_icmp(const uint8_t *pkt, size_t n) {
+    size_t ihl = (size_t)(pkt[0] & 0x0F) * 4;
+    if (ihl + 8 + 20 > n) return;
+    uint8_t type = pkt[ihl];
+    uint8_t code = pkt[ihl + 1];
+    if (type != 3 && type != 11 && type != 12) return;   // 不可达 / 超时 / 参数错
+
+    const uint8_t *orig = pkt + ihl + 8;                 // 里面封装的原始 IP 头
+    size_t oihl = (size_t)(orig[0] & 0x0F) * 4;
+    if (oihl + 20 > n - (ihl + 8)) return;
+    if (orig[9] != 6) return;                            // 只处理内层是 TCP 的
+    uint32_t oSrc = ((uint32_t)orig[12] << 24) | ((uint32_t)orig[13] << 16) |
+                    ((uint32_t)orig[14] << 8) | orig[15];
+    uint16_t oDport = (uint16_t)((orig[oihl + 2] << 8) | orig[oihl + 3]);
+
+    TCPSession *s = g_tcpSess;
+    while (s) {
+        TCPSession *next = s->next;
+        if (s->dport == oDport && s->dip == oSrc) {
+            const char *reason = (type == 3)
+                ? (code == 0 ? "网络不可达" : code == 1 ? "主机不可达" :
+                   code == 3 ? "端口不可达" : "目的不可达")
+                : (type == 11 ? "超时" : "参数错误");
+            T2SLog(@"ICMP %u/%u（%s）：目标 %u.%u.%u.%u:%u 不可达 → 断开该连接",
+                   type, code, reason,
+                   (oSrc >> 24) & 0xFF, (oSrc >> 16) & 0xFF,
+                   (oSrc >> 8) & 0xFF, oSrc & 0xFF, oDport);
+            if (s->fd >= 0) {
+                // SO_LINGER(1,0)：close 时发 RST，宿主侧 socket 立刻收到
+                // ECONNRESET，而不是「连接莫名结束」
+                struct linger lg = {1, 0};
+                setsockopt(s->fd, SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+            }
+            t2s_tcp_destroy(s);
+            return;
+        }
+        s = next;
+    }
+}
+
 static void t2s_feed_lwip(void) {
     static uint8_t pkt[65535];
     // g_ocFd 是 AF_UNIX SOCK_DGRAM：每次 read 恰好取出一个完整 IP 包（不会粘包/
@@ -306,6 +357,7 @@ static void t2s_feed_lwip(void) {
         }
         g_statInPkts++;
         g_statInBytes += (unsigned long long)n;
+        if (pkt[9] == 1) t2s_handle_icmp(pkt, (size_t)n);   // ICMP：不可达要立刻断
         struct pbuf *p = pbuf_alloc(PBUF_RAW, (u16_t)n, PBUF_RAM);
         if (!p) continue;
         pbuf_take(p, pkt, (u16_t)n);
@@ -431,6 +483,8 @@ static void t2s_tcp_accept(int newfd) {
         return;
     }
     s->pcb = pcb;
+    s->dip = dip;              // 主机序：ICMP 不可达时按目标 IP+端口匹配会话
+    s->dport = dport;
     // 诊断：记录游戏接线目标（dip/dport 已是主机序，可直接点分打印）
     static int acceptLogs = 0;
     if (acceptLogs < 5) {

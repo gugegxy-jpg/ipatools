@@ -254,7 +254,9 @@ static int IPATConnect(const char *host, int port, NSString **err) {
 }
 
 /// 明文 HTTP GET（按 Content-Length 收满，收不到就靠超时收尾）
-static NSString *IPATHttpGet(int fd, NSString *host, NSString *path, unsigned long long *bytes) {
+static NSString *IPATHttpGet(int fd, NSString *host, NSString *path,
+                              unsigned long long *bytes, int *outErr) {
+    if (outErr) *outErr = 0;
     NSMutableString *req = [NSMutableString string];
     [req appendFormat:@"GET %@ HTTP/1.1\r\n", path];
     [req appendFormat:@"Host: %@\r\n", host];
@@ -277,7 +279,12 @@ static NSString *IPATHttpGet(int fd, NSString *host, NSString *path, unsigned lo
     BOOL headDone = NO;
     while (YES) {
         ssize_t n = recv(fd, tmp, sizeof tmp, 0);
-        if (n <= 0) break;                       // 超时或对端关闭
+        if (n <= 0) {
+            // 记下 errno：ECONNRESET = 目标不可达（ICMP 已被 t2s 转成 RST），
+            // ETIMEDOUT = 目标没应答
+            if (outErr) *outErr = errno;
+            break;
+        }
         [buf appendBytes:tmp length:(NSUInteger)n];
         if (!headDone) {
             NSString *s = [[NSString alloc] initWithData:buf encoding:NSISOLatin1StringEncoding];
@@ -397,12 +404,21 @@ static void IPATFetchURL(IPATTarget *u, IPATFetchResult *out) {
         return;
     }
 
-    NSString *resp = IPATHttpGet(fd, u.host, u.path, &bytes);
+    int herr = 0;
+    NSString *resp = IPATHttpGet(fd, u.host, u.path, &bytes, &herr);
     close(fd);
     out.ms = ([NSDate timeIntervalSinceReferenceDate] - t0) * 1000.0;
     out.bytes = bytes;
     if (!resp.length) {
-        out.errText = @"没收到任何响应（超时或对端直接断开）";
+        if (herr == ECONNRESET) {
+            out.errText = @"连接被重置：目标不可达（网关/主机拒绝了连接，"
+                           "VPN 日志里有对应的 ICMP 不可达记录）";
+        } else if (herr == ETIMEDOUT) {
+            out.errText = @"超时：8 秒内没有任何响应（目标没开机，或被防火墙丢包）";
+        } else {
+            out.errText = [NSString stringWithFormat:@"没收到任何响应（errno %d %s）",
+                           herr, strerror(herr)];
+        }
         return;
     }
     out.raw = resp;

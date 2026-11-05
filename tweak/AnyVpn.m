@@ -1367,6 +1367,59 @@ static BOOL isPrivateIPv4(NSString *ip) {
     return NO;
 }
 
+/// 最小 TLS 1.2 ClientHello 探测：验证隧道能不能把包送到公网 443。
+/// 为什么必须有它：实测不少线路只放行 443，80 端口被网关直接 RST
+/// （日志：出站 SYN 44 字节 → 入向 40 字节 RST），只看 HTTP 会误判成
+/// 「隧道没通」，而其实隧道好得很。
+/// 不带 SNI（IP 直连不需要），长度固定 56 字节。
+/// 返回：1 = 收到 ServerHello（端点可达），2 = 收到 Alert（端口通但握手被拒），
+///       3 = 收到别的记录类型，0 = 没有任何响应。
+static int tlsProbe443(const char *host, int port, int timeoutSec) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return 0;
+    struct timeval tv = {timeoutSec, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    struct sockaddr_in dst;
+    memset(&dst, 0, sizeof dst);
+    dst.sin_family = AF_INET;
+    dst.sin_port = htons((uint16_t)port);
+    dst.sin_addr.s_addr = inet_addr(host);
+    if (connect(fd, (struct sockaddr *)&dst, sizeof dst) != 0) {
+        close(fd);
+        return 0;
+    }
+    uint8_t ch[56];
+    memset(ch, 0, sizeof ch);
+    size_t i = 0;
+    ch[i++] = 0x16; ch[i++] = 0x03; ch[i++] = 0x01;      // record: handshake
+    ch[i++] = 0x00; ch[i++] = 51;                        // record length
+    ch[i++] = 0x01;                                      // client_hello
+    ch[i++] = 0x00; ch[i++] = 0x00; ch[i++] = 47;        // handshake length
+    ch[i++] = 0x03; ch[i++] = 0x03;                      // TLS 1.2
+    for (int k = 0; k < 32; k++) ch[i++] = (uint8_t)(random() & 0xFF);
+    ch[i++] = 0x00;                                      // session_id 长度
+    ch[i++] = 0x00; ch[i++] = 0x08;                      // cipher suites 长度
+    ch[i++] = 0xC0; ch[i++] = 0x2F;                      // ECDHE_RSA_AES128_GCM
+    ch[i++] = 0xC0; ch[i++] = 0x30;                      // ECDHE_RSA_AES256_GCM
+    ch[i++] = 0x00; ch[i++] = 0x9C;                      // RSA_AES128_GCM
+    ch[i++] = 0x00; ch[i++] = 0x9D;                      // RSA_AES256_GCM
+    ch[i++] = 0x01; ch[i++] = 0x00;                      // compression: null
+    size_t left = sizeof ch, done = 0;
+    while (done < left) {
+        ssize_t n = send(fd, ch + done, left - done, 0);
+        if (n <= 0) { close(fd); return 0; }
+        done += (size_t)n;
+    }
+    uint8_t head[5];
+    ssize_t got = recv(fd, head, sizeof head, 0);
+    close(fd);
+    if (got <= 0) return 0;
+    if (head[0] == 0x16) return 1;      // ServerHello
+    if (head[0] == 0x15) return 2;      // Alert
+    return 3;
+}
+
 /// 明文 HTTP GET 探测（connect 已被劫持 → 请求必然走 CSTP 隧道）。
 /// host 传数字 IP = 免 DNS；传域名 = 走被劫持的 getaddrinfo（隧道 DNS）。
 /// 对端可能分段发送，必须循环 recv 收完，否则 body 后半段（ip= 行常在后面）会丢。
@@ -1609,6 +1662,14 @@ static NSString *probeHttpGet(const char *host, const char *path,
                 altFail = [NSString stringWithFormat:@"备用探测 1.1.1.1 失败（err %d）", err2];
             }
         }
+        // 目标 3（兜底）：TLS 握手探 443 —— 80 端口被网关 RST 时，用它证明隧道是通的
+        NSString *tlsInfo = nil;
+        if (!ip.length && !gotResponse) {
+            int r = tlsProbe443("1.1.1.1", 443, 4);
+            if (r == 1)      tlsInfo = @"收到 TLS ServerHello";
+            else if (r == 2) tlsInfo = @"服务端回了 TLS Alert（端口通，握手被拒）";
+            else if (r == 3) tlsInfo = @"收到非预期的记录类型";
+        }
         ms = ([NSDate timeIntervalSinceReferenceDate] - t0) * 1000.0;
 
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -1632,6 +1693,11 @@ static NSString *probeHttpGet(const char *host, const char *path,
                 self.probeOK = YES;
                 self.probeExitIP = nil;
                 self.probeResult = @"隧道 ✓ 有响应（出口未验证）";
+            } else if (tlsInfo.length) {
+                // 80 被网关挡了，但 443 的 TLS 握手有应答 → 隧道确实在跑流量
+                self.probeOK = YES;
+                self.probeExitIP = nil;
+                self.probeResult = @"隧道 ✓ 443 可达（出口未验证）";
             } else {
                 self.probeOK = NO;
                 self.probeExitIP = nil;
@@ -1647,6 +1713,9 @@ static NSString *probeHttpGet(const char *host, const char *path,
             }
             if (altFail.length) {
                 IPATAppendLogLine([NSString stringWithFormat:@"[anyvpn] %@", altFail]);
+            }
+            if (tlsInfo.length) {
+                IPATAppendLogLine([NSString stringWithFormat:@"[anyvpn] 443 探测：%@", tlsInfo]);
             }
             if (!self.probeOK) {
                 // 状态行放不下原因，日志里补一句，方便判断是隧道没通还是网关只放行 443
@@ -2052,7 +2121,7 @@ __attribute__((constructor))
 static void IPATAnyVpnLoad(void) {
     // 构建版本戳：dylib 一加载就写进日志。排查「日志 0 行/行为不符」时，
     // 第一行就能确认设备上跑的是哪个构建——防止装到旧包白测一轮
-    IPATAppendLogLine(@"[anyvpn] dylib 已加载：构建 VPN-PROBE2-20261105（隧道有效性可视化 v2：出口探测 + 私网出口说明）");
+    IPATAppendLogLine(@"[anyvpn] dylib 已加载：构建 VPN-PROBE3-20261105（隧道有效性 v3：TLS443 探测 + ICMP 不可达快速失败）");
     // 尽早装 socket 劫持（引擎没就绪时全部直通原函数，不影响 App 正常运行）
     T2SInstallHooks();
     // 与其他 tweak 一致：延后一点等主线程就绪再初始化
