@@ -751,12 +751,13 @@ def _package_and_sign(args, root: str, payload: str, app, workdir: str,
                 )
             finally:
                 shutil.rmtree(backup, ignore_errors=True)
-            _, archive_seconds = _timed(ipa_mod.archive, root, out, level)
-            # zsign 目录模式可能留下自己的缓存目录，别打进最终 IPA
-            for junk in ("zsign_cache", ".zsign_cache"):
+            # zsign 目录模式会在工作目录里留下 .zsign_cache（签名缓存），
+            # 必须在打包前清掉，不然会混进最终 IPA
+            for junk in (".zsign_cache", "zsign_cache"):
                 jd = os.path.join(root, junk)
                 if os.path.isdir(jd):
                     shutil.rmtree(jd, ignore_errors=True)
+            _, archive_seconds = _timed(ipa_mod.archive, root, out, level)
         else:
             _, archive_seconds = _timed(ipa_mod.archive, root, out, level)
             # 显式 --sign none 是用户自己的选择，上面也解释过原因了，都别再说「没有签名工具」
