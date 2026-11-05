@@ -102,7 +102,14 @@ static long IPATContentLength(NSString *head) {
 /// 响应体解码：先 UTF-8，再 GB18030（国内内网页面常见），最后 Latin-1 兜底
 static NSString *IPATDecode(NSData *d) {
     NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
-    if (!s) s = [[NSString alloc] initWithData:d encoding:NSGB18030StringEncoding];
+    if (!s) {
+        // iOS SDK 没有 NSGB18030StringEncoding 常量，从 CoreFoundation 取编码号
+        NSStringEncoding gb = CFStringConvertEncodingToNSStringEncoding(
+            kCFStringEncodingGB_18030_2000);
+        if ((CFStringEncoding)gb != kCFStringEncodingInvalidId) {
+            s = [[NSString alloc] initWithData:d encoding:gb];
+        }
+    }
     if (!s) s = [[NSString alloc] initWithData:d encoding:NSISOLatin1StringEncoding];
     return s ?: @"";
 }
@@ -169,8 +176,8 @@ static NSString *IPATHtmlToText(NSString *html, NSString **outTitle) {
     NSArray *reps = @[@" ", @"&", @"<", @">", @"\"", @"'", @"'"];
     for (NSUInteger i = 0; i < ents.count; i++) {
         [t replaceOccurrencesOfString:ents[i] withString:reps[i]
-                               options:NSCaseInsensitiveSearch range:NSMakeRange(0, t.length)
-                                 range:NULL];
+                               options:NSCaseInsensitiveSearch
+                                 range:NSMakeRange(0, t.length)];
     }
     // 折叠空白：连续空格压成一个，行首尾去掉，空行压成一行
     NSArray *lines = [t componentsSeparatedByString:@"\n"];
@@ -294,17 +301,16 @@ static NSString *IPATHttpGet(int fd, NSString *host, NSString *path, unsigned lo
 static NSString *IPATTlsProbe(int fd, NSString *host, unsigned long long *bytes) {
     NSMutableData *ext = [NSMutableData data];
     NSData *hostData = [host dataUsingEncoding:NSASCIIStringEncoding];
-    uint8_t sni[5] = {0};
+    uint8_t sni[3] = {0};
     sni[0] = 0;                                  // type = host_name
     uint16_t hlen = (uint16_t)hostData.length;
     sni[1] = (uint8_t)(hlen >> 8); sni[2] = (uint8_t)(hlen & 0xFF);
-    [ext appendBytes:hostData length:hostData.length];
     NSMutableData *sniExt = [NSMutableData data];
     uint16_t sniLen = (uint16_t)(hostData.length + 3);
     uint8_t sniLenBytes[2] = {(uint8_t)(sniLen >> 8), (uint8_t)(sniLen & 0xFF)};
-    [sniExt appendBytes:sniLenBytes length:2];
-    [sniExt appendBytes:sni bytes:4];
-    [sniExt appendBytes:hostData length:hostData.length];
+    [sniExt appendBytes:sniLenBytes length:2];  // server_name_list 长度
+    [sniExt appendBytes:sni bytes:3];            // type(1) + 名字长度(2)
+    [sniExt appendBytes:hostData.bytes length:hostData.length];
     uint8_t extHdr[4] = {0x00, 0x00, 0, 0};
     extHdr[2] = (uint8_t)(sniExt.length >> 8);
     extHdr[3] = (uint8_t)(sniExt.length & 0xFF);
