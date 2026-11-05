@@ -1358,8 +1358,8 @@ static NSString *extractIPv4(NSString *text) {
 static BOOL isPrivateIPv4(NSString *ip) {
     NSArray *parts = [ip componentsSeparatedByString:@"."];
     if (parts.count != 4) return NO;
-    int a = [[parts[0] intValue]];
-    int b = [[parts[1] intValue]];
+    int a = [parts[0] intValue];
+    int b = [parts[1] intValue];
     if (a == 10 || a == 127) return YES;
     if (a == 192 && b == 168) return YES;
     if (a == 172 && b >= 16 && b <= 31) return YES;
@@ -1431,7 +1431,10 @@ static NSString *probeHttpGet(const char *host, const char *path,
             // 按 Content-Length 收：302 这种「明确没有正文」的响应立刻收工，
             // 不用干等 recv 超时（实测白等 3s，是探测慢的主因）
             buf[total] = 0;
-            NSString *peek = @(buf);
+            // 用 Latin-1 解码：@(buf) 走的是 UTF-8，遇到 GBK 页面会得到 nil
+            NSString *peek = [[NSString alloc]
+                initWithData:[NSData dataWithBytes:buf length:total]
+                     encoding:NSISOLatin1StringEncoding] ?: @"";
             NSRange sep = [peek rangeOfString:@"\r\n\r\n"];
             if (sep.location != NSNotFound) {
                 headDone = YES;
