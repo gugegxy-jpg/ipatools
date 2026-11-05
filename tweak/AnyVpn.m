@@ -643,6 +643,7 @@ static void cb_protect_socket(void *privdata, int fd) {
 @property (nonatomic, assign) int tunnelMTU;
 @property (nonatomic, copy) NSString *probeResult;      // 出口 IP 自检结果（文案）
 @property (nonatomic, copy) NSString *probeExitIP;       // 出口公网 IP（状态行紧凑展示用）
+@property (nonatomic, assign) BOOL probeExitPrivate;    // 出口地址是私网段（网关未 NAT）
 @property (nonatomic, assign) BOOL probeOK;
 @property (nonatomic, strong) NSTimer *statsTimer;      // 1s 刷新流量/状态
 @property (nonatomic, assign) NSTimeInterval connectStart; // 连接开始时间（算握手耗时）
@@ -1306,6 +1307,21 @@ static NSString *respSummary(NSString *s, NSUInteger limit) {
     return head;
 }
 
+/// HTTP 头里的 Content-Length；没有该头返回 -1
+static long httpContentLength(NSString *head) {
+    if (!head.length) return -1;
+    for (NSString *line in [head componentsSeparatedByString:@"\r\n"]) {
+        NSString *t = [line stringByTrimmingCharactersInSet:
+            [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if ([t.lowercaseString hasPrefix:@"content-length:"]) {
+            NSString *v = [[t substringFromIndex:15] stringByTrimmingCharactersInSet:
+                [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            return (long)v.integerValue;
+        }
+    }
+    return -1;
+}
+
 /// 响应体：跳过 HTTP 头（\r\n\r\n 之后）
 static NSString *httpBody(NSString *resp) {
     if (!resp.length) return @"";
@@ -1336,6 +1352,19 @@ static NSString *extractIPv4(NSString *text) {
         if (ok) return part;
     }
     return nil;
+}
+
+/// 是否私网地址（10 / 172.16-31 / 192.168 / 127 / 169.254）
+static BOOL isPrivateIPv4(NSString *ip) {
+    NSArray *parts = [ip componentsSeparatedByString:@"."];
+    if (parts.count != 4) return NO;
+    int a = [[parts[0] intValue];
+    int b = [[parts[1] intValue];
+    if (a == 10 || a == 127) return YES;
+    if (a == 192 && b == 168) return YES;
+    if (a == 172 && b >= 16 && b <= 31) return YES;
+    if (a == 169 && b == 254) return YES;
+    return NO;
 }
 
 /// 明文 HTTP GET 探测（connect 已被劫持 → 请求必然走 CSTP 隧道）。
@@ -1392,10 +1421,27 @@ static NSString *probeHttpGet(const char *host, const char *path,
     }
     char buf[4096];
     size_t total = 0;
+    size_t want = 0;                      // 期望收满的总长度（0 = 未知）
+    BOOL headDone = NO;
     while (total < sizeof(buf) - 1) {
         ssize_t n = recv(fd, buf + total, sizeof(buf) - 1 - total, 0);
         if (n <= 0) break;                 // 超时（ETIMEDOUT）或对端关闭
         total += (size_t)n;
+        if (!headDone) {
+            // 按 Content-Length 收：302 这种「明确没有正文」的响应立刻收工，
+            // 不用干等 recv 超时（实测白等 3s，是探测慢的主因）
+            buf[total] = 0;
+            NSString *peek = @(buf);
+            NSRange sep = [peek rangeOfString:@"\r\n\r\n"];
+            if (sep.location != NSNotFound) {
+                headDone = YES;
+                long cl = httpContentLength([peek substringToIndex:sep.location]);
+                if (cl == 0) break;         // 没有正文
+                if (cl > 0) want = sep.location + 4 + (size_t)cl;
+            }
+        } else if (want && total >= want) {
+            break;                          // 收满了
+        }
     }
     close(fd);
     if (total == 0) {
@@ -1451,6 +1497,7 @@ static NSString *probeHttpGet(const char *host, const char *path,
         @"mtu": @(self.tunnelMTU),
         @"probe": self.probeResult ?: @"", @"probeOK": @(self.probeOK),
         @"exitIP": self.probeExitIP ?: @"",
+        @"exitPrivate": @(self.probeExitPrivate),
         @"status": g_lastStatusText ?: @"",
     }} forKey:@"IPAToolPanelAnyVpnStats"];
 }
@@ -1521,39 +1568,42 @@ static NSString *probeHttpGet(const char *host, const char *path,
         int err = 0;
 
         NSTimeInterval t0 = [NSDate timeIntervalSinceReferenceDate];
-        // 目标 1：1.1.1.1 的 Cloudflare trace（免 DNS），body 里 ip= 就是出口 IP
-        NSString *resp = probeHttpGet("1.1.1.1", "/cdn-cgi/trace", &statusLine, &err);
+        // 目标 1：icanhazip —— 明文、正文里就有出口 IP，一次搞定；
+        // 域名解析走被劫持的 getaddrinfo（隧道 DNS），顺带验证 DNS 通不通
+        NSString *resp = probeHttpGet("icanhazip.com", "/", &statusLine, &err);
         if (resp.length) {
             gotResponse = YES;
-            NSString *body = httpBody(resp);
-            for (NSString *line in [body componentsSeparatedByString:@"\n"]) {
-                NSString *t = [line stringByTrimmingCharactersInSet:
-                    [NSCharacterSet whitespaceAndNewlineCharacterSet]];
-                if ([t hasPrefix:@"ip="]) {
-                    NSString *v = [[t substringFromIndex:3] stringByTrimmingCharactersInSet:
-                        [NSCharacterSet whitespaceAndNewlineCharacterSet]];
-                    if (v.length) { ip = v; break; }
-                }
-            }
+            NSString *ip1 = extractIPv4(httpBody(resp));
+            if (ip1.length) ip = ip1;
             summary = respSummary(resp, 220);
         } else {
             fail = (err == ETIMEDOUT) ? @"隧道 ✗ 无响应"
                                        : [NSString stringWithFormat:@"隧道 ✗ 连接失败 %d", err];
         }
 
-        // 目标 2（兜底）：icanhazip —— 明文、body 只有一行 IP；
-        // 域名解析走被劫持的 getaddrinfo，顺带验证隧道 DNS 是否可用
-        if (gotResponse && !ip.length) {
+        // 目标 2（兜底）：1.1.1.1 的 Cloudflare trace（免 DNS）。
+        // 实测明文 HTTP 现在会 302 到 https（正文为空），所以它只能证明
+        // 「隧道有响应」，拿不到出口 IP
+        if (!ip.length) {
             NSString *st2 = nil;
             int err2 = 0;
-            NSString *r2 = probeHttpGet("icanhazip.com", "/", &st2, &err2);
+            NSString *r2 = probeHttpGet("1.1.1.1", "/cdn-cgi/trace", &st2, &err2);
             if (r2.length) {
-                NSString *ip2 = extractIPv4(httpBody(r2));
-                if (ip2.length) ip = ip2;
+                gotResponse = YES;
+                NSString *body2 = httpBody(r2);
+                for (NSString *line in [body2 componentsSeparatedByString:@"\n"]) {
+                    NSString *t = [line stringByTrimmingCharactersInSet:
+                        [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                    if ([t hasPrefix:@"ip="]) {
+                        NSString *v = [[t substringFromIndex:3] stringByTrimmingCharactersInSet:
+                            [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                        if (v.length) { ip = v; break; }
+                    }
+                }
                 if (!summary.length) summary = respSummary(r2, 220);
                 if (!statusLine.length) statusLine = st2;
             } else {
-                altFail = [NSString stringWithFormat:@"备用探测 icanhazip.com 失败（err %d）", err2];
+                altFail = [NSString stringWithFormat:@"备用探测 1.1.1.1 失败（err %d）", err2];
             }
         }
         ms = ([NSDate timeIntervalSinceReferenceDate] - t0) * 1000.0;
@@ -1566,7 +1616,14 @@ static NSString *probeHttpGet(const char *host, const char *path,
             if (ip.length) {
                 self.probeOK = YES;
                 self.probeExitIP = ip;
+                self.probeExitPrivate = isPrivateIPv4(ip);
                 self.probeResult = [NSString stringWithFormat:@"隧道 ✓ 出口 %@（%d ms）", ip, (int)ms];
+                if (self.probeExitPrivate) {
+                    IPATAppendLogLine(@"[anyvpn] 出口地址是私网段：网关没做 NAT，"
+                                       "对端看到的源地址就是这个内网地址——"
+                                       @"判断「选线是否生效」要拿它和本机直连时的出口比，"
+                       @"不是看它像不像公网 IP");
+                }
             } else if (gotResponse) {
                 // 收到了合法响应但没解析出 ip=：隧道是通的，只是出口没验证出来
                 self.probeOK = YES;
@@ -1954,6 +2011,7 @@ static NSString *probeHttpGet(const char *host, const char *path,
     self.tunnelMTU = 0;
     self.probeResult = nil;
     self.probeExitIP = nil;
+    self.probeExitPrivate = NO;
     self.probeOK = NO;
     [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"IPAToolPanelAnyVpnStats"];
     T2SEngineStop();   // 非越狱模式引擎（root 模式下是空操作）
@@ -1991,7 +2049,7 @@ __attribute__((constructor))
 static void IPATAnyVpnLoad(void) {
     // 构建版本戳：dylib 一加载就写进日志。排查「日志 0 行/行为不符」时，
     // 第一行就能确认设备上跑的是哪个构建——防止装到旧包白测一轮
-    IPATAppendLogLine(@"[anyvpn] dylib 已加载：构建 VPN-PROBE-20261105（线路 DNS 熔断 + 隧道有效性可视化）");
+    IPATAppendLogLine(@"[anyvpn] dylib 已加载：构建 VPN-PROBE2-20261105（隧道有效性可视化 v2：出口探测 + 私网出口说明）");
     // 尽早装 socket 劫持（引擎没就绪时全部直通原函数，不影响 App 正常运行）
     T2SInstallHooks();
     // 与其他 tweak 一致：延后一点等主线程就绪再初始化

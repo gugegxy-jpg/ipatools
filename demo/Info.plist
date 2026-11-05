@@ -24,6 +24,15 @@
 	<true/>
 	<key>MinimumOSVersion</key>
 	<string>14.0</string>
+	<!-- The browser's "compare" button uses NSURLSession to hit the same URL
+	     over the system network stack (not hijacked). ATS would block plain
+	     http:// before it reaches the network, so the comparison would be
+	     meaningless. -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
 	<key>UIDeviceFamily</key>
 	<array>
 		<integer>1</integer>

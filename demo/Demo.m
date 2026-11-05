@@ -10,6 +10,7 @@
 //
 #import <UIKit/UIKit.h>
 #import <mach-o/dyld.h>
+#import "Browser.h"
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -131,6 +132,12 @@ static NSString *VpnStateText(void) {
             mtu > 0 ? [NSString stringWithFormat:@"（MTU %d）", mtu] : @""];
         [s appendFormat:@"  隧道 DNS     : %@\n", tunDNS.length ? tunDNS : @"-"];
         [s appendFormat:@"  出口自检     : %@\n", probe.length ? probe : @"（无）"];
+        NSString *exitIP = st[@"exitIP"] ?: @"";
+        BOOL exitPriv = [st[@"exitPrivate"] boolValue];
+        if (exitIP.length) {
+            [s appendFormat:@"  出口地址     : %@%@\n", exitIP,
+                exitPriv ? @"（私网段：网关未 NAT，对端看到的就是这个内网地址）" : @""];
+        }
         if (status.length) {
             [s appendFormat:@"  连接状态     : %@\n", status];
         }
@@ -254,23 +261,45 @@ static void Refresh(void) {
     [copyVpnBtn setTitle:@"复制 VPN 日志" forState:UIControlStateNormal];
     [copyVpnBtn addTarget:self action:@selector(copyVpnLog) forControlEvents:UIControlEventTouchUpInside];
 
+    UIButton *browserBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [browserBtn setTitle:@"内网浏览器（验证隧道是否真的在跑流量）" forState:UIControlStateNormal];
+    [browserBtn addTarget:self action:@selector(openBrowser) forControlEvents:UIControlEventTouchUpInside];
+
     UIStackView *bar = [[UIStackView alloc] initWithArrangedSubviews:@[writeBtn, copyVpnBtn, clearBtn]];
     bar.axis = UILayoutConstraintAxisHorizontal;
     bar.distribution = UIStackViewDistributionFillEqually;
-    bar.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.view addSubview:bar];
+
+    UIStackView *bar2 = [[UIStackView alloc] initWithArrangedSubviews:@[browserBtn]];
+    bar2.axis = UILayoutConstraintAxisHorizontal;
+    bar2.distribution = UIStackViewDistributionFillEqually;
+
+    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[bar, bar2]];
+    stack.axis = UILayoutConstraintAxisVertical;
+    stack.spacing = 6.0;
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:stack];
 
     UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
-        [bar.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:8.0],
-        [bar.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-8.0],
-        [bar.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-8.0],
-        [bar.heightAnchor constraintEqualToConstant:44.0],
+        [stack.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:8.0],
+        [stack.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-8.0],
+        [stack.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-8.0],
+        [bar.heightAnchor constraintEqualToConstant:40.0],
+        [bar2.heightAnchor constraintEqualToConstant:38.0],
         [gText.topAnchor constraintEqualToAnchor:safe.topAnchor constant:8.0],
         [gText.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:8.0],
         [gText.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-8.0],
-        [gText.bottomAnchor constraintEqualToAnchor:bar.topAnchor constant:-8.0],
+        [gText.bottomAnchor constraintEqualToAnchor:stack.topAnchor constant:-8.0],
     ]];
+}
+
+/// 简易内网浏览器：裸 socket 请求，验证隧道是否真的在跑流量
+- (void)openBrowser {
+    IPATBrowserVC *vc = [[IPATBrowserVC alloc] init];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+    nav.modalPresentationStyle = UIModalPresentationFullScreen;
+    [self presentViewController:nav animated:YES completion:nil];
+    IPATLog(@"打开内网浏览器");
 }
 
 - (void)writeTestFile {
