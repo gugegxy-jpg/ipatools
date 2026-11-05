@@ -1296,6 +1296,121 @@ static NSString *fmtBytes(unsigned long long b) {
     return [NSString stringWithFormat:@"%lluB", b];
 }
 
+/// 响应摘要：把换行压成 " | "，方便在日志里一行看清
+static NSString *respSummary(NSString *s, NSUInteger limit) {
+    if (!s.length) return @"";
+    NSString *head = s.length > limit ? [s substringToIndex:limit] : s;
+    head = [head stringByReplacingOccurrencesOfString:@"\r\n" withString:@" | "];
+    head = [head stringByReplacingOccurrencesOfString:@"\n" withString:@" | "];
+    head = [head stringByReplacingOccurrencesOfString:@"\r" withString:@""];
+    return head;
+}
+
+/// 响应体：跳过 HTTP 头（\r\n\r\n 之后）
+static NSString *httpBody(NSString *resp) {
+    if (!resp.length) return @"";
+    NSRange r = [resp rangeOfString:@"\r\n\r\n"];
+    if (r.location == NSNotFound) return resp;
+    return [resp substringFromIndex:r.location + 4];
+}
+
+/// 从文本里提取第一个 IPv4（纯文本 IP 服务返回 "1.2.3.4\n" 这种）
+static NSString *extractIPv4(NSString *text) {
+    if (!text.length) return nil;
+    NSCharacterSet *nonIP = [[NSCharacterSet characterSetWithCharactersInString:@"0123456789."] invertedSet];
+    for (NSString *part in [text componentsSeparatedByCharactersInSet:nonIP]) {
+        if (part.length < 7 || part.length > 15) continue;
+        NSArray *oct = [part componentsSeparatedByString:@"."];
+        if (oct.count != 4) continue;
+        BOOL ok = YES;
+        for (NSString *o in oct) {
+            if (o.length == 0 || o.length > 3) { ok = NO; break; }
+            int v = 0;
+            for (NSUInteger i = 0; i < o.length; i++) {
+                unichar c = [o characterAtIndex:i];
+                if (c < '0' || c > '9') { ok = NO; break; }
+                v = v * 10 + (c - '0');
+            }
+            if (!ok || v > 255) { ok = NO; break; }
+        }
+        if (ok) return part;
+    }
+    return nil;
+}
+
+/// 明文 HTTP GET 探测（connect 已被劫持 → 请求必然走 CSTP 隧道）。
+/// host 传数字 IP = 免 DNS；传域名 = 走被劫持的 getaddrinfo（隧道 DNS）。
+/// 对端可能分段发送，必须循环 recv 收完，否则 body 后半段（ip= 行常在后面）会丢。
+/// 返回响应文本；失败返回 nil，*outErr 给 errno（超时为 ETIMEDOUT）。
+static NSString *probeHttpGet(const char *host, const char *path,
+                              NSString **outStatus, int *outErr) {
+    if (outStatus) *outStatus = nil;
+    if (outErr) *outErr = 0;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        if (outErr) *outErr = errno;
+        return nil;
+    }
+    struct timeval tv = {3, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+
+    struct sockaddr_in dst;
+    memset(&dst, 0, sizeof dst);
+    dst.sin_family = AF_INET;
+    dst.sin_port = htons(80);
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    if (inet_pton(AF_INET, host, &dst.sin_addr) != 1) {
+        if (getaddrinfo(host, "80", &hints, &res) != 0 || !res) {
+            close(fd);
+            if (outErr) *outErr = EHOSTUNREACH;
+            return nil;
+        }
+        struct sockaddr_in *sa = (struct sockaddr_in *)res->ai_addr;
+        dst.sin_addr = sa->sin_addr;
+        freeaddrinfo(res);
+    }
+
+    if (connect(fd, (struct sockaddr *)&dst, sizeof dst) != 0) {
+        if (outErr) *outErr = errno;
+        close(fd);
+        return nil;
+    }
+    char req[512];
+    int rn = snprintf(req, sizeof req,
+                      "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: AnyVpnProbe\r\n"
+                      "Accept: text/plain\r\nAccept-Encoding: identity\r\n"
+                      "Connection: close\r\n\r\n",
+                      path, host);
+    if (rn <= 0 || send(fd, req, (size_t)rn, 0) <= 0) {
+        if (outErr) *outErr = errno;
+        close(fd);
+        return nil;
+    }
+    char buf[4096];
+    size_t total = 0;
+    while (total < sizeof(buf) - 1) {
+        ssize_t n = recv(fd, buf + total, sizeof(buf) - 1 - total, 0);
+        if (n <= 0) break;                 // 超时（ETIMEDOUT）或对端关闭
+        total += (size_t)n;
+    }
+    close(fd);
+    if (total == 0) {
+        if (outErr) *outErr = ETIMEDOUT;
+        return nil;
+    }
+    buf[total] = 0;
+    NSString *resp = @(buf);
+    if (outStatus) {
+        NSRange nl = [resp rangeOfString:@"\r\n"];
+        *outStatus = (nl.location != NSNotFound) ? [resp substringToIndex:nl.location] : @"";
+    }
+    return resp;
+}
+
 /// 组装面板状态行：隧道是否真的可用 + 流量证据
 /// 注意：面板状态行只有一行（面板 276pt - 内边距 = 248pt，11pt 字号，超出截尾），
 /// 所以这里只放最关键的信号——出口 IP + 流量；服务器名、握手耗时、IPv6 告警
@@ -1308,7 +1423,7 @@ static NSString *fmtBytes(unsigned long long b) {
         if (self.probeExitIP.length) {
             [m appendFormat:@"隧道✓出口%@", self.probeExitIP];
         } else {
-            [m appendString:@"隧道✓流量已走隧道"];
+            [m appendString:@"隧道✓有响应"];
         }
     } else if (self.probeResult.length) {
         [m appendString:self.probeResult];              // 隧道 ✗ 未见流量 / 连接被拒 …
@@ -1343,7 +1458,9 @@ static NSString *fmtBytes(unsigned long long b) {
 /// 1s 刷新：把实时指标推到面板状态行
 - (void)startStatsTimer {
     [self stopStatsTimer];
-    self.lastProbeAt = 0;
+    // 从现在起算 30s：置 0 会让第一个 tick 就触发「复检」，
+    // 和连接成功后 1.5s 的首次探测撞车（一次连接探两遍）
+    self.lastProbeAt = [NSDate timeIntervalSinceReferenceDate];
     self.statsTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
                                                        target:self
                                                      selector:@selector(onStatsTick)
@@ -1380,68 +1497,97 @@ static NSString *fmtBytes(unsigned long long b) {
 /// 隧道自检：用裸 socket 发明文 HTTP 到 1.1.1.1（Cloudflare trace）。
 /// connect 会被 fishhook 劫持 → 请求必然走 CSTP 隧道；响应里的 ip= 就是出口 IP。
 /// 不用 NSURLSession：CFNetwork 在系统库里建连，劫持不到（非越狱模式的硬边界）。
+///
+/// 两个踩过的坑（2026-11-05 实测日志）：
+///  1) 必须循环 recv：Cloudflare 的响应分多段到达，一次 recv 只能拿到
+///     「响应头 + 半截 body」，ip= 行还在后半段——于是明明收到了 236 字节，
+///     判定却是「隧道 ✗ 未见流量」。
+///  2) 不能用「出站字节 > 阈值」当证据：探测请求本身就有 ~90 字节，
+///     加上 SYN/ACK 一共才 214 字节，永远够不到 256 的阈值。
+///     真正的证据是「收到了对端的 HTTP 响应」——请求被劫持进了隧道，
+///     响应能原路返回，就说明隧道真的通。
 - (void)probeTunnel {
     if (!self.running) return;
+    T2SStatsSnapshot base;
+    T2SGetStats(&base);
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         NSString *ip = nil;
+        NSString *statusLine = nil;
+        NSString *summary = nil;
         NSTimeInterval ms = 0;
+        BOOL gotResponse = NO;
         NSString *fail = nil;
-        int fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (fd < 0) {
-            fail = @"隧道 ✗ socket 失败";
-        } else {
-            struct timeval tv = {4, 0};
-            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-            struct sockaddr_in dst;
-            memset(&dst, 0, sizeof dst);
-            dst.sin_family = AF_INET;
-            dst.sin_port = htons(80);
-            dst.sin_addr.s_addr = inet_addr("1.1.1.1");
-            NSTimeInterval t0 = [NSDate timeIntervalSinceReferenceDate];
-            if (connect(fd, (struct sockaddr *)&dst, sizeof dst) != 0) {
-                fail = [NSString stringWithFormat:@"隧道 ✗ 连接被拒 %d", errno];
-            } else {
-                const char *req = "GET /cdn-cgi/trace HTTP/1.1\r\nHost: 1.1.1.1\r\n"
-                                  "User-Agent: AnyVpnProbe\r\nConnection: close\r\n\r\n";
-                ssize_t w = send(fd, req, strlen(req), 0);
-                if (w <= 0) {
-                    fail = @"隧道 ✗ 发送失败";
-                } else {
-                    char buf[2048];
-                    ssize_t n = recv(fd, buf, sizeof buf - 1, 0);
-                    if (n <= 0) {
-                        fail = @"隧道 ✗ 无响应";
-                    } else {
-                        buf[n] = 0;
-                        NSString *body = @(buf);
-                        for (NSString *line in [body componentsSeparatedByString:@"\n"]) {
-                            if ([line hasPrefix:@"ip="]) { ip = [line substringFromIndex:3]; break; }
-                        }
-                        ms = ([NSDate timeIntervalSinceReferenceDate] - t0) * 1000.0;
-                    }
+        NSString *altFail = nil;
+        int err = 0;
+
+        NSTimeInterval t0 = [NSDate timeIntervalSinceReferenceDate];
+        // 目标 1：1.1.1.1 的 Cloudflare trace（免 DNS），body 里 ip= 就是出口 IP
+        NSString *resp = probeHttpGet("1.1.1.1", "/cdn-cgi/trace", &statusLine, &err);
+        if (resp.length) {
+            gotResponse = YES;
+            NSString *body = httpBody(resp);
+            for (NSString *line in [body componentsSeparatedByString:@"\n"]) {
+                NSString *t = [line stringByTrimmingCharactersInSet:
+                    [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                if ([t hasPrefix:@"ip="]) {
+                    NSString *v = [[t substringFromIndex:3] stringByTrimmingCharactersInSet:
+                        [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                    if (v.length) { ip = v; break; }
                 }
             }
-            close(fd);
+            summary = respSummary(resp, 220);
+        } else {
+            fail = (err == ETIMEDOUT) ? @"隧道 ✗ 无响应"
+                                       : [NSString stringWithFormat:@"隧道 ✗ 连接失败 %d", err];
         }
+
+        // 目标 2（兜底）：icanhazip —— 明文、body 只有一行 IP；
+        // 域名解析走被劫持的 getaddrinfo，顺带验证隧道 DNS 是否可用
+        if (gotResponse && !ip.length) {
+            NSString *st2 = nil;
+            int err2 = 0;
+            NSString *r2 = probeHttpGet("icanhazip.com", "/", &st2, &err2);
+            if (r2.length) {
+                NSString *ip2 = extractIPv4(httpBody(r2));
+                if (ip2.length) ip = ip2;
+                if (!summary.length) summary = respSummary(r2, 220);
+                if (!statusLine.length) statusLine = st2;
+            } else {
+                altFail = [NSString stringWithFormat:@"备用探测 icanhazip.com 失败（err %d）", err2];
+            }
+        }
+        ms = ([NSDate timeIntervalSinceReferenceDate] - t0) * 1000.0;
+
         dispatch_async(dispatch_get_main_queue(), ^{
             T2SStatsSnapshot st;
             T2SGetStats(&st);
+            unsigned long long deltaOut = st.outBytes - base.outBytes;
+            unsigned long long deltaIn  = st.inBytes - base.inBytes;
             if (ip.length) {
                 self.probeOK = YES;
                 self.probeExitIP = ip;
                 self.probeResult = [NSString stringWithFormat:@"隧道 ✓ 出口 %@（%d ms）", ip, (int)ms];
-            } else if (st.outBytes > 256) {
-                // 探测本身只有百来字节；超过这个量说明确有别的流量进过隧道
+            } else if (gotResponse) {
+                // 收到了合法响应但没解析出 ip=：隧道是通的，只是出口没验证出来
                 self.probeOK = YES;
                 self.probeExitIP = nil;
-                self.probeResult = @"隧道 ✓ 流量已走隧道（出口未验证）";
+                self.probeResult = @"隧道 ✓ 有响应（出口未验证）";
             } else {
                 self.probeOK = NO;
                 self.probeExitIP = nil;
                 self.probeResult = fail ?: @"隧道 ✗ 未见流量";
             }
             IPATAppendLogLine([NSString stringWithFormat:@"[anyvpn] %@", self.probeResult]);
+            IPATAppendLogLine([NSString stringWithFormat:
+                @"[anyvpn] 探测明细：收到 %@，出站 +%llu B / 入向 +%llu B",
+                gotResponse ? (statusLine.length ? statusLine : @"(无状态行)") : @"无数据",
+                deltaOut, deltaIn]);
+            if (summary.length) {
+                IPATAppendLogLine([NSString stringWithFormat:@"[anyvpn] 响应摘要：%@", summary]);
+            }
+            if (altFail.length) {
+                IPATAppendLogLine([NSString stringWithFormat:@"[anyvpn] %@", altFail]);
+            }
             if (!self.probeOK) {
                 // 状态行放不下原因，日志里补一句，方便判断是隧道没通还是网关只放行 443
                 IPATAppendLogLine(@"[anyvpn] 隧道自检未通过：网关可能只放行 443，"
@@ -1845,7 +1991,7 @@ __attribute__((constructor))
 static void IPATAnyVpnLoad(void) {
     // 构建版本戳：dylib 一加载就写进日志。排查「日志 0 行/行为不符」时，
     // 第一行就能确认设备上跑的是哪个构建——防止装到旧包白测一轮
-    IPATAppendLogLine(@"[anyvpn] dylib 已加载：构建 DNS-BREAKER-20261104（线路 DNS 熔断 + TunnelDNS 覆盖）");
+    IPATAppendLogLine(@"[anyvpn] dylib 已加载：构建 VPN-PROBE-20261105（线路 DNS 熔断 + 隧道有效性可视化）");
     // 尽早装 socket 劫持（引擎没就绪时全部直通原函数，不影响 App 正常运行）
     T2SInstallHooks();
     // 与其他 tweak 一致：延后一点等主线程就绪再初始化
