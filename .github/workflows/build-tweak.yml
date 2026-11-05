@@ -97,6 +97,30 @@ jobs:
             codesign -dvvv "$f" 2>&1 | head -3 || true
           done
 
+      # 真机验证 Demo：编译最小 App，再注入面板 + VPN 插件，供实机测 VPN 连接
+      - name: Build demo IPA
+        run: |
+          chmod +x demo/build-demo.sh
+          ./demo/build-demo.sh 2>&1 | tee demo-build.log
+          code=${PIPESTATUS[0]}
+          echo "=== build-demo.sh exit=$code ===" | tee -a demo-build.log
+          exit "$code"
+
+      - name: Inject IPATool + AnyVpn into demo
+        run: |
+          python3 -m ipatool inject demo/build/IPATDemo.ipa \
+            --dylib tweak/build/IPATool.dylib \
+            --dylib tweak/build/AnyVpn.dylib \
+            --in-place --sign none 2>&1 | tee demo-inject.log
+          code=${PIPESTATUS[0]}
+          echo "=== inject exit=$code ===" | tee -a demo-inject.log
+          exit "$code"
+
+      - name: Verify demo IPA
+        run: |
+          python3 -m ipatool info demo/build/IPATDemo.ipa --json | head -40
+          python3 -m ipatool inject demo/build/IPATDemo.ipa --list || true
+
       - name: Pack build directory
         run: |
           zip -r build-artifacts.zip tweak/build -x "*.DS_Store"
@@ -111,6 +135,17 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+      # 单独的 demo IPA artifact：装到真机上测 VPN 连接用
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ipatool-demo-vpn
+          path: |
+            demo/build/IPATDemo.ipa
+            demo-build.log
+            demo-inject.log
+          if-no-files-found: error
+          retention-days: 90
+
       # Release asset 可以匿名下载，Artifact 必须登录，所以额外发一份到 Release
       - name: Publish dylibs as release assets
         if: always()
@@ -121,6 +156,9 @@ jobs:
           assets=()
           for f in tweak/build/*.dylib; do if [ -f "$f" ]; then assets+=("$f"); fi; done
           if [ -f build-artifacts.zip ]; then assets+=(build-artifacts.zip); fi
+          if [ -f demo/build/IPATDemo.ipa ]; then assets+=(demo/build/IPATDemo.ipa); fi
+          if [ -f demo-build.log ]; then assets+=(demo-build.log); fi
+          if [ -f demo-inject.log ]; then assets+=(demo-inject.log); fi
           if [ -f anyvpn-deps.log ]; then assets+=(anyvpn-deps.log); fi
           if [ ${#assets[@]} -eq 0 ]; then
             echo "没有可发布的产物，跳过 Release"

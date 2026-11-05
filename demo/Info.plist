@@ -29,8 +29,8 @@
 		<integer>1</integer>
 		<integer>2</integer>
 	</array>
-	<key>UILaunchStoryboardName</key>
-	<string></string>
+	<key>UILaunchScreen</key>
+	<dict/>
 	<key>UIRequiredDeviceCapabilities</key>
 	<array>
 		<string>arm64</string>
@@ -57,6 +57,37 @@
 				</dict>
 			</array>
 		</dict>
+	</dict>
+	<!-- AnyVpn.dylib 的初始配置。优先级：面板里保存的连接（NSUserDefaults）
+	     > 这里的值（AnyVpn.m 的 configured:）。所以这里留空也能测：
+	     打开 App → 右侧悬浮窗 →「VPN 隧道」→「＋ 添加连接」填网关信息即可。
+	     字段含义：
+	       Server        网关地址（必填）
+	       User          账号
+	       Password      密码
+	       AuthGroup     认证组（留空 = 自动选第一个）
+	       DisableDTLS   true = 只走 CSTP(TCP)。DTLS/UDP 443 在多数网络握不上手，
+	                      真机测试建议直接 true
+	       UnderlyingIface en0 = openconnect 的 socket 绑到底层网卡，防路由环路
+	       AutoConnect   true = 启动即连（默认 false，避免一启动就弹网关登录）
+	       TotpSecret    Base32 TOTP 密钥（可选；账号级密钥优先）
+	       TunnelDNS     覆盖网关下发的隧道 DNS，"ip1,ip2"（网关 DNS 不服务时用） -->
+	<key>IPAToolAnyVpn</key>
+	<dict>
+		<key>Server</key>
+		<string></string>
+		<key>User</key>
+		<string></string>
+		<key>Password</key>
+		<string></string>
+		<key>AuthGroup</key>
+		<string></string>
+		<key>DisableDTLS</key>
+		<true/>
+		<key>UnderlyingIface</key>
+		<string>en0</string>
+		<key>AutoConnect</key>
+		<false/>
 	</dict>
 </dict>
 </plist>
