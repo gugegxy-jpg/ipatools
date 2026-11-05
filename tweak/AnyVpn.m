@@ -1470,10 +1470,14 @@ static int tlsProbe443(const char *host, int port, int timeoutSec) {
 }
 
 /// 明文 HTTP GET 探测（connect 已被劫持 → 请求必然走 CSTP 隧道）。
+/// 探测专用错误码：解析到了代理软件的 fake-IP（198.18.0.0/15）。
+/// 不用 errno（会撞上真实错误），单独给一个便于日志区分。
+#define IPAT_PROBE_ERR_FAKEIP  2001
+
 /// host 传数字 IP = 免 DNS；传域名 = 走被劫持的 getaddrinfo（隧道 DNS）。
 /// 对端可能分段发送，必须循环 recv 收完，否则 body 后半段（ip= 行常在后面）会丢。
-/// 返回响应文本；失败返回 nil，*outErr 给 errno（超时为 ETIMEDOUT）。
-/// timeoutSec = 单次探测的 socket 超时（候选站点多时用小值，避免整体拖太久）。
+/// 返回响应文本；失败返回 nil，*outErr 给 errno（超时为 ETIMEDOUT），
+/// 解析到代理 fake-IP 时给 IPAT_PROBE_ERR_FAKEIP。
 static NSString *probeHttpGet(const char *host, const char *path,
                               NSString **outStatus, int *outErr, int timeoutSec) {
     if (outStatus) *outStatus = nil;
@@ -1505,6 +1509,15 @@ static NSString *probeHttpGet(const char *host, const char *path,
         struct sockaddr_in *sa = (struct sockaddr_in *)res->ai_addr;
         dst.sin_addr = sa->sin_addr;
         freeaddrinfo(res);
+        // fake-ip 检测就放在这里（不再单独查一次 DNS，省一次解析等待）：
+        // 198.18.0.0/15 是代理软件假 IP，直连它必然超时——既白等一个超时，
+        // 又会把「隧道其实是通的」误判成不通。
+        uint32_t iph = ntohl(dst.sin_addr.s_addr);
+        if ((iph & 0xFFFE0000u) == 0xC6120000u) {
+            close(fd);
+            if (outErr) *outErr = IPAT_PROBE_ERR_FAKEIP;
+            return nil;
+        }
     }
 
     if (connect(fd, (struct sockaddr *)&dst, sizeof dst) != 0) {
@@ -1693,16 +1706,23 @@ static NSString *probeHttpGet(const char *host, const char *path,
         // 所以多备两个同样返回纯 IP 明文的站点（api.ipify.org / ifconfig.me）：
         //   - 任意一个返回了 IP → 出口 IP 确认
         //   - 任意一个返回了响应（含 302）→ 隧道有响应
-        // 每个候选先做 fake-ip 预检：本机代理（Surge/小火箭/Clash）劫持了 DNS 时，
-        // 直连 198.18.x.x 必然超时，白等 3 秒还会把隧道误判成不通。
+        //
+        // 两个「别白等」的约束（实测踩过的坑）：
+        //  1) fake-ip 由 probeHttpGet 在解析后就地判定（不额外查一次 DNS）：
+        //     代理（Surge/小火箭/Clash）的 fake-ip 模式对所有域名统一返回
+        //     198.18.x.x，命中就整组域名目标都跳过，直接改走 IP 目标。
+        //  2) 域名解析失败（EHOSTUNREACH）时不再试其它域名：解析不了就是
+        //     线路 DNS 不通，换域名一样白等（每次都要等 resolver 超时）。
         static const char *kExitHosts[] = { "icanhazip.com", "api.ipify.org", "ifconfig.me" };
+        const NSTimeInterval kProbeBudget = 8.0;      // 域名候选的总预算（秒）
+        BOOL fakeAll = NO;
         for (size_t i = 0; i < sizeof(kExitHosts) / sizeof(kExitHosts[0]); i++) {
-            char fakeBuf[INET_ADDRSTRLEN] = {0};
-            if (hostResolvesToFakeIp(kExitHosts[i], fakeBuf, sizeof fakeBuf)) {
+            if (i > 0 && ([NSDate timeIntervalSinceReferenceDate] - t0) > kProbeBudget) {
                 mainFail = [NSString stringWithFormat:
-                    @"探测目标 %@ 被代理 fake-ip 劫持（%@）→ 跳过该目标",
-                    kExitHosts[i], [NSString stringWithUTF8String:fakeBuf]];
-                continue;
+                    @"探测已耗时 %.1f 秒（DNS/连接无响应），跳过剩余候选 %@",
+                    [NSDate timeIntervalSinceReferenceDate] - t0,
+                    kExitHosts[i]];
+                break;
             }
             NSString *st1 = nil;
             int err1 = 0;
@@ -1721,12 +1741,26 @@ static NSString *probeHttpGet(const char *host, const char *path,
                 }
             } else {
                 err = err1;
+                if (err1 == IPAT_PROBE_ERR_FAKEIP) {
+                    fakeAll = YES;
+                    mainFail = [NSString stringWithFormat:
+                        @"探测目标 %@ 被代理 fake-ip 劫持 → 跳过域名目标，改用 IP 目标探测",
+                        kExitHosts[i]];
+                    break;
+                }
+                if (err1 == EHOSTUNREACH) {
+                    mainFail = [NSString stringWithFormat:
+                        @"探测目标 %@ 域名解析失败：%@（线路 DNS 不通，system 解析也无结果）",
+                        kExitHosts[i], probeErrText(err1)];
+                    break;                      // 换域名也解析不了，别再白等
+                }
                 mainFail = [NSString stringWithFormat:@"探测目标 %@ 失败：%@（errno %d）",
                              kExitHosts[i], probeErrText(err1), err1];
             }
         }
         if (!ip.length && !gotResponse) {
-            if (err == 0) fail = @"隧道 ✗ 未见流量";
+            if (fakeAll) fail = @"隧道 ✗ 未见流量（探测目标被代理劫持）";
+            else if (err == 0) fail = @"隧道 ✗ 未见流量";
             else if (err == ETIMEDOUT) fail = @"隧道 ✗ 无响应";
             else fail = [NSString stringWithFormat:@"隧道 ✗ 连接失败 %d", err];
         }
