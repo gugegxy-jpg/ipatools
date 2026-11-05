@@ -1358,8 +1358,8 @@ static NSString *extractIPv4(NSString *text) {
 static BOOL isPrivateIPv4(NSString *ip) {
     NSArray *parts = [ip componentsSeparatedByString:@"."];
     if (parts.count != 4) return NO;
-    int a = [[parts[0] intValue];
-    int b = [[parts[1] intValue];
+    int a = [[parts[0] intValue]];
+    int b = [[parts[1] intValue]];
     if (a == 10 || a == 127) return YES;
     if (a == 192 && b == 168) return YES;
     if (a == 172 && b >= 16 && b <= 31) return YES;

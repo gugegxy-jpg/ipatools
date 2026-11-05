@@ -26,6 +26,7 @@
 #import <unistd.h>
 #import <errno.h>
 #import <stdlib.h>
+#import <stdio.h>
 #import <string.h>
 
 #pragma clang diagnostic push
@@ -33,14 +34,19 @@
 
 // ---------------------------------------------------------------- URL
 
-typedef struct {
-    NSString *host;
-    int port;
-    NSString *path;
-    BOOL isTLS;
-} IPATURL;
+// 目标地址。用 ObjC 类而不是 C 结构体：结构体里的 NSString* 在 ARC 下
+// 不参与内存管理，函数返回后就是悬垂指针。
+@interface IPATTarget : NSObject
+@property (nonatomic, copy) NSString *host;
+@property (nonatomic, assign) int port;
+@property (nonatomic, copy) NSString *path;
+@property (nonatomic, assign) BOOL isTLS;
+@end
 
-static BOOL IPATParseURL(NSString *input, IPATURL *out, NSString **err) {
+@implementation IPATTarget
+@end
+
+static BOOL IPATParseURL(NSString *input, IPATTarget *out, NSString **err) {
     NSString *s = [input stringByTrimmingCharactersInSet:
                    [NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (!s.length) { *err = @"请输入地址"; return NO; }
@@ -69,10 +75,10 @@ static BOOL IPATParseURL(NSString *input, IPATURL *out, NSString **err) {
         if (v > 0 && v < 65536) port = v;
     }
     if (!host.length) { *err = @"缺少主机名"; return NO; }
-    out->host = host;
-    out->port = port;
-    out->path = path.length ? path : @"/";
-    out->isTLS = isTLS;
+    out.host = host;
+    out.port = port;
+    out.path = path.length ? path : @"/";
+    out.isTLS = isTLS;
     return YES;
 }
 
@@ -190,17 +196,21 @@ static NSString *IPATHtmlToText(NSString *html, NSString **outTitle) {
 
 // ---------------------------------------------------------------- 裸 socket 请求
 
-typedef struct {
-    BOOL ok;
-    NSString *status;      // 状态行
-    NSString *headers;     // 响应头
-    NSString *body;        // 正文（HTML 已转纯文本）
-    NSString *raw;         // 原始响应
-    NSString *errText;
-    NSString *note;        // 补充说明（如 TLS 探测结论）
-    NSTimeInterval ms;
-    unsigned long long bytes;
-} IPATFetch;
+// 一次请求的结果。同样用 ObjC 类（理由同 IPATTarget）
+@interface IPATFetchResult : NSObject
+@property (nonatomic, assign) BOOL ok;
+@property (nonatomic, copy) NSString *status;      // 状态行
+@property (nonatomic, copy) NSString *headers;     // 响应头
+@property (nonatomic, copy) NSString *body;        // 正文（HTML 已转纯文本）
+@property (nonatomic, copy) NSString *raw;         // 原始响应
+@property (nonatomic, copy) NSString *errText;
+@property (nonatomic, copy) NSString *note;        // 补充说明（如 TLS 探测结论）
+@property (nonatomic, assign) NSTimeInterval ms;
+@property (nonatomic, assign) unsigned long long bytes;
+@end
+
+@implementation IPATFetchResult
+@end
 
 /// 连目标（connect 会被劫持进隧道）；返回 fd 或 -1
 static int IPATConnect(const char *host, int port, NSString **err) {
@@ -359,44 +369,43 @@ static NSString *IPATTlsProbe(int fd, NSString *host, unsigned long long *bytes)
 }
 
 /// 完整取一次资源
-static void IPATFetchURL(const IPATURL *u, IPATFetch *out) {
-    memset(out, 0, sizeof *out);
+static void IPATFetchURL(IPATTarget *u, IPATFetchResult *out) {
     NSString *err = nil;
     NSTimeInterval t0 = [NSDate timeIntervalSinceReferenceDate];
     int fd = IPATConnect(u.host.UTF8String, u.port, &err);
     if (fd < 0) {
-        out->errText = err ?: @"连接失败";
-        out->ms = ([NSDate timeIntervalSinceReferenceDate] - t0) * 1000.0;
+        out.errText = err ?: @"连接失败";
+        out.ms = ([NSDate timeIntervalSinceReferenceDate] - t0) * 1000.0;
         return;
     }
     unsigned long long bytes = 0;
-    if (u->isTLS) {
+    if (u.isTLS) {
         NSString *note = IPATTlsProbe(fd, u.host, &bytes);
-        out->ok = (note.length > 0);
-        out->note = note;
-        out->bytes = bytes;
-        out->status = note.length ? @"TLS 握手探测" : nil;
+        out.ok = (note.length > 0);
+        out.note = note;
+        out.bytes = bytes;
+        out.status = note.length ? @"TLS 握手探测" : nil;
         close(fd);
-        out->ms = ([NSDate timeIntervalSinceReferenceDate] - t0) * 1000.0;
-        if (!out->ok) out->errText = @"TLS 探测失败（隧道没把包送到对端？）";
+        out.ms = ([NSDate timeIntervalSinceReferenceDate] - t0) * 1000.0;
+        if (!out.ok) out.errText = @"TLS 探测失败（隧道没把包送到对端？）";
         return;
     }
 
     NSString *resp = IPATHttpGet(fd, u.host, u.path, &bytes);
     close(fd);
-    out->ms = ([NSDate timeIntervalSinceReferenceDate] - t0) * 1000.0;
-    out->bytes = bytes;
+    out.ms = ([NSDate timeIntervalSinceReferenceDate] - t0) * 1000.0;
+    out.bytes = bytes;
     if (!resp.length) {
-        out->errText = @"没收到任何响应（超时或对端直接断开）";
+        out.errText = @"没收到任何响应（超时或对端直接断开）";
         return;
     }
-    out->raw = resp;
+    out.raw = resp;
     NSRange sep = [resp rangeOfString:@"\r\n\r\n"];
     NSString *head = (sep.location != NSNotFound) ? [resp substringToIndex:sep.location] : resp;
     NSString *bodyRaw = (sep.location != NSNotFound)
         ? [resp substringFromIndex:sep.location + 4] : @"";
-    out->status = ([head componentsSeparatedByString:@"\r\n"]).firstObject ?: @"";
-    out->headers = head;
+    out.status = ([head componentsSeparatedByString:@"\r\n"]).firstObject ?: @"";
+    out.headers = head;
     NSString *decoded = IPATDecode([bodyRaw dataUsingEncoding:NSISOLatin1StringEncoding]);
     NSString *ctype = @"";
     for (NSString *line in [head componentsSeparatedByString:@"\r\n"]) {
@@ -408,12 +417,12 @@ static void IPATFetchURL(const IPATURL *u, IPATFetch *out) {
     if ([ctype.lowercaseString containsString:@"html"] || [decoded containsString:@"<html"]) {
         NSString *title = @"";
         NSString *text = IPATHtmlToText(decoded, &title);
-        out->body = title.length ? [NSString stringWithFormat:@"[标题] %@\n\n%@", title, text]
+        out.body = title.length ? [NSString stringWithFormat:@"[标题] %@\n\n%@", title, text]
                                  : text;
     } else {
-        out->body = decoded;
+        out.body = decoded;
     }
-    out->ok = YES;
+    out.ok = YES;
 }
 
 // ---------------------------------------------------------------- 界面
@@ -525,9 +534,9 @@ static void IPATFetchURL(const IPATURL *u, IPATFetch *out) {
 
 - (void)onOpen {
     if (self.busy) return;
-    IPATURL u;
+    IPATTarget *u = [[IPATTarget alloc] init];
     NSString *err = nil;
-    if (!IPATParseURL(self.urlField.text, &u, &err)) {
+    if (!IPATParseURL(self.urlField.text, u, &err)) {
         [self show:err];
         return;
     }
@@ -535,8 +544,8 @@ static void IPATFetchURL(const IPATURL *u, IPATFetch *out) {
     [self show:[NSString stringWithFormat:@"正在请求 %@:%d …", u.host, u.port]];
     __weak typeof(self) w = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        IPATFetch r;
-        IPATFetchURL(&u, &r);
+        IPATFetchResult *r = [[IPATFetchResult alloc] init];
+        IPATFetchURL(u, r);
         NSMutableString *s = [NSMutableString string];
         [s appendFormat:@"目标      : %@:%d%@\n", u.host, u.port,
             u.isTLS ? @"（TLS 探测）" : @""];
@@ -585,7 +594,7 @@ static void IPATFetchURL(const IPATURL *u, IPATFetch *out) {
             NSHTTPURLResponse *hr = [resp isKindOfClass:[NSHTTPURLResponse class]]
                 ? (NSHTTPURLResponse *)resp : nil;
             [t appendFormat:@"状态      : %ld %@\n", (long)hr.statusCode,
-                hr.allHeaderFields[@"Content-Type"] ?: @""];
+                [hr valueForHTTPHeaderField:@"Content-Type"] ?: @""];
             [t appendFormat:@"正文长度  : %lu 字节\n", (unsigned long)data.length];
             NSString *txt = IPATDecode(data);
             [t appendFormat:@"正文开头  : %@\n",
