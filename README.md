@@ -389,7 +389,7 @@ python -m ipatool inject game.ipa --files --qnet -o out.ipa             # 文件
 实现方式和要注意的：
 
 - 拦截 `send` / `sendto` / `recv` / `recvfrom` / `read` / `write`，用的是 dyld 自带的
-  `__DATA,__interpose`（不需要 fishhook 之类的第三方库）；调用原函数一律走 `syscall()`
+  `__DATA,__interpose`（不需要第三方 hook 库）；调用原函数一律走 `syscall()`
   直接进内核，不会绕回自己的实现。
 - 限速用令牌桶；`read` / `write` 会先用 `getsockopt` 判断 fd 是不是 socket，
   文件读写直接放行（结果按 fd 缓存），不会拖慢游戏读资源。
