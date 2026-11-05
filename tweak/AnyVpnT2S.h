@@ -33,6 +33,21 @@ BOOL T2SEngineReady(void);
 // 诊断：打印当前流量计数与会话数快照（tag 用于标记调用时机）
 void T2SStatsLog(const char *tag);
 
+/// 流量/会话快照（给面板做「连接是否真的有效」的可视化用）
+typedef struct {
+    unsigned long long outBytes;   // App → 隧道
+    unsigned long long inBytes;    // 隧道 → App
+    unsigned long long outPkts;
+    unsigned long long inPkts;
+    unsigned long long v6Bypass;   // IPv6 直连（引擎只接管 IPv4）
+    int tcpConns;                  // 活跃 TCP 会话数
+    int udpConns;                  // 活跃 UDP 会话数
+    int ready;                     // 引擎是否就绪
+} T2SStatsSnapshot;
+
+/// 取当前快照（线程安全：只读计数器，不碰链表）
+void T2SGetStats(T2SStatsSnapshot *out);
+
 // DNS（走隧道内的 VPN DNS）。阻塞，内部 5s 超时，失败返回 NO。
 BOOL T2SResolve(NSString *host, uint32_t *outAddrV4);
 

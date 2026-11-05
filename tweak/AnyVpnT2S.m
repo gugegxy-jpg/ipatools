@@ -138,11 +138,14 @@ static TCPSession *g_tcpSess;
 static UDPSession *g_udpSess;
 
 // 流量计数（诊断用）：out = 客户端→隧道（t2s_output），in = 隧道→客户端（t2s_feed_lwip）
-static unsigned long long g_statOutPkts, g_statOutBytes;
-static unsigned long long g_statInPkts, g_statInBytes;
+// 用 volatile：引擎线程写、面板线程读，避免编译器把读缓存成常量
+static volatile unsigned long long g_statOutPkts, g_statOutBytes;
+static volatile unsigned long long g_statInPkts, g_statInBytes;
 // 诊断：游戏发起的 IPv6 连接数（引擎只接管 IPv4，这些全部直连物理网络，
 // 出口环境不变的头号嫌疑）
-static unsigned long long g_statV6Bypass;
+static volatile unsigned long long g_statV6Bypass;
+// 活跃会话计数（增删时维护，面板只读这个数字，不去遍历链表——跨线程遍历会崩）
+static volatile int g_statTcpConns, g_statUdpConns;
 
 // 受保护 fd（openconnect 自己的 socket，绝不劫持）
 #define PROTECTED_MAX 128
@@ -327,6 +330,7 @@ static void t2s_tcp_destroy(TCPSession *s) {
     TCPSession **pp = &g_tcpSess;
     while (*pp && *pp != s) pp = &(*pp)->next;
     if (*pp) *pp = s->next;
+    g_statTcpConns--;
     free(s);
 }
 
@@ -353,6 +357,7 @@ static void t2s_tcp_flush(TCPSession *s) {
         TCPSession **pp = &g_tcpSess;
         while (*pp && *pp != s) pp = &(*pp)->next;
         if (*pp) *pp = s->next;
+        g_statTcpConns--;
         free(s->buf);
         free(s);
     }
@@ -436,6 +441,7 @@ static void t2s_tcp_accept(int newfd) {
     }
     s->next = g_tcpSess;
     g_tcpSess = s;
+    g_statTcpConns++;
     target_del(g_tcpTargets, sport);
 }
 
@@ -471,6 +477,7 @@ static void t2s_udp_destroy(UDPSession *u) {
     UDPSession **pp = &g_udpSess;
     while (*pp && *pp != u) pp = &(*pp)->next;
     if (*pp) *pp = u->next;
+    g_statUdpConns--;
     free(u);
 }
 
@@ -515,6 +522,7 @@ static void t2s_udp_accept(struct sockaddr_in *from) {
     u->pcb = pcb;
     u->next = g_udpSess;
     g_udpSess = u;
+    g_statUdpConns++;
     // 诊断：UDP 会话建立（游戏自带 DNS 客户端的关键证据链——它往哪些
     // 服务器发 UDP、我们有没有承接）
     static int udpSessLogs = 0;
@@ -1205,12 +1213,23 @@ static int hooked_getaddrinfo(const char *node, const char *service,
 // 诊断：在 TLS 被网关断开的时刻调用——看断开瞬间数据面在正常收发还是已停摆，
 // 以及两次断开之间有没有流量（delta = 本轮会话的收发量）
 void T2SStatsLog(const char *tag) {
-    int tcp = 0, udp = 0;
-    for (TCPSession *s = g_tcpSess; s; s = s->next) tcp++;
-    for (UDPSession *u = g_udpSess; u; u = u->next) udp++;
+    T2SStatsSnapshot s;
+    T2SGetStats(&s);
     T2SLog(@"[%s] 出 %llu 包/%lluKB，入 %llu 包/%lluKB，TCP 会话 %d，UDP 会话 %d，IPv6 直连 %llu",
-           tag, g_statOutPkts, g_statOutBytes / 1024,
-           g_statInPkts, g_statInBytes / 1024, tcp, udp, g_statV6Bypass);
+           tag, s.outPkts, s.outBytes / 1024,
+           s.inPkts, s.inBytes / 1024, s.tcpConns, s.udpConns, s.v6Bypass);
+}
+
+void T2SGetStats(T2SStatsSnapshot *out) {
+    if (!out) return;
+    out->outBytes  = g_statOutBytes;
+    out->inBytes   = g_statInBytes;
+    out->outPkts   = g_statOutPkts;
+    out->inPkts    = g_statInPkts;
+    out->v6Bypass  = g_statV6Bypass;
+    out->tcpConns  = g_statTcpConns;
+    out->udpConns  = g_statUdpConns;
+    out->ready     = g_ready ? 1 : 0;
 }
 
 void T2SInstallHooks(void) {

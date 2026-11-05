@@ -114,6 +114,30 @@ static NSString *VpnStateText(void) {
     [s appendFormat:@"  禁用 DTLS    : %@\n",
         noDTLS ? ([noDTLS boolValue] ? @"是" : @"否") : @"否（默认）"];
 
+    // 有效性证据（AnyVpn 每秒镜像一次到 NSUserDefaults）
+    id statsObj = [ud objectForKey:@"IPAToolPanelAnyVpnStats"];
+    NSDictionary *st = [statsObj isKindOfClass:[NSDictionary class]] ? statsObj : nil;
+    if (st) {
+        unsigned long long up = [st[@"upBytes"] unsignedLongLongValue];
+        unsigned long long down = [st[@"downBytes"] unsignedLongLongValue];
+        NSString *probe = st[@"probe"] ?: @"";
+        NSString *tunIP = st[@"ip"] ?: @"";
+        NSString *tunDNS = st[@"dns"] ?: @"";
+        int mtu = [st[@"mtu"] intValue];
+        int conns = [st[@"tcpConns"] intValue] + [st[@"udpConns"] intValue];
+        unsigned long long v6 = [st[@"v6Bypass"] unsignedLongLongValue];
+        [s appendFormat:@"  隧道地址     : %@%@\n", tunIP.length ? tunIP : @"-",
+            mtu > 0 ? [NSString stringWithFormat:@"（MTU %d）", mtu] : @""];
+        [s appendFormat:@"  隧道 DNS     : %@\n", tunDNS.length ? tunDNS : @"-"];
+        [s appendFormat:@"  出口自检     : %@\n", probe.length ? probe : @"（无）"];
+        [s appendFormat:@"  流量         : ↑%llu B ↓%llu B · %d 个连接\n", up, down, conns];
+        if (v6) {
+            [s appendFormat:@"  ⚠ IPv6 直连  : %llu 条（这些流量没进隧道）\n", v6];
+        }
+    } else {
+        [s appendString:@"  隧道状态     : 尚无统计（未连接或插件未运行）\n"];
+    }
+
     id profs = [ud objectForKey:@"IPAToolPanelAnyVpnProfiles"];
     NSArray *list = [profs isKindOfClass:[NSArray class]] ? profs : @[];
     NSString *active = [ud stringForKey:@"IPAToolPanelAnyVpnActive"] ?: @"";
