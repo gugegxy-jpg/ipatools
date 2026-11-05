@@ -1367,6 +1367,55 @@ static BOOL isPrivateIPv4(NSString *ip) {
     return NO;
 }
 
+/// fake-IP 预检：Surge / 小火箭 / Clash 的 fake-ip 模式会把域名解析到
+/// 198.18.0.0/15。这种 IP 只能由代理软件自己接管，直连必然超时——
+///
+/// 用它当探测目标会有两个坏处：
+///   1) 白等一个连接超时（3 秒），拖慢探测；
+///   2) 把「隧道其实是通的」误判成「隧道不通」（这正是 2026-11-05 误报的原因）。
+///
+/// 注意 getaddrinfo 已被劫持成隧道 DNS，所以这里查到的就是「隧道 DNS 解析结果」；
+/// 线路 DNS 不通时会回落到系统解析，于是本机代理的 fake-ip 就露出来了。
+/// 返回 YES = 是 fake-ip；outIp（可选）里给出解析到的 IP。
+static BOOL hostResolvesToFakeIp(const char *host, char *outIp, size_t outIpLen) {
+    if (outIp && outIpLen) outIp[0] = 0;
+    if (!host || !*host) return NO;
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET;
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) return NO;
+    BOOL fake = NO;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_addr) {
+        if (ai->ai_family != AF_INET || !ai->ai_addr) continue;
+        uint32_t iph = ntohl(((struct sockaddr_in *)ai->ai_addr)->sin_addr.s_addr);
+        if ((iph & 0xFFFE0000u) == 0xC6120000u) {       // 198.18.0.0/15
+            fake = YES;
+            if (outIp && outIpLen) {
+                struct sockaddr_in *sa = (struct sockaddr_in *)ai->ai_addr;
+                inet_ntop(AF_INET, &sa->sin_addr, outIp, (socklen_t)outIpLen);
+            }
+            break;
+        }
+    }
+    freeaddrinfo(res);
+    return fake;
+}
+
+/// 探测失败的 errno → 人话（面板一行放不下，完整原因进日志）
+static NSString *probeErrText(int err) {
+    switch (err) {
+        case 0:             return @"无错误";
+        case ETIMEDOUT:     return @"超时（3 秒内没有任何响应）";
+        case EHOSTUNREACH:  return @"域名解析失败（线路 DNS 不通，系统解析也无结果）";
+        case ECONNREFUSED:  return @"连接被拒绝（网关 RST / 拒绝该端口）";
+        case ECONNRESET:    return @"连接被重置（网关拒绝该端口，可能只放行 443/11443）";
+        case ENETUNREACH:   return @"网络不可达（无路由）";
+        case EPIPE:         return @"连接已断开";
+        default:            return [NSString stringWithFormat:@"errno %d", err];
+    }
+}
+
 /// 最小 TLS 1.2 ClientHello 探测：验证隧道能不能把包送到公网 443。
 /// 为什么必须有它：实测不少线路只放行 443，80 端口被网关直接 RST
 /// （日志：出站 SYN 44 字节 → 入向 40 字节 RST），只看 HTTP 会误判成
@@ -1424,8 +1473,9 @@ static int tlsProbe443(const char *host, int port, int timeoutSec) {
 /// host 传数字 IP = 免 DNS；传域名 = 走被劫持的 getaddrinfo（隧道 DNS）。
 /// 对端可能分段发送，必须循环 recv 收完，否则 body 后半段（ip= 行常在后面）会丢。
 /// 返回响应文本；失败返回 nil，*outErr 给 errno（超时为 ETIMEDOUT）。
+/// timeoutSec = 单次探测的 socket 超时（候选站点多时用小值，避免整体拖太久）。
 static NSString *probeHttpGet(const char *host, const char *path,
-                              NSString **outStatus, int *outErr) {
+                              NSString **outStatus, int *outErr, int timeoutSec) {
     if (outStatus) *outStatus = nil;
     if (outErr) *outErr = 0;
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -1433,7 +1483,8 @@ static NSString *probeHttpGet(const char *host, const char *path,
         if (outErr) *outErr = errno;
         return nil;
     }
-    struct timeval tv = {3, 0};
+    if (timeoutSec <= 0) timeoutSec = 3;
+    struct timeval tv = {timeoutSec, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
 
@@ -1488,12 +1539,20 @@ static NSString *probeHttpGet(const char *host, const char *path,
             NSString *peek = [[NSString alloc]
                 initWithData:[NSData dataWithBytes:buf length:total]
                      encoding:NSISOLatin1StringEncoding] ?: @"";
-            NSRange sep = [peek rangeOfString:@"\r\n\r\n"];
-            if (sep.location != NSNotFound) {
+            if ([peek hasPrefix:@"HTTP/"]) {
+                // 状态行到了 → 已经能证明「隧道有响应」，别再死等 \r\n\r\n：
+                // 实测服务器只发了 236 字节的头（后续段没到），等满 3 秒超时
+                // 既拖慢探测，也拿不到 body。
                 headDone = YES;
-                long cl = httpContentLength([peek substringToIndex:sep.location]);
-                if (cl == 0) break;         // 没有正文
-                if (cl > 0) want = sep.location + 4 + (size_t)cl;
+                // 后续最多再等 1 秒：能收全 body 最好（出口 IP 在 body 里）
+                struct timeval tv2 = {1, 0};
+                setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv2, sizeof tv2);
+                NSRange sep = [peek rangeOfString:@"\r\n\r\n"];
+                if (sep.location != NSNotFound) {
+                    long cl = httpContentLength([peek substringToIndex:sep.location]);
+                    if (cl == 0) break;         // 没有正文
+                    if (cl > 0) want = sep.location + 4 + (size_t)cl;
+                }
             }
         } else if (want && total >= want) {
             break;                          // 收满了
@@ -1505,7 +1564,11 @@ static NSString *probeHttpGet(const char *host, const char *path,
         return nil;
     }
     buf[total] = 0;
-    NSString *resp = @(buf);
+    // 优先 UTF-8；正文不是 UTF-8（GBK 页面）时回退 Latin-1，
+    // 否则 @() 走 UTF-8 解码会得到 nil，把「已收到响应」误判成失败
+    NSData *raw = [NSData dataWithBytes:buf length:total];
+    NSString *resp = [[NSString alloc] initWithData:raw encoding:NSUTF8StringEncoding]
+        ?: [[NSString alloc] initWithData:raw encoding:NSISOLatin1StringEncoding] ?: @"";
     if (outStatus) {
         NSRange nl = [resp rangeOfString:@"\r\n"];
         *outStatus = (nl.location != NSNotFound) ? [resp substringToIndex:nl.location] : @"";
@@ -1621,20 +1684,51 @@ static NSString *probeHttpGet(const char *host, const char *path,
         BOOL gotResponse = NO;
         NSString *fail = nil;
         NSString *altFail = nil;
+        NSString *mainFail = nil;
         int err = 0;
 
         NSTimeInterval t0 = [NSDate timeIntervalSinceReferenceDate];
-        // 目标 1：icanhazip —— 明文、正文里就有出口 IP，一次搞定；
-        // 域名解析走被劫持的 getaddrinfo（隧道 DNS），顺带验证 DNS 通不通
-        NSString *resp = probeHttpGet("icanhazip.com", "/", &statusLine, &err);
-        if (resp.length) {
-            gotResponse = YES;
-            NSString *ip1 = extractIPv4(httpBody(resp));
-            if (ip1.length) ip = ip1;
-            summary = respSummary(resp, 220);
-        } else {
-            fail = (err == ETIMEDOUT) ? @"隧道 ✗ 无响应"
-                                       : [NSString stringWithFormat:@"隧道 ✗ 连接失败 %d", err];
+        // 目标 1：明文 HTTP 的「出口 IP 查询」站点。
+        // icanhazip.com 现在会 302 到 https（正文为空 → 拿不到 IP），
+        // 所以多备两个同样返回纯 IP 明文的站点（api.ipify.org / ifconfig.me）：
+        //   - 任意一个返回了 IP → 出口 IP 确认
+        //   - 任意一个返回了响应（含 302）→ 隧道有响应
+        // 每个候选先做 fake-ip 预检：本机代理（Surge/小火箭/Clash）劫持了 DNS 时，
+        // 直连 198.18.x.x 必然超时，白等 3 秒还会把隧道误判成不通。
+        static const char *kExitHosts[] = { "icanhazip.com", "api.ipify.org", "ifconfig.me" };
+        for (size_t i = 0; i < sizeof(kExitHosts) / sizeof(kExitHosts[0]); i++) {
+            char fakeBuf[INET_ADDRSTRLEN] = {0};
+            if (hostResolvesToFakeIp(kExitHosts[i], fakeBuf, sizeof fakeBuf)) {
+                mainFail = [NSString stringWithFormat:
+                    @"探测目标 %@ 被代理 fake-ip 劫持（%@）→ 跳过该目标",
+                    kExitHosts[i], [NSString stringWithUTF8String:fakeBuf]];
+                continue;
+            }
+            NSString *st1 = nil;
+            int err1 = 0;
+            NSString *r1 = probeHttpGet(kExitHosts[i], "/", &st1, &err1, 3);
+            if (r1.length) {
+                gotResponse = YES;
+                NSString *ip1 = extractIPv4(httpBody(r1));
+                if (ip1.length) ip = ip1;
+                if (!summary.length) summary = respSummary(r1, 220);
+                if (!statusLine.length) statusLine = st1;
+                if (ip.length) break;          // 拿到出口 IP 就收工
+                // 302 之类：算「有响应」，但正文里没有 IP → 换下一个候选
+                if ([st1 hasPrefix:@"HTTP/1.1 3"] || [st1 hasPrefix:@"HTTP/1.0 3"]) {
+                    mainFail = [NSString stringWithFormat:@"探测目标 %@ 返回 %@（重定向，正文里没有 IP）",
+                                 kExitHosts[i], st1];
+                }
+            } else {
+                err = err1;
+                mainFail = [NSString stringWithFormat:@"探测目标 %@ 失败：%@（errno %d）",
+                             kExitHosts[i], probeErrText(err1), err1];
+            }
+        }
+        if (!ip.length && !gotResponse) {
+            if (err == 0) fail = @"隧道 ✗ 未见流量";
+            else if (err == ETIMEDOUT) fail = @"隧道 ✗ 无响应";
+            else fail = [NSString stringWithFormat:@"隧道 ✗ 连接失败 %d", err];
         }
 
         // 目标 2（兜底）：1.1.1.1 的 Cloudflare trace（免 DNS）。
@@ -1643,7 +1737,7 @@ static NSString *probeHttpGet(const char *host, const char *path,
         if (!ip.length) {
             NSString *st2 = nil;
             int err2 = 0;
-            NSString *r2 = probeHttpGet("1.1.1.1", "/cdn-cgi/trace", &st2, &err2);
+            NSString *r2 = probeHttpGet("1.1.1.1", "/cdn-cgi/trace", &st2, &err2, 3);
             if (r2.length) {
                 gotResponse = YES;
                 NSString *body2 = httpBody(r2);
@@ -1659,7 +1753,8 @@ static NSString *probeHttpGet(const char *host, const char *path,
                 if (!summary.length) summary = respSummary(r2, 220);
                 if (!statusLine.length) statusLine = st2;
             } else {
-                altFail = [NSString stringWithFormat:@"备用探测 1.1.1.1 失败（err %d）", err2];
+                altFail = [NSString stringWithFormat:@"备用探测 1.1.1.1 失败：%@（errno %d）",
+                           probeErrText(err2), err2];
             }
         }
         // 目标 3（兜底）：TLS 握手探 443 —— 80 端口被网关 RST 时，用它证明隧道是通的
@@ -1704,6 +1799,9 @@ static NSString *probeHttpGet(const char *host, const char *path,
                 self.probeResult = fail ?: @"隧道 ✗ 未见流量";
             }
             IPATAppendLogLine([NSString stringWithFormat:@"[anyvpn] %@", self.probeResult]);
+            if (mainFail.length) {
+                IPATAppendLogLine([NSString stringWithFormat:@"[anyvpn] %@", mainFail]);
+            }
             IPATAppendLogLine([NSString stringWithFormat:
                 @"[anyvpn] 探测明细：收到 %@，出站 +%llu B / 入向 +%llu B",
                 gotResponse ? (statusLine.length ? statusLine : @"(无状态行)") : @"无数据",
@@ -1850,29 +1948,15 @@ static NSString *probeHttpGet(const char *host, const char *path,
         // DNS 预检：198.18.0.0/15 是 Surge/小火箭/Clash 等 fake-ip 模式的保留网段。
         // 域名解析成这个段说明被设备上的代理软件劫持了，直连假 IP 必然超时，
         // 最后只会得到一个误导性的"认证失败"——在这里就明确报出来
-        struct addrinfo fakeHints = {.ai_family = AF_INET};
-        struct addrinfo *fakeRes = NULL;
-        if (getaddrinfo(host.UTF8String, NULL, &fakeHints, &fakeRes) == 0 && fakeRes) {
-            BOOL fakeIp = NO;
-            char ipbuf[INET_ADDRSTRLEN] = {0};
-            for (struct addrinfo *ai = fakeRes; ai; ai = ai->ai_next) {
-                if (ai->ai_family != AF_INET || !ai->ai_addr) continue;
-                uint32_t be = ((struct sockaddr_in *)ai->ai_addr)->sin_addr.s_addr;
-                uint32_t iph = ntohl(be);
-                if ((iph & 0xFFFE0000u) == 0xC6120000u) {   // 198.18.0.0/15
-                    fakeIp = YES;
-                    struct sockaddr_in *sa = (struct sockaddr_in *)ai->ai_addr;
-                    inet_ntop(AF_INET, &sa->sin_addr, ipbuf, sizeof ipbuf);
-                    break;
-                }
-            }
-            freeaddrinfo(fakeRes);
-            if (fakeIp) {
-                [self fail:[NSString stringWithFormat:
-                    @"域名解析到了代理软件的 fake-IP（%@）——请关闭 Surge/小火箭等代理，"
-                    "或把该域名设为直连", [NSString stringWithUTF8String:ipbuf]]];
-                return NO;
-            }
+        char ipbuf[INET_ADDRSTRLEN] = {0};
+        if (hostResolvesToFakeIp(host.UTF8String, ipbuf, sizeof ipbuf)) {
+            [self fail:[NSString stringWithFormat:
+                @"域名解析到了代理软件的 fake-IP（%@）——设备上的 Surge/小火箭/Clash 等 "
+                @"fake-ip 模式劫持了 DNS，直连这个假 IP 不可能通（会一直超时，"
+                @"最后报成误导性的『认证失败』）。请关掉这些代理后重试，"
+                @"或在代理里把该域名设为直连 / 改用 real-ip 模式",
+                [NSString stringWithUTF8String:ipbuf]]];
+            return NO;
         }
 
         if (openconnect_init_ssl() != 0) {
@@ -2121,7 +2205,7 @@ __attribute__((constructor))
 static void IPATAnyVpnLoad(void) {
     // 构建版本戳：dylib 一加载就写进日志。排查「日志 0 行/行为不符」时，
     // 第一行就能确认设备上跑的是哪个构建——防止装到旧包白测一轮
-    IPATAppendLogLine(@"[anyvpn] dylib 已加载：构建 VPN-PROBE3-20261105（隧道有效性 v3：TLS443 探测 + ICMP 不可达快速失败）");
+    IPATAppendLogLine(@"[anyvpn] dylib 已加载：构建 VPN-PROBE4-20261105（隧道有效性 v4：ICMP 立即断连 + 探测目标多站点/fake-ip 预检）");
     // 尽早装 socket 劫持（引擎没就绪时全部直通原函数，不影响 App 正常运行）
     T2SInstallHooks();
     // 与其他 tweak 一致：延后一点等主线程就绪再初始化

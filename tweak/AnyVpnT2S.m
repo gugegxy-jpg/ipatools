@@ -280,22 +280,26 @@ static void t2s_handle_icmp(const uint8_t *pkt, size_t n) {
     size_t oihl = (size_t)(orig[0] & 0x0F) * 4;
     if (oihl + 20 > n - (ihl + 8)) return;
     if (orig[9] != 6) return;                            // 只处理内层是 TCP 的
-    uint32_t oSrc = ((uint32_t)orig[12] << 24) | ((uint32_t)orig[13] << 16) |
-                    ((uint32_t)orig[14] << 8) | orig[15];
+    // 封装进来的是「我们发出去、出了错的那个包」：
+    //   内层 IP 头 src = 我们的隧道地址，dst = 目标主机
+    //   内层 TCP 头 sport = 我们的源端口，dport = 目标端口
+    // 所以要拿 dst 去匹配会话的目标 IP（之前误取 src，导致永远匹配不上）
+    uint32_t oDst = ((uint32_t)orig[16] << 24) | ((uint32_t)orig[17] << 16) |
+                    ((uint32_t)orig[18] << 8) | orig[19];
     uint16_t oDport = (uint16_t)((orig[oihl + 2] << 8) | orig[oihl + 3]);
 
     TCPSession *s = g_tcpSess;
     while (s) {
         TCPSession *next = s->next;
-        if (s->dport == oDport && s->dip == oSrc) {
+        if (s->dport == oDport && s->dip == oDst) {
             const char *reason = (type == 3)
                 ? (code == 0 ? "网络不可达" : code == 1 ? "主机不可达" :
                    code == 3 ? "端口不可达" : "目的不可达")
                 : (type == 11 ? "超时" : "参数错误");
             T2SLog(@"ICMP %u/%u（%s）：目标 %u.%u.%u.%u:%u 不可达 → 断开该连接",
                    type, code, reason,
-                   (oSrc >> 24) & 0xFF, (oSrc >> 16) & 0xFF,
-                   (oSrc >> 8) & 0xFF, oSrc & 0xFF, oDport);
+                   (oDst >> 24) & 0xFF, (oDst >> 16) & 0xFF,
+                   (oDst >> 8) & 0xFF, oDst & 0xFF, oDport);
             if (s->fd >= 0) {
                 // SO_LINGER(1,0)：close 时发 RST，宿主侧 socket 立刻收到
                 // ECONNRESET，而不是「连接莫名结束」
