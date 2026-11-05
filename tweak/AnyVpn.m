@@ -408,9 +408,15 @@ static BOOL otp_prompt_match(const char *text) {
 // C 层发状态（面板状态行 + 落盘日志）；cb_auth_form 在类声明之前，不能直接
 // 引用 AnyVPNController，走通知协议。面板可能从后台线程收到通知后直接碰 UI，
 // 所以这里统一跳主线程再发
+// 最近一次状态文案（连接/错误详情）。面板状态行只有一行且会截断尾字，
+// 隧道跑起来后那一行被实时指标占住，所以完整文案留在这里，
+// 由 NSUserDefaults 镜像给宿主 App（demo）完整展示。
+static NSString *g_lastStatusText = nil;
+
 static void anyvpn_status_notify(NSString *text) {
     IPATAppendLogLine([NSString stringWithFormat:@"[anyvpn] %@", text]);
     dispatch_async(dispatch_get_main_queue(), ^{
+        g_lastStatusText = [text copy];
         [[NSNotificationCenter defaultCenter] postNotificationName:IPATControlStatusNotification
                                                             object:nil
                                                           userInfo:@{IPATRegId: IPATFeatureAnyVpn,
@@ -636,6 +642,7 @@ static void cb_protect_socket(void *privdata, int fd) {
 @property (nonatomic, copy) NSString *tunnelDNS;       // 隧道内 DNS
 @property (nonatomic, assign) int tunnelMTU;
 @property (nonatomic, copy) NSString *probeResult;      // 出口 IP 自检结果（文案）
+@property (nonatomic, copy) NSString *probeExitIP;       // 出口公网 IP（状态行紧凑展示用）
 @property (nonatomic, assign) BOOL probeOK;
 @property (nonatomic, strong) NSTimer *statsTimer;      // 1s 刷新流量/状态
 @property (nonatomic, assign) NSTimeInterval connectStart; // 连接开始时间（算握手耗时）
@@ -1272,6 +1279,7 @@ static void cb_protect_socket(void *privdata, int fd) {
 - (void)status:(NSString *)text {
     IPATAppendLogLine([NSString stringWithFormat:@"[anyvpn] %@", text]);
     dispatch_async(dispatch_get_main_queue(), ^{
+        g_lastStatusText = [text copy];
         [[NSNotificationCenter defaultCenter] postNotificationName:IPATControlStatusNotification
                                                             object:nil
                                                           userInfo:@{IPATRegId: IPATFeatureAnyVpn,
@@ -1289,23 +1297,28 @@ static NSString *fmtBytes(unsigned long long b) {
 }
 
 /// 组装面板状态行：隧道是否真的可用 + 流量证据
+/// 注意：面板状态行只有一行（面板 276pt - 内边距 = 248pt，11pt 字号，超出截尾），
+/// 所以这里只放最关键的信号——出口 IP + 流量；服务器名、握手耗时、IPv6 告警
+/// 这些长文案走日志与 NSUserDefaults 镜像（demo 界面完整展示）。
 - (NSString *)effectiveStatusText {
     T2SStatsSnapshot s;
     T2SGetStats(&s);
     NSMutableString *m = [NSMutableString string];
-    if (self.probeOK && self.probeResult.length) {
-        [m appendString:self.probeResult];              // 隧道 ✓ 出口 x.x.x.x (162ms)
+    if (self.probeOK) {
+        if (self.probeExitIP.length) {
+            [m appendFormat:@"隧道✓出口%@", self.probeExitIP];
+        } else {
+            [m appendString:@"隧道✓流量已走隧道"];
+        }
     } else if (self.probeResult.length) {
-        [m appendString:self.probeResult];              // 隧道 ✗ …
+        [m appendString:self.probeResult];              // 隧道 ✗ 未见流量 / 连接被拒 …
     } else {
         [m appendString:@"隧道检测中…"];
     }
-    [m appendFormat:@" · ↑%@ ↓%@", fmtBytes(s.outBytes), fmtBytes(s.inBytes)];
-    if (s.tcpConns || s.udpConns) {
-        [m appendFormat:@" · %d 连接", s.tcpConns + s.udpConns];
-    }
-    if (s.v6Bypass) {
-        [m appendFormat:@" · ⚠IPv6 直连 %llu", s.v6Bypass];
+    [m appendFormat:@" ↑%@ ↓%@", fmtBytes(s.outBytes), fmtBytes(s.inBytes)];
+    int conns = s.tcpConns + s.udpConns;
+    if (conns) {
+        [m appendFormat:@" %d连接", conns];
     }
     return m;
 }
@@ -1322,6 +1335,8 @@ static NSString *fmtBytes(unsigned long long b) {
         @"ip": self.tunnelIP ?: @"", @"dns": self.tunnelDNS ?: @"",
         @"mtu": @(self.tunnelMTU),
         @"probe": self.probeResult ?: @"", @"probeOK": @(self.probeOK),
+        @"exitIP": self.probeExitIP ?: @"",
+        @"status": g_lastStatusText ?: @"",
     }} forKey:@"IPAToolPanelAnyVpnStats"];
 }
 
@@ -1373,7 +1388,7 @@ static NSString *fmtBytes(unsigned long long b) {
         NSString *fail = nil;
         int fd = socket(AF_INET, SOCK_STREAM, 0);
         if (fd < 0) {
-            fail = @"隧道 ✗ socket 创建失败";
+            fail = @"隧道 ✗ socket 失败";
         } else {
             struct timeval tv = {4, 0};
             setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
@@ -1385,7 +1400,7 @@ static NSString *fmtBytes(unsigned long long b) {
             dst.sin_addr.s_addr = inet_addr("1.1.1.1");
             NSTimeInterval t0 = [NSDate timeIntervalSinceReferenceDate];
             if (connect(fd, (struct sockaddr *)&dst, sizeof dst) != 0) {
-                fail = [NSString stringWithFormat:@"隧道 ✗ 连接被拒（errno %d）", errno];
+                fail = [NSString stringWithFormat:@"隧道 ✗ 连接被拒 %d", errno];
             } else {
                 const char *req = "GET /cdn-cgi/trace HTTP/1.1\r\nHost: 1.1.1.1\r\n"
                                   "User-Agent: AnyVpnProbe\r\nConnection: close\r\n\r\n";
@@ -1396,7 +1411,7 @@ static NSString *fmtBytes(unsigned long long b) {
                     char buf[2048];
                     ssize_t n = recv(fd, buf, sizeof buf - 1, 0);
                     if (n <= 0) {
-                        fail = @"隧道 ✗ 无响应（网关可能只放行 443）";
+                        fail = @"隧道 ✗ 无响应";
                     } else {
                         buf[n] = 0;
                         NSString *body = @(buf);
@@ -1414,16 +1429,24 @@ static NSString *fmtBytes(unsigned long long b) {
             T2SGetStats(&st);
             if (ip.length) {
                 self.probeOK = YES;
+                self.probeExitIP = ip;
                 self.probeResult = [NSString stringWithFormat:@"隧道 ✓ 出口 %@（%d ms）", ip, (int)ms];
             } else if (st.outBytes > 256) {
                 // 探测本身只有百来字节；超过这个量说明确有别的流量进过隧道
                 self.probeOK = YES;
+                self.probeExitIP = nil;
                 self.probeResult = @"隧道 ✓ 流量已走隧道（出口未验证）";
             } else {
                 self.probeOK = NO;
+                self.probeExitIP = nil;
                 self.probeResult = fail ?: @"隧道 ✗ 未见流量";
             }
             IPATAppendLogLine([NSString stringWithFormat:@"[anyvpn] %@", self.probeResult]);
+            if (!self.probeOK) {
+                // 状态行放不下原因，日志里补一句，方便判断是隧道没通还是网关只放行 443
+                IPATAppendLogLine(@"[anyvpn] 隧道自检未通过：网关可能只放行 443，"
+                                   "或本 App 还没有任何直连流量进入隧道");
+            }
             [self onStatsTick];
         });
     });
@@ -1729,6 +1752,7 @@ static NSString *fmtBytes(unsigned long long b) {
         self.tunnelMTU = ip->mtu > 0 ? (int)ip->mtu : 0;
         self.tunnelDNS = gwDNS.count ? [gwDNS componentsJoinedByString:@","] : @"";
         self.probeResult = nil;
+        self.probeExitIP = nil;
         self.probeOK = NO;
         // %s 会把 UTF-8 中文按 Latin-1 解码（日志乱码），一律用 %@ + @() 包裹
         [self status:[NSString stringWithFormat:@"已连接 %@（IP %@ / %@%@）",
@@ -1783,6 +1807,7 @@ static NSString *fmtBytes(unsigned long long b) {
     self.tunnelDNS = nil;
     self.tunnelMTU = 0;
     self.probeResult = nil;
+    self.probeExitIP = nil;
     self.probeOK = NO;
     [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"IPAToolPanelAnyVpnStats"];
     T2SEngineStop();   // 非越狱模式引擎（root 模式下是空操作）

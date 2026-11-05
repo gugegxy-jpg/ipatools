@@ -126,10 +126,14 @@ static NSString *VpnStateText(void) {
         int mtu = [st[@"mtu"] intValue];
         int conns = [st[@"tcpConns"] intValue] + [st[@"udpConns"] intValue];
         unsigned long long v6 = [st[@"v6Bypass"] unsignedLongLongValue];
+        NSString *status = st[@"status"] ?: @"";
         [s appendFormat:@"  隧道地址     : %@%@\n", tunIP.length ? tunIP : @"-",
             mtu > 0 ? [NSString stringWithFormat:@"（MTU %d）", mtu] : @""];
         [s appendFormat:@"  隧道 DNS     : %@\n", tunDNS.length ? tunDNS : @"-"];
         [s appendFormat:@"  出口自检     : %@\n", probe.length ? probe : @"（无）"];
+        if (status.length) {
+            [s appendFormat:@"  连接状态     : %@\n", status];
+        }
         [s appendFormat:@"  流量         : ↑%llu B ↓%llu B · %d 个连接\n", up, down, conns];
         if (v6) {
             [s appendFormat:@"  ⚠ IPv6 直连  : %llu 条（这些流量没进隧道）\n", v6];
