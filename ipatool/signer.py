@@ -545,6 +545,9 @@ def zsign_dir(
             stale = os.path.join(bundle, "_CodeSignature")
             if os.path.isdir(stale):
                 shutil.rmtree(stale, ignore_errors=True)
+            # Info.plist 先规范化（去注释、去非 ASCII），zsign 那套 XML 解析器
+            # 啃不动带中文注释的 plist
+            _normalize_plist_for_zsign(bundle)
             run = subprocess.run(cmd + ["-z", "9", bundle], capture_output=True, check=False)
             out = (run.stderr.decode("utf-8", "replace").strip()
                    or run.stdout.decode("utf-8", "replace").strip())
@@ -564,6 +567,28 @@ def zsign_dir(
             except OSError:
                 pass
     log("  zsign 完成（目录模式，已就地签名）")
+
+
+def _normalize_plist_for_zsign(bundle: str) -> None:
+    """签名前把 Info.plist 规范化：去掉 XML 注释、统一编码、只留标准结构。
+
+    zsign 用自己那套（非 UTF-8 感知）的 XML 解析器读 Info.plist，
+    注释里只要有中文/非 ASCII，就可能被它解析坏，
+    表现为「Can't find app's Info.plist!」（明明文件就在那儿）。
+    用 plistlib 读写一遍即可去掉注释；原格式（XML / 二进制）保持不变。
+    """
+    path = os.path.join(bundle, "Info.plist")
+    if not os.path.isfile(path):
+        return
+    try:
+        from . import plistutil
+        data = plistutil.load_plist(path)
+        if not isinstance(data, dict):
+            return
+        plistutil.dump_plist(path, data)
+    except Exception:
+        # 规范化失败别挡着签名：让 zsign 自己试，实在不行它会报更具体的错
+        pass
 
 
 def _bundle_snapshot(bundle: str) -> str:

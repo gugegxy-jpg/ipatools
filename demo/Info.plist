@@ -13,7 +13,7 @@
 	<key>CFBundleName</key>
 	<string>IPATDemo</string>
 	<key>CFBundleDisplayName</key>
-	<string>注入验证</string>
+	<string>IPAT Demo</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -58,20 +58,23 @@
 			</array>
 		</dict>
 	</dict>
-	<!-- AnyVpn.dylib 的初始配置。优先级：面板里保存的连接（NSUserDefaults）
-	     > 这里的值（AnyVpn.m 的 configured:）。所以这里留空也能测：
-	     打开 App → 右侧悬浮窗 →「VPN 隧道」→「＋ 添加连接」填网关信息即可。
-	     字段含义：
-	       Server        网关地址（必填）
-	       User          账号
-	       Password      密码
-	       AuthGroup     认证组（留空 = 自动选第一个）
-	       DisableDTLS   true = 只走 CSTP(TCP)。DTLS/UDP 443 在多数网络握不上手，
-	                      真机测试建议直接 true
-	       UnderlyingIface en0 = openconnect 的 socket 绑到底层网卡，防路由环路
-	       AutoConnect   true = 启动即连（默认 false，避免一启动就弹网关登录）
-	       TotpSecret    Base32 TOTP 密钥（可选；账号级密钥优先）
-	       TunnelDNS     覆盖网关下发的隧道 DNS，"ip1,ip2"（网关 DNS 不服务时用） -->
+	<!-- AnyVpn.dylib bootstrap config.
+	     Priority: connections saved by the floating panel (NSUserDefaults)
+	     > these values (AnyVpn.m "configured:").
+	     Leaving them empty is fine: open the app, expand the floating panel,
+	     "VPN tunnel" -> "+ add connection", then fill in the gateway.
+	       Server          gateway address (required)
+	       User            account
+	       Password        password
+	       AuthGroup       auth group (empty = pick the first one)
+	       DisableDTLS     true = CSTP/TCP only; DTLS/UDP 443 rarely negotiates
+	       UnderlyingIface en0 = bind openconnect socket to the real NIC
+	       AutoConnect     true = connect on launch (default false)
+	       TotpSecret      Base32 TOTP secret (optional)
+	       TunnelDNS       override tunnel DNS, "ip1,ip2"
+	     Keep this file ASCII-only: zsign reads Info.plist with its own
+	     non-UTF-8 aware XML parser, and non-ASCII comments can break it
+	     ("Can't find app's Info.plist!"). -->
 	<key>IPAToolAnyVpn</key>
 	<dict>
 		<key>Server</key>
